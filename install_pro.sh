@@ -422,8 +422,11 @@ server {
     ssl_preread on;
 }
 STREAMCONF
-    grep -q 'ngx_stream_module.so' /etc/nginx/nginx.conf 2>/dev/null \
-        || sed -i '1i load_module /usr/lib/nginx/modules/ngx_stream_module.so;' /etc/nginx/nginx.conf
+    # Debian/Ubuntu load stream via /etc/nginx/modules-enabled/*.conf already;
+    # only append our own load_module when it is truly absent from ALL configs.
+    if ! nginx -T 2>/dev/null | grep -q 'ngx_stream_module.so'; then
+        sed -i '1i load_module /usr/lib/nginx/modules/ngx_stream_module.so;' /etc/nginx/nginx.conf
+    fi
     grep -q 'stream {' /etc/nginx/nginx.conf \
         || echo 'stream { include /etc/nginx/stream-enabled/*.conf; }' >> /etc/nginx/nginx.conf
 
