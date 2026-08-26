@@ -93,6 +93,7 @@ cp_ws_v=$(gen_str 10);  cp_grpc_v=$(gen_str 10);  cp_tobf_v=$(gen_str 10)
 cp_ws_vm=$(gen_str 10); cp_grpc_vm=$(gen_str 10); cp_tobf_vm=$(gen_str 10)
 cp_ws_t=$(gen_str 10);  cp_grpc_t=$(gen_str 10)
 cp_ws_s=$(gen_str 10);  cp_grpc_s=$(gen_str 10);  cp_tobf_s=$(gen_str 10)
+mtr_backend_port=$(make_port)   # diagnostics backend (localhost-only)
 config_username=$(gen_str 10); config_password=$(gen_str 10)
 diag_path="/net-$(gen_str 12)/"; diag_token=$(gen_str 16)
 
@@ -222,6 +223,10 @@ configure_xui_db() {
     rm -f /dev/shm/uds2023.sock
     x-ui stop 2>/dev/null || true
     now_ms
+
+    # Wipe any previous installer's rows (idempotent re-run / upgrade path)
+    sq "DELETE FROM client_traffics; DELETE FROM client_inbounds; DELETE FROM clients;"
+    sq "DELETE FROM hosts; DELETE FROM inbounds;"
 
     # REALITY keypair
     local xray_bin="/usr/local/x-ui/bin/xray-linux-$(_arch)"
@@ -597,7 +602,7 @@ VHOST
     location ^~ ${diag_path}api/mtr {
         if (\$diag_auth = 0) { return 404; }
         limit_req zone=diag_api burst=2 nodelay;
-        proxy_pass http://127.0.0.1:${MTR_BACKEND_PORT}/api/mtr;
+        proxy_pass http://127.0.0.1:${mtr_backend_port}/api/mtr;
         proxy_intercept_errors off;
     }
 DIAG
@@ -675,7 +680,7 @@ install_diagnostics() {
     command -v setcap >/dev/null && setcap cap_net_raw+ep "$(command -v mtr-packet 2>/dev/null || command -v mtr)" 2>/dev/null || true
     id mtr-backend &>/dev/null || useradd --system --no-create-home --shell /usr/sbin/nologin mtr-backend
 
-    MTR_BACKEND_PORT=$(make_port)
+    MTR_BACKEND_PORT="$mtr_backend_port"
     cat > /etc/systemd/system/mtr-backend.service <<MTRUNIT
 [Unit]
 Description=lucx-pro MTR diagnostics backend
