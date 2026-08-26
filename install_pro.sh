@@ -185,6 +185,12 @@ install_panel() {
     ./x-ui setting -username bootstrap -password bootstrap01 \
         -port "${panel_port}" -webBasePath "/${panel_path}/" >/dev/null 2>&1
     ./x-ui migrate >/dev/null 2>&1
+    # geo assets required by panel DNS routing rules (geosite:...)
+    local bin_dir="/usr/local/x-ui/bin"
+    [[ -s "$bin_dir/geosite.dat" ]] || curl -fsSL --retry 3 -o "$bin_dir/geosite.dat" \
+        "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" || true
+    [[ -s "$bin_dir/geoip.dat" ]] || curl -fsSL --retry 3 -o "$bin_dir/geoip.dat" \
+        "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" || true
     cp -f x-ui.service.debian /etc/systemd/system/x-ui.service
     systemctl daemon-reload && systemctl enable x-ui >/dev/null 2>&1
     msg_ok "lucx-ui ${tag_version} installed"
@@ -208,7 +214,7 @@ jc_mtproto() { printf '{"fakeTlsDomain":"%s","clients":[{"secret":"%s","adTag":"
 
 js_ws()    { printf '{"network":"ws","security":"none","externalProxy":[],"wsSettings":{"acceptProxyProtocol":false,"path":"/%s/%s","headers":{}}}' "$1" "$2"; }
 js_grpc()  { printf '{"network":"grpc","security":"none","externalProxy":[],"grpcSettings":{"serviceName":"/%s/%s","multiMode":false}}' "$1" "$2"; }
-js_tcpobfs() { printf '{"network":"tcp","security":"none","externalProxy":[],"tcpSettings":{"acceptProxyProtocol":false,"header":{"type":"http","request":{"path":["/%s/%s"],"headers":{"Host":["%s"],"User-Agent":["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36"],"Accept-Encoding":["gzip, deflate"],"Connection":["keep-alive"],"Pragma":"no-cache"}}}}}' "$1" "$2" "$domain"; }
+js_tcpobfs() { printf '{"network":"tcp","security":"none","externalProxy":[],"tcpSettings":{"acceptProxyProtocol":false,"header":{"type":"http","request":{"path":["/%s/%s"],"headers":{"Host":["%s"]}}}}}' "$1" "$2" "$domain"; }
 
 SNIFF_OFF='{"enabled":false,"destOverride":[],"metadataOnly":false,"routeOnly":false}'
 SNIFF_ON='{"enabled":true,"destOverride":["http","tls","quic"],"metadataOnly":false,"routeOnly":false}'
@@ -245,7 +251,10 @@ configure_xui_db() {
     CLIENT_SUBID=$(gen_str 16)
     CLIENT_UUID=$(gen_uuid)
     CLIENT_TROJAN=$(gen_str 20)
-    CLIENT_SS_PASS=$(gen_str 20)
+    # lucx-ui sub-links read client.Password for BOTH trojan and shadowsocks links
+    # (SIP002 userinfo = base64(method:client.Password)); trojan and SS inbounds
+    # must therefore share ONE secret with clients.password.
+    CLIENT_TROJAN="$CLIENT_SS_PASS"
     CLIENT_HYS_AUTH=$(gen_str 20)
     local MT_SECRET="ee$(openssl rand -hex 16)$(printf '%s' "$domain" | od -An -tx1 | tr -d ' \n')"
 
@@ -358,22 +367,33 @@ configure_xui_db() {
     sq "DELETE FROM hosts;"
     local host_tpl="((SELECT id FROM inbounds WHERE tag='%s'),${gid_val} 0,'%s','%s',443,'tls','%s','%s','[\"h2\",\"http/1.1\"]','',0)"
     local grpc_alpn_tpl="((SELECT id FROM inbounds WHERE tag='%s'),${gid_val} 0,'%s','%s',443,'tls','%s','%s','[\"h2\"]','',0)"
-    sq "INSERT INTO hosts (inbound_id,${gid_col}sort_order,remark,address,port,security,sni,host_header,alpn,fingerprint,is_hidden) VALUES
-  ((SELECT id FROM inbounds WHERE tag='inbound-reality-vision'), ${gid_val} 0,'reality','${reality_domain}',443,'same','${reality_domain}','','[]','chrome',0),
-  ($(printf "${host_tpl}" "inbound-${p_ws_v}" 'vless-ws' "$domain" "$domain" "$domain")),
-  ($(printf "${grpc_alpn_tpl}" "inbound-${p_grpc_v}" 'vless-grpc' "$domain" "$domain" "$domain")),
-  ($(printf "${host_tpl}" "inbound-${p_tobf_v}" 'vless-tcp-obfs' "$domain" "$domain" "$domain")),
-  ($(printf "${host_tpl}" "inbound-xhttp" 'vless-xhttp' "$domain" "$domain" "$domain")),
-  ($(printf "${host_tpl}" "inbound-${p_ws_vm}" 'vmess-ws' "$domain" "$domain" "$domain")),
-  ($(printf "${grpc_alpn_tpl}" "inbound-${p_grpc_vm}" 'vmess-grpc' "$domain" "$domain" "$domain")),
-  ($(printf "${host_tpl}" "inbound-${p_tobf_vm}" 'vmess-tcp-obfs' "$domain" "$domain" "$domain")),
-  ($(printf "${host_tpl}" "inbound-${p_ws_t}" 'trojan-ws' "$domain" "$domain" "$domain")),
-  ($(printf "${grpc_alpn_tpl}" "inbound-${p_grpc_t}" 'trojan-grpc' "$domain" "$domain" "$domain")),
-  ($(printf "${host_tpl}" "inbound-${p_ws_s}" 'ss-ws' "$domain" "$domain" "$domain")),
-  ($(printf "${grpc_alpn_tpl}" "inbound-${p_grpc_s}" 'ss-grpc' "$domain" "$domain" "$domain")),
-  ($(printf "${host_tpl}" "inbound-${p_tobf_s}" 'ss-tcp-obfs' "$domain" "$domain" "$domain"));"
+    # tcp-http-obfs cannot h2 (xray obfs server is HTTP/1.1-only): alpn=http/1.1
+    local obfs_alpn_tpl="((SELECT id FROM inbounds WHERE tag='%s'),${gid_val} 0,'%s','%s',443,'tls','%s','%s','[\"http/1.1\"]','',0)"
+    # Explicit per-row inserts (batch printf template failed silently on quoting)
+    add_host() { # tag remark alpn_tpl  → uses host_tpl/grpc/obfs templates via case
+        local _tpl
+        case "$3" in
+            h2only)   _tpl="$grpc_alpn_tpl" ;;
+            http11)   _tpl="$obfs_alpn_tpl" ;;
+            *)        _tpl="$host_tpl" ;;
+        esac
+        sq "INSERT INTO hosts (inbound_id,${gid_col}sort_order,remark,address,port,security,sni,host_header,alpn,fingerprint,is_hidden) VALUES ($(printf "${_tpl}" "$1" "$2" "$domain" "$domain" "$domain"));"
+    }
+    sq "INSERT INTO hosts (inbound_id,${gid_col}sort_order,remark,address,port,security,sni,host_header,alpn,fingerprint,is_hidden) VALUES ((SELECT id FROM inbounds WHERE tag='inbound-reality-vision'), ${gid_val} 0,'reality','${reality_domain}',443,'same','${reality_domain}','','[]','chrome',0);"
+    add_host "inbound-${p_ws_v}"    'vless-ws'       default
+    add_host "inbound-${p_grpc_v}"  'vless-grpc'     h2only
+    add_host "inbound-${p_tobf_v}"  'vless-tcp-obfs' http11
+    add_host "inbound-xhttp"        'vless-xhttp'    default
+    add_host "inbound-${p_ws_vm}"   'vmess-ws'       default
+    add_host "inbound-${p_grpc_vm}" 'vmess-grpc'     h2only
+    add_host "inbound-${p_tobf_vm}" 'vmess-tcp-obfs' http11
+    add_host "inbound-${p_ws_t}"    'trojan-ws'      default
+    add_host "inbound-${p_grpc_t}"  'trojan-grpc'    h2only
+    add_host "inbound-${p_ws_s}"    'ss-ws'          default
+    add_host "inbound-${p_grpc_s}"  'ss-grpc'        h2only
+    add_host "inbound-${p_tobf_s}"  'ss-tcp-obfs'    http11
 
-    # Hysteria2 host: same TLS cert, own UDP port
+# Hysteria2 host: same TLS cert, own UDP port
     sq "INSERT INTO hosts (inbound_id,${gid_col}sort_order,remark,address,port,security,sni,host_header,alpn,fingerprint,is_hidden)
 VALUES ((SELECT id FROM inbounds WHERE tag='inbound-hysteria2'),${gid_val} 0,'hysteria2','${domain}',${hys_port},'same','${domain}','','[]','',0);"
 
@@ -457,7 +477,7 @@ SUBSNIP
 
     _loc_ws()   { cat >> /etc/nginx/snippets/includes.conf <<LOCWS
     # ${1}
-    location /${2}/${3} {
+    location ^~ /${2}/${3} {
         proxy_pass http://127.0.0.1:${2};
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
@@ -469,7 +489,7 @@ LOCWS
 }
     _loc_grpc() { cat >> /etc/nginx/snippets/includes.conf <<LOCG
     # ${1}
-    location /${2}/${3} {
+    location ^~ /${2}/${3} {
         grpc_pass grpc://127.0.0.1:${2};
         grpc_buffer_size 16k;
         grpc_socket_keepalive on;
@@ -481,7 +501,7 @@ LOCG
 }
     _loc_tcp()  { cat >> /etc/nginx/snippets/includes.conf <<LOCT
     # ${1} (http-obfs: URI+Host must survive unchanged)
-    location /${2}/${3} {
+    location ^~ /${2}/${3} {
         proxy_pass http://127.0.0.1:${2};
         proxy_http_version 1.1;
         proxy_set_header Connection "";
@@ -506,7 +526,7 @@ LOCT
 
     cat >> /etc/nginx/snippets/includes.conf <<XHTTPLOC
     # VLESS-XHTTP via UDS
-    location /xhttp {
+    location ^~ /xhttp {
         grpc_pass grpc://unix:/dev/shm/uds2023.sock;
         grpc_read_timeout 1h;
         grpc_send_timeout 1h;
