@@ -208,7 +208,7 @@ jc_mtproto() { printf '{"fakeTlsDomain":"%s","clients":[{"secret":"%s","adTag":"
 
 js_ws()    { printf '{"network":"ws","security":"none","externalProxy":[],"wsSettings":{"acceptProxyProtocol":false,"path":"/%s/%s","headers":{}}}' "$1" "$2"; }
 js_grpc()  { printf '{"network":"grpc","security":"none","externalProxy":[],"grpcSettings":{"serviceName":"/%s/%s","multiMode":false}}' "$1" "$2"; }
-js_tcpobfs() { printf '{"network":"tcp","security":"none","externalProxy":[],"tcpSettings":{"acceptProxyProtocol":false,"header":{"type":"http","request":{"path":["/%s/%s"],"headers":{"Host":{"%s":["%s"]}}}}}}' "$1" "$2" "$domain" "$domain"; }
+js_tcpobfs() { printf '{"network":"tcp","security":"none","externalProxy":[],"tcpSettings":{"acceptProxyProtocol":false,"header":{"type":"http","request":{"path":["/%s/%s"],"headers":{"Host":["%s"],"User-Agent":["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36"],"Accept-Encoding":["gzip, deflate"],"Connection":["keep-alive"],"Pragma":"no-cache"}}}}}' "$1" "$2" "$domain"; }
 
 SNIFF_OFF='{"enabled":false,"destOverride":[],"metadataOnly":false,"routeOnly":false}'
 SNIFF_ON='{"enabled":true,"destOverride":["http","tls","quic"],"metadataOnly":false,"routeOnly":false}'
@@ -249,34 +249,46 @@ configure_xui_db() {
     CLIENT_HYS_AUTH=$(gen_str 20)
     local MT_SECRET="ee$(openssl rand -hex 16)$(printf '%s' "$domain" | od -An -tx1 | tr -d ' \n')"
 
-    # ── Panel + subscriptions settings (defaults exist after migrate → replace) ──
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('webPort','${panel_port}');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('webBasePath','/${panel_path}/');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('webCertFile','/root/cert/${domain}/fullchain.pem');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('webKeyFile','/root/cert/${domain}/privkey.pem');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('subEnable','true');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('subPort','${sub_port}');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('subPath','/${sub_path}/');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('subURI','https://${domain}/${sub_path}/');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('subJsonEnable','true');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('subJsonPath','/${json_path}/');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('subJsonURI','https://${domain}/${json_path}/');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('subJsonAutoDetect','true');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('subJsonUserAgentRegex','(?i)(sing-box|singbox|karing|hiddify|husi)');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('subClashEnable','true');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('subClashPath','/${clash_path}/');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('subClashURI','https://${domain}/${clash_path}/');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('subClashAutoDetect','true');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('subAwgEnable','true');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('subAwgPath','/${awg_path}/');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('subAwgURI','https://${domain}/${awg_path}/');"
+    # ── Panel + subscriptions settings ──
+    # settings.key is NOT the PK in this schema → INSERT OR REPLACE would
+    # create duplicates. Delete each key first, then insert.
+    local _keys=("webPort" "webBasePath" "webCertFile" "webKeyFile"
+                 "subEnable" "subPort" "subPath" "subURI"
+                 "subJsonEnable" "subJsonPath" "subJsonURI" "subJsonAutoDetect" "subJsonUserAgentRegex"
+                 "subClashEnable" "subClashPath" "subClashURI" "subClashAutoDetect"
+                 "subAwgEnable" "subAwgPath" "subAwgURI"
+                 "subEnableRouting" "subRoutingSource" "subIncyEnableRouting"
+                 "timeLocation" "subUpdates" "subEncrypt")
+    local k
+    for k in "${_keys[@]}"; do sq "DELETE FROM settings WHERE key='$k';"; done
+
+    sq "INSERT INTO settings (key,value) VALUES ('webPort','${panel_port}');"
+    sq "INSERT INTO settings (key,value) VALUES ('webBasePath','/${panel_path}/');"
+    sq "INSERT INTO settings (key,value) VALUES ('webCertFile','/root/cert/${domain}/fullchain.pem');"
+    sq "INSERT INTO settings (key,value) VALUES ('webKeyFile','/root/cert/${domain}/privkey.pem');"
+    sq "INSERT INTO settings (key,value) VALUES ('subEnable','true');"
+    sq "INSERT INTO settings (key,value) VALUES ('subPort','${sub_port}');"
+    sq "INSERT INTO settings (key,value) VALUES ('subPath','/${sub_path}/');"
+    sq "INSERT INTO settings (key,value) VALUES ('subURI','https://${domain}/${sub_path}/');"
+    sq "INSERT INTO settings (key,value) VALUES ('subJsonEnable','true');"
+    sq "INSERT INTO settings (key,value) VALUES ('subJsonPath','/${json_path}/');"
+    sq "INSERT INTO settings (key,value) VALUES ('subJsonURI','https://${domain}/${json_path}/');"
+    sq "INSERT INTO settings (key,value) VALUES ('subJsonAutoDetect','true');"
+    sq "INSERT INTO settings (key,value) VALUES ('subJsonUserAgentRegex','(?i)(sing-box|singbox|karing|hiddify|husi)');"
+    sq "INSERT INTO settings (key,value) VALUES ('subClashEnable','true');"
+    sq "INSERT INTO settings (key,value) VALUES ('subClashPath','/${clash_path}/');"
+    sq "INSERT INTO settings (key,value) VALUES ('subClashURI','https://${domain}/${clash_path}/');"
+    sq "INSERT INTO settings (key,value) VALUES ('subClashAutoDetect','true');"
+    sq "INSERT INTO settings (key,value) VALUES ('subAwgEnable','true');"
+    sq "INSERT INTO settings (key,value) VALUES ('subAwgPath','/${awg_path}/');"
+    sq "INSERT INTO settings (key,value) VALUES ('subAwgURI','https://${domain}/${awg_path}/');"
     # Happ + Incy RoscomVPN routing (hydraponique/roscomvpn-routing, source: default profile)
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('subEnableRouting','true');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('subRoutingSource','default');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('subIncyEnableRouting','true');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('timeLocation','Europe/Moscow');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('subUpdates','12');"
-    sq "INSERT OR REPLACE INTO settings (key,value) VALUES ('subEncrypt','true');"
+    sq "INSERT INTO settings (key,value) VALUES ('subEnableRouting','true');"
+    sq "INSERT INTO settings (key,value) VALUES ('subRoutingSource','default');"
+    sq "INSERT INTO settings (key,value) VALUES ('subIncyEnableRouting','true');"
+    sq "INSERT INTO settings (key,value) VALUES ('timeLocation','Europe/Moscow');"
+    sq "INSERT INTO settings (key,value) VALUES ('subUpdates','12');"
+    sq "INSERT INTO settings (key,value) VALUES ('subEncrypt','true');"
 
     # ══════ 1. VLESS REALITY + Vision — public :443 @ reality_domain ══════
     local stream_reality
