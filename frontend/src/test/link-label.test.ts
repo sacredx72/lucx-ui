@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 
-import { parseLinkParts, linkMetaText } from '@/lib/xray/link-label';
+import { parseLinkParts, linkMetaText, displaySubLinks } from '@/lib/xray/link-label';
+import { genAmneziaWGLink } from '@/lib/xray/inbound-link';
+import type { AmneziawgInboundSettings } from '@/schemas/protocols/inbound/amneziawg';
 
 // The panel shows the subscription's remark verbatim. Per-client traffic/expiry
 // info is rendered only into the body a client app imports (backend, first link
@@ -43,9 +45,7 @@ describe('link-label parseLinkParts', () => {
 
   // LUCX-HOOK: naive+https:// uses a compound scheme; must not fall back to "LINK".
   it('labels a naive+https share link as Naive with HTTPS and #remark', () => {
-    const parts = parseLinkParts(
-      'naive+https://nxabc:pass@n.example.com:8443#alice@example.com',
-    );
+    const parts = parseLinkParts('naive+https://nxabc:pass@n.example.com:8443#alice@example.com');
     expect(parts?.protocol).toBe('Naive');
     expect(parts?.security).toBe('HTTPS');
     expect(parts?.remark).toBe('alice@example.com');
@@ -64,8 +64,91 @@ describe('link-label parseLinkParts', () => {
     expect(parseLinkParts('olcrtc://jitsi?datachannel@https://meet.jit.si/r#aabb')?.protocol).toBe(
       'olcRTC',
     );
-    expect(
-      parseLinkParts('qwdtt://config?name=Home&peer=1.2.3.4%3A56000&pass=x')?.protocol,
-    ).toBe('qWDTT');
+    expect(parseLinkParts('qwdtt://config?name=Home&peer=1.2.3.4%3A56000&pass=x')?.protocol).toBe(
+      'qWDTT',
+    );
+    expect(parseLinkParts('csqtt://connect?v=2&host=1.2.3.4&peer=46000&password=x')?.protocol).toBe(
+      'CSQTT',
+    );
+  });
+
+  it('labels an AmneziaWG vpn:// link with its decoded remark and endpoint port', () => {
+    const settings = {
+      server: {
+        publicKey: 'serverPubKey==',
+        jc: 5,
+        jmin: 10,
+        jmax: 50,
+        s1: 30,
+        s2: 45,
+        s3: 10,
+        s4: 5,
+        h1: '',
+        h2: '',
+        h3: '',
+        h4: '',
+        i1: '',
+      },
+      clients: [{ email: 'peer-1', privateKey: 'clientPrivKey==', allowedIPs: ['10.8.1.2/32'] }],
+    } as unknown as AmneziawgInboundSettings;
+
+    const link = genAmneziaWGLink({
+      settings,
+      address: 'awg.example.test',
+      port: 36541,
+      remark: 'wg-Майфун',
+      peerIndex: 0,
+    });
+
+    const parts = parseLinkParts(link);
+    expect(parts?.protocol).toBe('AmneziaWG');
+    expect(parts?.remark).toBe('wg-Майфун');
+    expect(parts?.port).toBe('36541');
+    expect(parts && linkMetaText(parts)).toBe('wg-Майфун:36541');
+  });
+
+  it('labels a tuic link with QUIC network and TLS security', () => {
+    const link = 'tuic://uuid:pass@tuic.example.com:8443?congestion_control=bbr#tuic-remark';
+    const parts = parseLinkParts(link);
+    expect(parts?.protocol).toBe('TUIC');
+    expect(parts?.network).toBe('QUIC');
+    expect(parts?.security).toBe('TLS');
+    expect(parts?.port).toBe('8443');
+    expect(parts?.remark).toBe('tuic-remark');
+  });
+
+  it('does not treat a LucX qCompress vpn:// envelope as a .conf remark', () => {
+    const raw = Uint8Array.from([
+      0, 0, 0, 16, 0x78, 0x9c, 0xff, 0x23, 0x20, 0x62, 0x61, 0x64, 0xfe, 0x00,
+    ]);
+    let bin = '';
+    for (const b of raw) bin += String.fromCharCode(b);
+    const link = `vpn://${btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')}`;
+    const parts = parseLinkParts(link);
+    expect(parts?.protocol).toBe('AmneziaWG');
+    expect(parts?.remark).toBe('');
+    expect(parts?.port).toBe('');
+    expect(parts?.remark).not.toMatch(/\uFFFD/);
+    expect(parts && linkMetaText(parts)).toBe('');
+  });
+
+  it('displaySubLinks labels vpn:// from the preceding amneziawg:// and groups by protocol', () => {
+    const rows = displaySubLinks([
+      'vless://u@h:443?type=tcp&security=reality#DE-satx',
+      'amneziawg://k@10.0.0.1:51820?publickey=x#NL-ams',
+      'vpn://e30',
+      'vless://u@h:443?type=xhttp&security=reality#CH-switz',
+      'amneziawg://k@10.0.0.2:51821#DE-awg',
+      'vpn://e30',
+    ]);
+    expect(rows.map((r) => r.parts?.protocol)).toEqual([
+      'Vless',
+      'Vless',
+      'AmneziaWG',
+      'AmneziaWG',
+    ]);
+    expect(rows.map((r) => r.parts?.remark)).toEqual(['DE-satx', 'CH-switz', 'NL-ams', 'DE-awg']);
+    expect(rows.filter((r) => r.link.startsWith('amneziawg://'))).toHaveLength(0);
+    expect(rows.filter((r) => r.link.startsWith('vpn://'))).toHaveLength(2);
   });
 });

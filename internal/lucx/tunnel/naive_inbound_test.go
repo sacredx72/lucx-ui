@@ -17,6 +17,17 @@ func TestNaiveKey(t *testing.T) {
 	}
 }
 
+func TestConfigFromInbound_LoopbackListenWins(t *testing.T) {
+	ib := &model.Inbound{
+		Protocol: model.Naive, Listen: "127.0.0.1", Port: 8443,
+		Settings: `{"listen":"0.0.0.0","domain":"n.example.com"}`,
+	}
+	cfg, ok := ConfigFromInbound(ib)
+	if !ok || cfg.Listen != "127.0.0.1" {
+		t.Fatalf("loopback envelope must win: ok=%v listen=%q", ok, cfg.Listen)
+	}
+}
+
 func TestClientAuthForInbound_Scoped(t *testing.T) {
 	secret := []byte("panel-secret")
 	a := ClientAuthForInbound(secret, 1, "alice@example.com")
@@ -76,6 +87,24 @@ func TestInstanceFromInbound_RendersClients(t *testing.T) {
 	}
 }
 
+func TestValidateInbound_RejectsCaddyInject(t *testing.T) {
+	c := NaiveConfig{Port: 443, CertFile: "/c.pem", KeyFile: "/k.pem", Domain: "x.com, :80"}
+	if err := c.ValidateInbound(true); err == nil {
+		t.Fatal("comma in domain must be rejected")
+	}
+}
+
+func TestInstanceFromInbound_InjectDomainDisabled(t *testing.T) {
+	ib := &model.Inbound{
+		Id: 1, Enable: true, Port: 8443, Protocol: model.Naive,
+		Settings: `{"domain":"x.com {\n reverse_proxy 127.0.0.1","certFile":"/c.pem","keyFile":"/k.pem","clients":[{"email":"a@x","enable":true}]}`,
+	}
+	inst, ok := InstanceFromInbound(ib, []byte("s"))
+	if !ok || inst.Enabled {
+		t.Fatalf("inject domain must not start: ok=%v enabled=%v", ok, inst.Enabled)
+	}
+}
+
 func TestInstanceFromInbound_Disabled(t *testing.T) {
 	ib := &model.Inbound{Id: 1, Enable: false, Protocol: model.Naive, Port: 443, Settings: `{}`}
 	inst, ok := InstanceFromInbound(ib, nil)
@@ -105,10 +134,35 @@ func TestInstanceFromInbound_RouteThroughXrayUpstream(t *testing.T) {
 	if !ok || !inst.Enabled {
 		t.Fatal("expected enabled instance")
 	}
-	if !strings.Contains(inst.ConfigText, "upstream socks5://127.0.0.1:39123") {
+	if !strings.Contains(inst.ConfigText, "upstream socks5://") || !strings.Contains(inst.ConfigText, "@127.0.0.1:39123") {
 		t.Fatalf("routed inbound must render SOCKS upstream:\n%s", inst.ConfigText)
 	}
 	if inst.ProbePort != 8443 {
 		t.Fatalf("ProbePort = %d", inst.ProbePort)
+	}
+}
+
+func TestInstanceFromInbound_AuthSeed(t *testing.T) {
+	settings := SetAuthSeed(`{
+		"domain":"n.example.com",
+		"certFile":"/c.pem",
+		"keyFile":"/k.pem",
+		"authUser":"svc",
+		"authPass":"svcpass",
+		"clients":[{"email":"a@x","enable":true}]
+	}`, "shared-seed")
+	master := &model.Inbound{Id: 15, Enable: true, Port: 8443, Protocol: model.Naive, Settings: settings}
+	node := &model.Inbound{Id: 3, Enable: true, Port: 8443, Protocol: model.Naive, Settings: settings}
+	a, ok := InstanceFromInbound(master, []byte("master-secret"))
+	if !ok || !a.Enabled {
+		t.Fatal("master instance")
+	}
+	b, ok := InstanceFromInbound(node, []byte("node-secret"))
+	if !ok || !b.Enabled {
+		t.Fatal("node instance")
+	}
+	pair := InboundAuthPair([]byte("master-secret"), master, "a@x")
+	if !strings.Contains(a.ConfigText, pair.User) || !strings.Contains(b.ConfigText, pair.User) {
+		t.Fatalf("seeded user %q missing from Caddyfile", pair.User)
 	}
 }

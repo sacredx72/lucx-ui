@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
@@ -11,6 +12,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v3/internal/web/entity"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/middleware"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service"
+	"github.com/mhsanaei/3x-ui/v3/internal/web/service/discord"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service/email"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service/panel"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/session"
@@ -33,10 +35,15 @@ type updateUserForm struct {
 // "unchanged", so clearing needs its own signal — see #5724).
 type updateSettingForm struct {
 	entity.AllSetting
-	TwoFactorCode     string `json:"twoFactorCode" form:"twoFactorCode"`
-	ClearTgBotToken   bool   `json:"clearTgBotToken" form:"clearTgBotToken"`
-	ClearLdapPassword bool   `json:"clearLdapPassword" form:"clearLdapPassword"`
-	ClearSmtpPassword bool   `json:"clearSmtpPassword" form:"clearSmtpPassword"`
+	// LUCX-HOOK: nil means the client omitted tgBotProxy (keep stored). A
+	// present empty string is an explicit clear. Shadows AllSetting.TgBotProxy.
+	TgBotProxy *string `json:"tgBotProxy" form:"tgBotProxy"`
+	// END LUCX-HOOK
+	TwoFactorCode        string `json:"twoFactorCode" form:"twoFactorCode"`
+	ClearTgBotToken      bool   `json:"clearTgBotToken" form:"clearTgBotToken"`
+	ClearLdapPassword    bool   `json:"clearLdapPassword" form:"clearLdapPassword"`
+	ClearSmtpPassword    bool   `json:"clearSmtpPassword" form:"clearSmtpPassword"`
+	ClearDiscordBotToken bool   `json:"clearDiscordBotToken" form:"clearDiscordBotToken"`
 }
 
 type validateRegexForm struct {
@@ -77,6 +84,7 @@ func (a *SettingController) initRouter(g *gin.RouterGroup) {
 	g.POST("/apiTokens/setEnabled/:id", a.setApiTokenEnabled)
 	g.POST("/testSmtp", a.testSmtp)
 	g.POST("/testTgBot", a.testTgBot)
+	g.POST("/testDiscord", a.testDiscord)
 }
 
 func (a *SettingController) validateRegex(c *gin.Context) {
@@ -130,16 +138,34 @@ func (a *SettingController) updateSetting(c *gin.Context) {
 	oldTgToken, _ := a.settingService.GetTgBotToken()
 	oldTgChatId, _ := a.settingService.GetTgBotChatId()
 	oldTgAPIServer, _ := a.settingService.GetTgBotAPIServer()
-	if twoFactorErr == nil && oldTwoFactor && !allSetting.TwoFactorEnable {
-		if err := a.settingService.VerifyTwoFactorCode(form.TwoFactorCode); err != nil {
-			jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
-			return
+	// LUCX-HOOK: omitted proxy must not wipe a value an older client never sent.
+	oldTgProxy, _ := a.settingService.GetTgBotProxy()
+	allSetting.TgBotProxy = oldTgProxy
+	if form.TgBotProxy != nil {
+		allSetting.TgBotProxy = strings.TrimSpace(*form.TgBotProxy)
+	}
+	// END LUCX-HOOK
+	oldDiscordEnable, _ := a.settingService.GetDiscordBotEnable()
+	oldDiscordToken, _ := a.settingService.GetDiscordBotToken()
+	oldDiscordChannelId, _ := a.settingService.GetDiscordChannelId()
+	oldDiscordRunTime, _ := a.settingService.GetDiscordRunTime()
+	if twoFactorErr == nil && oldTwoFactor {
+		// Rebinding the authenticator is the same class of change as turning 2FA
+		// off, so both need a current code. Blank still means "unchanged".
+		submittedToken := strings.TrimSpace(allSetting.TwoFactorToken)
+		storedToken, _ := a.settingService.GetTwoFactorToken()
+		if !allSetting.TwoFactorEnable || (submittedToken != "" && submittedToken != storedToken) {
+			if err := a.settingService.VerifyTwoFactorCode(form.TwoFactorCode); err != nil {
+				jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
+				return
+			}
 		}
 	}
 	err := a.settingService.UpdateAllSetting(allSetting, service.SecretClears{
-		TgBotToken:   form.ClearTgBotToken,
-		LdapPassword: form.ClearLdapPassword,
-		SmtpPassword: form.ClearSmtpPassword,
+		TgBotToken:      form.ClearTgBotToken,
+		LdapPassword:    form.ClearLdapPassword,
+		SmtpPassword:    form.ClearSmtpPassword,
+		DiscordBotToken: form.ClearDiscordBotToken,
 	})
 	if err == nil && twoFactorErr == nil && !oldTwoFactor && allSetting.TwoFactorEnable {
 		if bumpErr := a.userService.BumpLoginEpoch(); bumpErr != nil {
@@ -156,12 +182,25 @@ func (a *SettingController) updateSetting(c *gin.Context) {
 	}
 	// UpdateAllSetting already restored a redacted-blank token, so allSetting.TgBotToken is the effective value to compare.
 	if err == nil && reloadTgbotFunc != nil {
+		// LUCX-HOOK: proxy and panel egress are the bot's dial path.
 		tgChanged := oldTgEnable != allSetting.TgBotEnable ||
 			(allSetting.TgBotEnable && (oldTgToken != allSetting.TgBotToken ||
 				oldTgChatId != allSetting.TgBotChatId ||
-				oldTgAPIServer != allSetting.TgBotAPIServer))
+				oldTgAPIServer != allSetting.TgBotAPIServer ||
+				oldTgProxy != allSetting.TgBotProxy ||
+				oldPanelOutbound != allSetting.PanelOutbound))
+		// END LUCX-HOOK
 		if tgChanged {
 			reloadTgbotFunc()
+		}
+	}
+	if err == nil && reloadDiscordFunc != nil {
+		discordChanged := oldDiscordEnable != allSetting.DiscordBotEnable ||
+			oldDiscordRunTime != allSetting.DiscordRunTime ||
+			(allSetting.DiscordBotEnable && (oldDiscordToken != allSetting.DiscordBotToken ||
+				oldDiscordChannelId != allSetting.DiscordChannelId))
+		if discordChanged {
+			reloadDiscordFunc()
 		}
 	}
 	jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
@@ -216,11 +255,18 @@ func (a *SettingController) getDefaultXrayConfig(c *gin.Context) {
 }
 
 type apiTokenCreateForm struct {
-	Name string `json:"name" form:"name"`
+	Name      string `json:"name" form:"name"`
+	Scope     string `json:"scope" form:"scope"`
+	ExpiresAt int64  `json:"expiresAt" form:"expiresAt"`
 }
 
 type apiTokenEnabledForm struct {
-	Enabled bool `json:"enabled" form:"enabled"`
+	Enabled       bool   `json:"enabled" form:"enabled"`
+	ExpectedScope string `json:"expectedScope" form:"expectedScope"`
+}
+
+type apiTokenScopeForm struct {
+	ExpectedScope string `json:"expectedScope" form:"expectedScope"`
 }
 
 func (a *SettingController) listApiTokens(c *gin.Context) {
@@ -238,7 +284,7 @@ func (a *SettingController) createApiToken(c *gin.Context) {
 		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
 		return
 	}
-	row, err := a.apiTokenService.Create(form.Name)
+	row, err := a.apiTokenService.Create(form.Name, form.Scope, form.ExpiresAt)
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
 		return
@@ -252,7 +298,12 @@ func (a *SettingController) deleteApiToken(c *gin.Context) {
 		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
 		return
 	}
-	jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), a.apiTokenService.Delete(id))
+	form := &apiTokenScopeForm{}
+	if bindErr := c.ShouldBind(form); bindErr != nil {
+		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), bindErr)
+		return
+	}
+	jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), a.apiTokenService.DeleteExpectedScope(id, form.ExpectedScope))
 }
 
 func (a *SettingController) setApiTokenEnabled(c *gin.Context) {
@@ -266,7 +317,7 @@ func (a *SettingController) setApiTokenEnabled(c *gin.Context) {
 		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), bindErr)
 		return
 	}
-	jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), a.apiTokenService.SetEnabled(id, form.Enabled))
+	jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), a.apiTokenService.SetEnabledExpectedScope(id, form.ExpectedScope, form.Enabled))
 }
 
 func (a *SettingController) testSmtp(c *gin.Context) {
@@ -328,3 +379,31 @@ var emailService *email.EmailService
 
 // SetEmailService registers the email service for test endpoints.
 func SetEmailService(s *email.EmailService) { emailService = s }
+
+// reloadDiscordFunc is wired from the web layer to reschedule or cancel Discord notify job.
+var reloadDiscordFunc func()
+
+func SetReloadDiscordFunc(fn func()) { reloadDiscordFunc = fn }
+
+// discordService is set from web layer.
+var discordService *discord.DiscordService
+
+// SetDiscordService registers the Discord service for test endpoints.
+func SetDiscordService(s *discord.DiscordService) { discordService = s }
+
+func (a *SettingController) testDiscord(c *gin.Context) {
+	if discordService == nil {
+		jsonMsg(c, I18nWeb(c, "pages.settings.discordNotInitialized"), errors.New("discord service not available"))
+		return
+	}
+	enabled, err := a.settingService.GetDiscordBotEnable()
+	if err != nil || !enabled {
+		jsonMsg(c, I18nWeb(c, "pages.settings.discordBotNotEnabled"), errors.New("discord bot disabled"))
+		return
+	}
+	if err := discordService.SendTest(c.Request.Context()); err != nil {
+		jsonMsg(c, I18nWeb(c, "pages.settings.discordTestFailed")+": "+err.Error(), err)
+		return
+	}
+	jsonMsg(c, I18nWeb(c, "pages.settings.discordTestSuccess"), nil)
+}

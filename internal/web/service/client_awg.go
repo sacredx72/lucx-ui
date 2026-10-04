@@ -7,18 +7,35 @@
 package service
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"strings"
 
+	"github.com/mhsanaei/3x-ui/v3/internal/amneziawg"
 	"github.com/mhsanaei/3x-ui/v3/internal/awg"
+	awgcps "github.com/mhsanaei/3x-ui/v3/internal/awg/cps"
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
+	"github.com/mhsanaei/3x-ui/v3/internal/logger"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/common"
 	wgutil "github.com/mhsanaei/3x-ui/v3/internal/util/wireguard"
 )
+
+// errAwgControlChar: a value rendered verbatim into a .conf held a control
+// character, which would open a new config line downstream.
+var errAwgControlChar = errors.New("awg: value contains control characters")
+
+// errAwgSettingsMalformed: awg inbound settings are non-empty but not valid
+// JSON, so none of the checks that follow parsing could run.
+var errAwgSettingsMalformed = errors.New("awg: settings is not valid JSON")
+
+// errAwgHeaderProtectionKey: the AWG3 cipher takes a 32-byte key, and the awg
+// tools reject the whole .conf over a bad one, without naming the field.
+var errAwgHeaderProtectionKey = errors.New("awg: headerProtectionKey is not a base64 32-byte key")
 
 // defaultAwgBase is the tunnel subnet AWG clients are allocated from. It is
 // intentionally distinct from WireGuard's 10.0.0.0/24 so an AWG inbound and a
@@ -89,6 +106,227 @@ func awgSettingsAddress(settings string) string {
 		return ""
 	}
 	return s.Address
+}
+
+// Blank means the feature is off. The control-character check must stay (a
+// \r\n-wrapped key decodes fine) and go first, or DEL reads as bad base64.
+func validateAwgHeaderProtectionKey(v string) error {
+	if v == "" {
+		return nil
+	}
+	if err := amneziawg.ValidateConfigValue("headerProtectionKey", v); err != nil {
+		return fmt.Errorf("%w: %w", errAwgControlChar, err)
+	}
+	key, err := base64.StdEncoding.DecodeString(v)
+	if err != nil {
+		return fmt.Errorf("%w: not base64: %w", errAwgHeaderProtectionKey, err)
+	}
+	if len(key) != 32 {
+		return fmt.Errorf("%w: got %d bytes, want 32", errAwgHeaderProtectionKey, len(key))
+	}
+	return nil
+}
+
+// awgInboundIfnameShape names the awg+id interface these settings describe. The
+// id is unknowable here (a node numbers its own), hence the shape, not a name.
+const awgInboundIfnameShape = "awgN"
+
+// AwgIFieldBudgetWarning is the note an over-budget I-set earns on a save: it
+// stays stored, but `awg show` would fail on it, so no renderer emits it.
+func AwgIFieldBudgetWarning(settings string) string {
+	err := validateAwgSettingsJSON(settings)
+	if !errors.Is(err, awg.ErrIFieldsTooLarge) {
+		return ""
+	}
+	// The advice tail names a knob the operator of an adopted server lacks.
+	measured, _, _ := strings.Cut(err.Error(), " — ")
+	return measured
+}
+
+// AwgIFieldExportNote names the I-fields that will not reach a client, because
+// one of the two engines cannot parse them and would fail the whole config.
+// Deliberately outside validateAwgSettingsJSON: this never refuses a save, and
+// folding it into the error path would make its class forgivable too.
+func AwgIFieldExportNote(settings string) string {
+	var s struct {
+		I1 string `json:"i1"`
+		I2 string `json:"i2"`
+		I3 string `json:"i3"`
+		I4 string `json:"i4"`
+		I5 string `json:"i5"`
+	}
+	if json.Unmarshal([]byte(settings), &s) != nil {
+		return ""
+	}
+	var lost []string
+	for i, v := range []string{s.I1, s.I2, s.I3, s.I4, s.I5} {
+		// An empty field is not a loss — it was never a value.
+		if strings.TrimSpace(v) != "" && !awg.PortableIField(v) {
+			lost = append(lost, fmt.Sprintf("I%d", i+1))
+		}
+	}
+	return strings.Join(lost, ", ")
+}
+
+// validateAwgSettingsForSave refuses everything except an over-budget I-set,
+// which is stored and logged once: refusing it froze node reconcile instead.
+func validateAwgSettingsForSave(settings, tag string) error {
+	if err := awg.ValidateTproxySettings(settings); err != nil {
+		return err
+	}
+	err := validateAwgSettingsJSON(settings)
+	if !errors.Is(err, awg.ErrIFieldsTooLarge) {
+		return err
+	}
+	logger.Warningf("awg: inbound %s saved with an I-set no renderer will emit: %v", tag, err)
+	return nil
+}
+
+// stripAwgRouteSettings deletes the now-inert routing keys when
+// routeThroughXray is off, mirroring normalizeMtprotoXrayPort: without this a
+// toggled-off inbound keeps xrayRoutingMode/tproxyPort/outboundTag in its
+// settings and re-enabling routing resurrects the stale mode instead of the
+// TUN default.
+func stripAwgRouteSettings(inbound *model.Inbound) {
+	if inbound == nil || inbound.Protocol != model.AWG {
+		return
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(inbound.Settings), &parsed); err != nil || parsed == nil {
+		return
+	}
+	if routed, _ := parsed["routeThroughXray"].(bool); routed {
+		return
+	}
+	_, hadMode := parsed["xrayRoutingMode"]
+	_, hadPort := parsed["tproxyPort"]
+	_, hadTag := parsed["outboundTag"]
+	if !hadMode && !hadPort && !hadTag {
+		return
+	}
+	delete(parsed, "xrayRoutingMode")
+	delete(parsed, "tproxyPort")
+	delete(parsed, "outboundTag")
+	if bs, err := json.MarshalIndent(parsed, "", "  "); err == nil {
+		inbound.Settings = string(bs)
+	} else {
+		logger.Warning("awg: failed to marshal settings after disabling routing:", err)
+	}
+}
+
+func validateAwgSettingsJSON(settings string) error {
+	var s struct {
+		AwgVersion          string `json:"awgVersion"`
+		H1                  string `json:"h1"`
+		H2                  string `json:"h2"`
+		H3                  string `json:"h3"`
+		H4                  string `json:"h4"`
+		Jc                  int    `json:"jc"`
+		Jmin                int    `json:"jmin"`
+		Jmax                int    `json:"jmax"`
+		S1                  int    `json:"s1"`
+		S2                  int    `json:"s2"`
+		S3                  int    `json:"s3"`
+		S4                  int    `json:"s4"`
+		I1                  string `json:"i1"`
+		I2                  string `json:"i2"`
+		I3                  string `json:"i3"`
+		I4                  string `json:"i4"`
+		I5                  string `json:"i5"`
+		HeaderProtectionKey string `json:"headerProtectionKey"`
+		Address             string `json:"address"`
+		DNS                 string `json:"dns"`
+		// AWG3 device-level timers/padding: string-typed so a lo-hi range
+		// ("100-500") survives, same shape as awg.Instance's own fields.
+		ContentPaddingAddition awg.AwgTimer `json:"contentPaddingAddition"`
+		RekeyAfterTime         awg.AwgTimer `json:"rekeyAfterTime"`
+		RekeyTimeout           awg.AwgTimer `json:"rekeyTimeout"`
+		RejectAfterTime        awg.AwgTimer `json:"rejectAfterTime"`
+		KeepaliveTimeout       awg.AwgTimer `json:"keepaliveTimeout"`
+		MaxHandshakeAttempts   awg.AwgTimer `json:"maxHandshakeAttempts"`
+	}
+	if strings.TrimSpace(settings) == "" {
+		return nil
+	}
+	if err := json.Unmarshal([]byte(settings), &s); err != nil {
+		return fmt.Errorf("%w: %w", errAwgSettingsMalformed, err)
+	}
+	if err := awg.ValidateObfuscationFields(s.AwgVersion, s.Jc, s.S1, s.H1, s.H2, s.H3, s.H4); err != nil {
+		return err
+	}
+	for _, dt := range []struct {
+		name string
+		val  awg.AwgTimer
+	}{
+		{"ContentPaddingAddition", s.ContentPaddingAddition},
+		{"RekeyAfterTime", s.RekeyAfterTime},
+		{"RekeyTimeout", s.RekeyTimeout},
+		{"RejectAfterTime", s.RejectAfterTime},
+		{"KeepaliveTimeout", s.KeepaliveTimeout},
+		{"MaxHandshakeAttempts", s.MaxHandshakeAttempts},
+	} {
+		if err := awg.ValidateDeviceTimer(dt.name, dt.val); err != nil {
+			return err
+		}
+	}
+	// Reported last, never first: a caller that downgrades this to a warning
+	// must still have had every other check run over these same I-fields.
+	iFieldErr := awg.ValidateIFields(awgInboundIfnameShape, s.HeaderProtectionKey, s.I1, s.I2, s.I3, s.I4, s.I5)
+	// Checked raw, because the renderers write raw: trimming here let a leading
+	// "\n" hide a second directive from this loop and still reach the .conf.
+	for _, cv := range []struct{ field, v string }{
+		{"i1", s.I1},
+		{"i2", s.I2},
+		{"i3", s.I3},
+		{"i4", s.I4},
+		{"i5", s.I5},
+		{"h1", s.H1},
+		{"h2", s.H2},
+		{"h3", s.H3},
+		{"h4", s.H4},
+		{"address", s.Address},
+		{"dns", s.DNS},
+	} {
+		if err := amneziawg.ValidateConfigValue(cv.field, cv.v); err != nil {
+			return fmt.Errorf("%w: %w", errAwgControlChar, err)
+		}
+	}
+	if err := validateAwgHeaderProtectionKey(s.HeaderProtectionKey); err != nil {
+		return err
+	}
+	if s.Jc == 0 && s.S1 == 0 {
+		return iFieldErr
+	}
+	p := awgcps.AWGParams{
+		Jc: s.Jc, Jmin: s.Jmin, Jmax: s.Jmax,
+		S1: s.S1, S2: s.S2, S3: s.S3, S4: s.S4,
+		HeaderProtectionKey: s.HeaderProtectionKey,
+	}
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	return iFieldErr
+}
+
+func (s *InboundService) applyLocalAwg(inboundId int) {
+	inbound, err := s.GetInbound(inboundId)
+	if err != nil || inbound == nil || inbound.Protocol != model.AWG || inbound.NodeID != nil {
+		return
+	}
+	if !inbound.Enable {
+		awg.GetManager().Remove(inboundId)
+		return
+	}
+	inst, ok := awg.InstanceFromInbound(inbound)
+	if !ok {
+		return
+	}
+	if !awg.KernelAvailable() {
+		return
+	}
+	if err := awg.GetManager().Ensure(inst); err != nil {
+		logger.Debug("awg: immediate client apply failed for inbound", inboundId, ":", err)
+	}
 }
 
 func awgSettingsVersion(settings string) string {
@@ -324,6 +562,7 @@ func fillAwgClients(existing, clients []model.Client, interfaceClients []any, ba
 	}
 	for i := range clients {
 		c := &clients[i]
+		known := awgKnownClient(existing, c)
 		if c.PrivateKey == "" && c.PublicKey == "" {
 			priv, pub, err := wgutil.GenerateWireguardKeypair()
 			if err != nil {
@@ -338,7 +577,7 @@ func fillAwgClients(existing, clients []model.Client, interfaceClients []any, ba
 			}
 			c.PublicKey = pub
 		}
-		if c.PreSharedKey == "" {
+		if c.PreSharedKey == "" && !known {
 			psk, err := wgutil.GenerateWireguardPSK()
 			if err != nil {
 				return err
@@ -368,8 +607,8 @@ func fillAwgClients(existing, clients []model.Client, interfaceClients []any, ba
 					}
 				}
 			}
-			if hit := wireguardAllowedIPsCollision(normalized, peers); hit != "" {
-				return common.NewError("awg: allowedIPs entry already used by another client:", hit)
+			if entry, taken := wireguardAllowedIPsOverlap(normalized, peers); taken != "" {
+				return common.NewError("awg: allowedIPs entry", entry, "overlaps", taken, "used by another client")
 			}
 			c.AllowedIPs = normalized
 		}
@@ -394,6 +633,20 @@ func fillAwgClients(existing, clients []model.Client, interfaceClients []any, ba
 	return nil
 }
 
+func awgKnownClient(existing []model.Client, c *model.Client) bool {
+	email := strings.ToLower(strings.TrimSpace(c.Email))
+	pub := strings.TrimSpace(c.PublicKey)
+	for i := range existing {
+		if email != "" && strings.ToLower(strings.TrimSpace(existing[i].Email)) == email {
+			return true
+		}
+		if pub != "" && strings.TrimSpace(existing[i].PublicKey) == pub {
+			return true
+		}
+	}
+	return false
+}
+
 func countAwgOrWireguard(inbounds []*model.Inbound) int {
 	n := 0
 	for _, ib := range inbounds {
@@ -408,9 +661,63 @@ func clearBroadcastTunnelIP(c *model.Client, proto model.Protocol, tunnelInbound
 	if c == nil {
 		return
 	}
-	if (proto == model.AWG || proto == model.WireGuard) && tunnelInboundCount != 1 {
+	if isTunnelProtocol(proto) && tunnelInboundCount != 1 {
 		c.AllowedIPs = nil
 	}
+}
+
+func isTunnelProtocol(proto model.Protocol) bool {
+	return proto == model.AWG || proto == model.WireGuard || proto == model.AmneziaWG
+}
+
+// portForwardProtocol is the tunnel inbounds whose client JSON and client
+// record both store forwardedPorts. WireGuard has no host DNAT layer.
+func portForwardProtocol(proto model.Protocol) bool {
+	return proto == model.AmneziaWG || proto == model.AWG
+}
+
+func clearForeignTunnelFields(c *model.Client, proto model.Protocol) {
+	if c == nil || isTunnelProtocol(proto) {
+		return
+	}
+	c.PrivateKey = ""
+	c.PublicKey = ""
+	c.PreSharedKey = ""
+	c.AllowedIPs = nil
+}
+
+func mintTunnelKeypairOnce(c *model.Client, tunnelTarget bool) error {
+	if !tunnelTarget || c.PrivateKey != "" || c.PublicKey != "" {
+		return nil
+	}
+	priv, pub, err := wgutil.GenerateWireguardKeypair()
+	if err != nil {
+		return err
+	}
+	c.PrivateKey = priv
+	c.PublicKey = pub
+	return nil
+}
+
+func hasTunnelInbound(inbounds []*model.Inbound) bool {
+	for _, ib := range inbounds {
+		if ib != nil && isTunnelProtocol(ib.Protocol) {
+			return true
+		}
+	}
+	return false
+}
+
+func fillAwgPSK(c *model.Client) error {
+	if c.PreSharedKey != "" {
+		return nil
+	}
+	psk, err := wgutil.GenerateWireguardPSK()
+	if err != nil {
+		return err
+	}
+	c.PreSharedKey = psk
+	return nil
 }
 
 func awgOwnAllowedIPs(own map[string]map[string]struct{}, c *model.Client) map[string]struct{} {
@@ -499,11 +806,20 @@ func NodeAddressForInbound(inbound *model.Inbound) string {
 	return strings.TrimSpace(n.Address)
 }
 
-// BuildAwgClientConf renders a full AmneziaWG client .conf for export (panel QR
-// path / Telegram bot). Mirrors frontend buildAwgClientConfig: [Interface]
-// with client keypair, tunnel address, DNS, MTU, obfuscation block from
-// inboundAwgHints; [Peer] with server public key, PSK, full-tunnel AllowedIPs,
-// endpoint, and optional PersistentKeepalive.
+// AwgClientTunnelAddress returns the per-inbound tunnel IP for email from
+// settings.clients[].allowedIPs, then fallback (clients-table AllowedIPs).
+func AwgClientTunnelAddress(settings, email string, fallback []string) string {
+	if email = strings.TrimSpace(email); email != "" {
+		if ip := InboundAwgPeerAddresses(settings)[email]; ip != "" {
+			return ip
+		}
+	}
+	if len(fallback) > 0 {
+		return strings.TrimSpace(fallback[0])
+	}
+	return ""
+}
+
 func BuildAwgClientConf(inbound *model.Inbound, client *model.Client, endpointHost string) (string, error) {
 	if inbound == nil || client == nil {
 		return "", common.NewError("awg: missing inbound or client")
@@ -534,10 +850,7 @@ func BuildAwgClientConf(inbound *model.Inbound, client *model.Client, endpointHo
 	if serverPub == "" {
 		return "", common.NewError("awg: cannot derive server public key")
 	}
-	address := ""
-	if len(client.AllowedIPs) > 0 {
-		address = strings.TrimSpace(client.AllowedIPs[0])
-	}
+	address := AwgClientTunnelAddress(inbound.Settings, client.Email, client.AllowedIPs)
 	if address == "" {
 		address = "10.200.0.2/32"
 	}
@@ -547,13 +860,13 @@ func BuildAwgClientConf(inbound *model.Inbound, client *model.Client, endpointHo
 	}
 	mtu := s.MTU
 	if mtu <= 0 {
-		mtu = 1320
+		mtu = awg.DefaultMTU
 	}
 	host := formatEndpointHost(endpointHost)
 	if host == "" {
 		host = "127.0.0.1"
 	}
-	_, obf, _ := inboundAwgHints(inbound.Settings)
+	_, obf, _ := inboundAwgHints(inbound.Settings, inbound.NodeID == nil)
 
 	var b strings.Builder
 	b.WriteString("[Interface]\n")
@@ -574,8 +887,8 @@ func BuildAwgClientConf(inbound *model.Inbound, client *model.Client, endpointHo
 	}
 	b.WriteString("AllowedIPs = 0.0.0.0/0, ::/0\n")
 	fmt.Fprintf(&b, "Endpoint = %s:%d\n", host, inbound.Port)
-	if !client.KeepAlive.IsZero() {
-		fmt.Fprintf(&b, "PersistentKeepalive = %s\n", client.KeepAlive.String())
+	if ka := awg.CollapseTimerForVersion(client.KeepAlive.String(), awgSettingsVersion(inbound.Settings)); ka != "" {
+		fmt.Fprintf(&b, "PersistentKeepalive = %s\n", ka)
 	}
 	return b.String(), nil
 }

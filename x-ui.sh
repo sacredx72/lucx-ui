@@ -19,6 +19,40 @@ function LOGI() {
     echo -e "${green}[INF] $* ${plain}"
 }
 
+# LUCX-HOOK: GitHub default; Yandex if /etc/x-ui/install-source says so
+lucx_install_source() {
+    local src="${LUCX_SOURCE:-}"
+    if [[ -z "$src" && -r /etc/x-ui/install-source ]]; then
+        src=$(tr -d '[:space:]' < /etc/x-ui/install-source)
+    fi
+    case "$src" in
+        yandex | sourcecraft | sc | yc) echo yandex ;;
+        *) echo github ;;
+    esac
+}
+lucx_script_base() {
+    echo "https://raw.githubusercontent.com/AlexeyLCP/lucx-ui/main"
+}
+# Runs install.sh / update.sh from the SourceCraft dist bundle (anonymous
+# codeload download), used on yandex hosts. $1 = script name.
+lucx_run_from_dist() {
+    local script="$1"
+    local tmp
+    tmp=$(mktemp -d)
+    if curl -fLR --retry 3 --retry-delay 3 --connect-timeout 15 --max-time 600 \
+        "https://codeload.sourcecraft.tech/alexeylcp/lucx-ui/tarball/refs/heads/dist" \
+        | tar -xz --strip-components=1 -C "$tmp" && [[ -s "${tmp}/${script}" ]]; then
+        bash "${tmp}/${script}"
+        local rc=$?
+        rm -rf "$tmp"
+        return $rc
+    fi
+    rm -rf "$tmp"
+    LOGE "SourceCraft dist unavailable, falling back to GitHub"
+    return 1
+}
+# END LUCX-HOOK
+
 # Port helpers: detect listener and owning process (best effort)
 is_port_in_use() {
     local port="$1"
@@ -129,7 +163,11 @@ before_show_menu() {
 }
 
 install() {
-    bash <(curl -Ls https://raw.githubusercontent.com/AlexeyLCP/lucx-ui/main/install.sh)
+    if [[ "$(lucx_install_source)" == "yandex" ]]; then
+        lucx_run_from_dist install.sh
+    else
+        bash <(curl -Ls "$(lucx_script_base)/install.sh")
+    fi
     if [[ $? == 0 ]]; then
         if [[ $# == 0 ]]; then
             start
@@ -148,7 +186,11 @@ update() {
         fi
         return 0
     fi
-    bash <(curl -Ls https://raw.githubusercontent.com/AlexeyLCP/lucx-ui/main/update.sh)
+    if [[ "$(lucx_install_source)" == "yandex" ]]; then
+        lucx_run_from_dist update.sh
+    else
+        bash <(curl -Ls "$(lucx_script_base)/update.sh")
+    fi
     if [[ $? == 0 ]]; then
         LOGI "Update is complete, Panel has automatically restarted "
         before_show_menu
@@ -166,7 +208,7 @@ update_dev() {
     fi
     # XUI_UPDATE_TAG tells update.sh to install the dev-latest pre-release
     # instead of the latest stable tag.
-    XUI_UPDATE_TAG="dev-latest" bash <(curl -Ls https://raw.githubusercontent.com/AlexeyLCP/lucx-ui/main/update.sh)
+    XUI_UPDATE_TAG="dev-latest" bash <(curl -Ls "$(lucx_script_base)/update.sh")
     if [[ $? == 0 ]]; then
         LOGI "Dev update is complete, Panel has automatically restarted "
         before_show_menu
@@ -219,7 +261,7 @@ update_menu() {
         return 0
     fi
 
-    if replace_xui_script "https://raw.githubusercontent.com/AlexeyLCP/lucx-ui/main/x-ui.sh" "false"; then
+    if replace_xui_script "$(lucx_script_base)/x-ui.sh" "false"; then
         chmod +x ${xui_folder}/x-ui.sh
         echo -e "${green}Update successful. The panel has automatically restarted.${plain}"
         exit 0
@@ -340,6 +382,12 @@ reset_user() {
 
 gen_random_string() {
     local length="$1"
+    # LUCX-HOOK: openssl missing → empty path, `setting -webBasePath` is a no-op
+    if ! command -v openssl >/dev/null 2>&1; then
+        tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c "$length"
+        return
+    fi
+    # END LUCX-HOOK
     openssl rand -base64 $((length * 2)) \
         | tr -dc 'a-zA-Z0-9' \
         | head -c "$length"
@@ -354,10 +402,20 @@ reset_webbasepath() {
         return
     fi
 
-    config_webBasePath=$(gen_random_string 18)
-
-    # Apply the new web base path setting
-    ${xui_folder}/x-ui setting -webBasePath "${config_webBasePath}" > /dev/null 2>&1
+    # LUCX-HOOK: custom path, and do not hide a failed write (old path stayed)
+    read -rp "New web base path (empty = random): " config_webBasePath
+    if [[ -z "${config_webBasePath}" ]]; then
+        config_webBasePath=$(gen_random_string 18)
+    fi
+    if [[ -z "${config_webBasePath}" ]]; then
+        LOGE "Could not generate a web base path"
+        return
+    fi
+    if ! ${xui_folder}/x-ui setting -webBasePath "${config_webBasePath}"; then
+        LOGE "Failed to set web base path"
+        return
+    fi
+    # END LUCX-HOOK
 
     echo -e "Web base path has been reset to: ${green}${config_webBasePath}${plain}"
     echo -e "${green}Please use the new web base path to access the panel.${plain}"
@@ -884,7 +942,8 @@ check_status() {
         if [[ ! -f ${xui_service}/x-ui.service ]]; then
             return 2
         fi
-        temp=$(systemctl status x-ui | grep Active | awk '{print $3}' | cut -d "(" -f2 | cut -d ")" -f1)
+        temp=$(systemctl show --property=SubState x-ui)
+        temp=${temp#SubState=}
         if [[ "${temp}" == "running" ]]; then
             return 0
         else
@@ -2333,7 +2392,17 @@ setup_fail2ban_iplimit() {
             centos)
                 if [[ "${VERSION_ID}" =~ ^7 ]]; then
                     yum makecache -y && yum install epel-release -y
+                    # On EL7 fail2ban pulls in firewalld, which is enabled on the
+                    # next boot and blocks every panel/inbound port. The IP Limit
+                    # jail uses raw iptables, so a firewalld that was not there
+                    # before is not needed: keep it from starting on reboot.
+                    rpm -q firewalld &> /dev/null && had_firewalld=1 || had_firewalld=0
                     yum -y install fail2ban nftables
+                    if [[ "${had_firewalld}" == "0" ]] && rpm -q firewalld &> /dev/null; then
+                        systemctl disable firewalld 2> /dev/null
+                        echo -e "${yellow}firewalld was pulled in by fail2ban and has been disabled so it does not block your ports after a reboot.${plain}
+"
+                    fi
                 else
                     dnf makecache -y && dnf -y install fail2ban nftables
                 fi
@@ -2521,9 +2590,14 @@ create_iplimit_jails() {
     # Uncomment 'allowipv6 = auto' in fail2ban.conf
     sed -i 's/#allowipv6 = auto/allowipv6 = auto/g' /etc/fail2ban/fail2ban.conf
 
-    # On Debian 12+ and Ubuntu 22.04+ fail2ban's default backend should be changed to systemd
-    if [[ ( "${release}" == "debian" && ${os_version} -ge 12 ) || ( "${release}" == "ubuntu" && ${os_version} -ge 2200 ) ]]; then
-        sed -i '0,/action =/s/backend = auto/backend = systemd/' /etc/fail2ban/jail.conf
+    # Debian 12+ / Ubuntu 22.04+ log sshd to the journal only; a jail.d override
+    # survives package upgrades. Only the stock 'backend = auto' is overridden.
+    if [[ ( "${release}" == "debian" && ${os_version} -ge 12 ) || ( "${release}" == "ubuntu" && ${os_version} -ge 2200 ) ]] &&
+        sed -n '0,/action =/p' /etc/fail2ban/jail.conf | grep -q '^backend = auto'; then
+        cat << EOF > /etc/fail2ban/jail.d/3x-ipl-backend.conf
+[DEFAULT]
+backend = systemd
+EOF
     fi
 
     cat << EOF > /etc/fail2ban/jail.d/3x-ipl.conf

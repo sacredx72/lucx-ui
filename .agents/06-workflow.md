@@ -8,10 +8,10 @@ Extracted from AGENTS.md. This file is project law.
 
 ```
 1. READ    → Read .agents/00-index.md, then 01-purpose.md + 05-rules.md.
-             progress.md: last 1–2 entries only. git log --oneline -15
+             docs/progress.md: last 1–2 entries only. git log --oneline -15
 2. AUDIT   → Read all relevant files, trace data flow end-to-end
 3. PLAN    → Write a short plan: which files, what changes, what tests
-4. BRANCH  → Work on `main` (active branch, v3.6.0 migration merged)
+4. BRANCH  → Work on `main` (active branch, v3.7.0 merge complete)
 5. CODE    → Implement changes inside LUCX-HOOK blocks in upstream files;
              new code goes in internal/awg/ or internal/lucx/
 6. TEST    → Run tests:
@@ -32,8 +32,8 @@ Extracted from AGENTS.md. This file is project law.
              offer: (a) review/merge the PR first, (b) fix the issue first,
              (c) push after. Do not silently push over someone else's PR —
              you can overwrite or break their work.
-12. DOCS   → ALWAYS keep progress.md and .agents/ up to date. Every commit —
-             a new entry in progress.md (what was done, which lucxVersion, which
+12. DOCS   → ALWAYS keep docs/progress.md and .agents/ up to date. Every commit —
+             a new entry in docs/progress.md (what was done, which lucxVersion, which
              files, which tests). On architecture / rules / env / debug changes —
              update the matching .agents/ file. Do not grow AGENTS.md.
              Write all agent/project docs in English (Rule 11).
@@ -82,6 +82,8 @@ cp bin/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
 
 `install.sh` is adapted for our fork (`AlexeyLCP/lucx-ui`): downloads the release tarball and raw scripts (x-ui.sh, x-ui.rc, service units) from `main`. Xray-core + mtg are reused from the upstream `MHSanaei/3x-ui` release.
 
+GitHub is the source of truth. SourceCraft (`sc`, `alexeylcp/lucx-ui`) builds and tags independently (`.sourcecraft/ci.yaml` + `bin/sourcecraft-release.sh`). Optional install from Yandex: `install.sh --yandex` (or `LUCX_SOURCE=yandex`). The choice is stored in `/etc/x-ui/install-source` so later `x-ui update` stays on that host.
+
 ### Release build — GitHub Actions only (do NOT build on a VPS by hand)
 
 All builds are done by `.github/workflows/release.yml` (ubuntu-latest, CGO via
@@ -94,27 +96,29 @@ legacy — don’t use them: they drift from CI on xray/mtg versions.
 #    the tag pins the WHOLE main, but notes easily describe only the last fix
 #    and lose features/fixes that landed on main without their own tag.
 git fetch gh --tags
-git log --oneline v3.6.0-lucx.$((N-1))..HEAD
-# In notes and progress.md — EVERY non-docs commit from that list, not only lucx.N.
+git log --oneline v3.7.0-lucx.$((N-1))..HEAD
+# In notes and docs/progress.md — EVERY non-docs commit from that list, not only lucx.N.
 # Empty list except the previous release’s docs tail — OK.
 
 # 1. Wait for green CI on main, then tag — Release workflow
 #    will build the tarball and publish the stable release:
-git tag v3.6.0-lucx.N && git push gh v3.6.0-lucx.N
+git tag v3.7.0-lucx.N && git push gh v3.7.0-lucx.N
 gh run watch --repo AlexeyLCP/lucx-ui          # Release LucX-UI
-gh release view v3.6.0-lucx.N --repo AlexeyLCP/lucx-ui   # asset x-ui-linux-amd64.tar.gz
+gh release view v3.7.0-lucx.N --repo AlexeyLCP/lucx-ui   # assets x-ui-linux-amd64.tar.gz, x-ui-linux-arm64.tar.gz
+# Same tag also runs docker.yml → ghcr.io/alexeylcp/lucx-ui:<tag> and :latest
+# (amd64+arm64). First publish: GitHub → Packages → lucx-ui → Public.
 
 # 2. REQUIRED: release body (release notes) — what the operator sees
 #    in the panel on update (getPanelUpdateInfo → releaseNotes).
 #    upload-release-action often leaves body empty → fill it immediately:
-gh release edit v3.6.0-lucx.N --repo AlexeyLCP/lucx-ui --notes-file - <<'EOF'
-## v3.6.0-lucx.N
+gh release edit v3.7.0-lucx.N --repo AlexeyLCP/lucx-ui --notes-file - <<'EOF'
+## v3.7.0-lucx.N
 
 - item 1 (what changed for the user)
 - item 2
 - …
 EOF
-# Source: lucx.N entry in progress.md (compress to 5–15 bullets, in Russian
+# Source: lucx.N entry in docs/progress.md (compress to 5–15 bullets, in Russian
 # or EN+RU). Without notes the operator sees empty “What’s new” or raw compare.
 
 # 3. Install/update the panel on a VPS:
@@ -124,12 +128,12 @@ bash <(curl -fL https://raw.githubusercontent.com/AlexeyLCP/lucx-ui/main/install
 
 ### Release notes — law (mandatory)
 
-**Every stable tag `v3.6.0-lucx.N` MUST have a non-empty GitHub Release body.**
+**Every stable tag `v3.7.0-lucx.N` MUST have a non-empty GitHub Release body.**
 
 - The panel shows `release.Body` in the update modal (`PanelUpdateInfo.releaseNotes`).
 - Empty body → fallback `fetchCompareNotes` (raw commit subjects) — bad for testers.
 - Write **after** a successful Release workflow (`gh release edit … --notes` / `--notes-file`).
-- In parallel: entry in `progress.md` (detailed, for agents) + notes (short for UI/testers).
+- In parallel: entry in `docs/progress.md` (detailed, for agents) + notes (short for UI/testers).
 - If notes were forgotten on an already published tag — fill them immediately (`gh release edit`), don’t wait for the next release.
 
 #### Notes style (how we write for people)
@@ -163,11 +167,11 @@ release.yml fails the build on mismatch. Push to main without a tag updates
 the rolling pre-release `dev-latest` (panel Dev channel); `releases/latest`
 stays on the last stable tag.
 
-### What `x-ui update` does (lucx.58+)
+### What `x-ui update` does (lucx.230+)
 1. Installs the new binary/frontend, stops the panel.
-2. **Auto kernel upgrade** to the latest packaged (Debian/Ubuntu meta-package) — only if AWG is already installed (inside `install-awg-module.sh`).
-3. AWG-gate (only if the module was already installed: marker / `amneziawg` loaded / `awg-quick` in PATH). Else skip — `x-ui install-awg`. Marker `/etc/x-ui/.awg-module-version` vs `git ls-remote refs/heads/master`; mismatch → `--force-rebuild`.
-4. Start panel, migrate, fail2ban; if a new kernel was installed — **reboot in 10s** (AWG module already built for the new kernel; panel comes up via systemd).
+2. Geo: skip files that already exist; fetch only missing. Sidecars from the tarball (GitHub) or `x-ui-sidecars-*.tar.gz` (Yandex); refresh after start only when `lucx-pins.txt` sha mismatches.
+3. Start panel, then AWG `install-awg-module.sh` (missing = not current → try; pin match → no-op). Never fatal. **No auto-reboot** on update (print `.awg-reboot-needed`). Fresh `install.sh` may still reboot after DKMS kernel upgrade.
+4. fail2ban; sidecar pin skip.
 
 ### VPS build dependencies
 - Go 1.23+ (1.26 recommended)
@@ -177,15 +181,22 @@ stays on the last stable tag.
 
 ### Release layout (same as upstream)
 ```
-x-ui-linux-amd64.tar.gz → x-ui/
-  ├── x-ui                    ← our binary (CGO, built from the fork)
+x-ui-linux-{amd64,arm64}.tar.gz → x-ui/
+  ├── x-ui                    ← our binary (CGO, Bootlin musl static)
   ├── x-ui.sh, x-ui.rc        ← from the repo
   ├── x-ui.service.{debian,arch,rhel}  ← from the repo
   └── bin/
-      ├── xray-linux-amd64    ← from upstream release (not our code)
-      ├── mtg-linux-amd64     ← from upstream release (not our code)
-      └── install-awg-module.sh  ← our DKMS script
+      ├── xray-linux-{arch}   ← from upstream Xray-core release
+      ├── mtg-linux-{arch}    ← from upstream mtg-multi release
+      ├── install-awg-module.sh  ← our DKMS script
+      └── caddy-naive / olcrtc / qwdtt / csqtt / mieru / trusttunnel / anytls / tproxy / mtproxy (+ clients)
+          ← same names for amd64 and arm64 except mtproxy (amd64-only, x86 C engine).
+            amd64 unpacks third_party gz; arm64 from bin/pack-sidecars.sh + tproxy in release.yml.
 ```
+
+Geo is not in the GitHub panel tarball. `install.sh` / `update.sh` fetch Loyalsoldier + IR/RU/ROSCOM **before** panel start if the file is missing (never fatal). SourceCraft unpacks `x-ui-geo.tar.gz` for missing names only. Xray `geodata.assets` cron (`0 4 * * *`) refreshes all 8 on a live panel.
+
+Tunnel sidecars (gzipped) live in `third_party/sidecars/linux-amd64/`. GitHub tarball includes unpacked binaries + `bin/lucx-pins.txt`. SourceCraft stays SLIM amd64 (100 MB cap) and adds `x-ui-sidecars-amd64.tar.gz` (split to `sidecars/*.gz` if over 100 MB).
 
 ---
 

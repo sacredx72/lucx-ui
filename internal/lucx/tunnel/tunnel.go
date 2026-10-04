@@ -10,6 +10,7 @@
 //   - NaiveProxy — Caddy + klzgrad/forwardproxy (HTTP/2 padding)
 //   - olcRTC — openlibrecommunity/olcrtc (TCP-over-WebRTC via meet rooms)
 //   - qWDTT — SpaceNeuroX wdtt-server (WireGuard over VK TURN)
+//   - CSQTT — amurcanov/csqtt rust-server (TURN/RTP; not qWDTT)
 //
 // Each core is one supervised process with a panel-rendered config file (or
 // CLI args), an isolated data directory and a health probe (process alive;
@@ -45,6 +46,11 @@ const Olcrtc Name = "olcrtc"
 // external process — not linked into the panel.
 const Qwdtt Name = "qwdtt"
 
+// Csqtt is the CSQTT core: TURN/RTP tunnel (amurcanov/csqtt rust-server,
+// PolyForm NC). Not wire-compatible with qWDTT. Needs root (TUN csqtt1).
+// Binary is an external process — not linked into the panel.
+const Csqtt Name = "csqtt"
+
 // Mieru is the mieru core: mita server (enfein/mieru, GPL-3.0) — a
 // censorship-resistant SOCKS/HTTP proxy over a custom TCP/UDP protocol
 // (XChaCha20-Poly1305, no TLS). Multi-user; per-panel-client credentials.
@@ -55,6 +61,16 @@ const Mieru Name = "mieru"
 // traffic indistinguishable from HTTPS (HTTP/1.1 + HTTP/2 + QUIC). Requires
 // a trusted TLS certificate (panel ACME certs are reused); multi-client.
 const TrustTunnel Name = "trusttunnel"
+
+// Anytls is the AnyTLS core: anytls-server (anytls/anytls-go reference
+// implementation) — TLS proxy that splits the outer TLS handshake to dodge
+// TLS-in-TLS fingerprints. Single shared password per instance; clients are
+// sing-box / mihomo / Shadowrocket / Stash / Loon.
+const Anytls Name = "anytls"
+
+// Tproxy is Telegram Desktop WEB proxy (tproxy-server + official MTProxy
+// + Caddy TLS reverse_proxy). Share: https://t.me/webproxy?server=&secret=.
+// Mtproxy / TproxyCaddy are the companion processes of one tproxy inbound.
 
 // Client-mode cores (outbound sidecars). Distinct Name values so BinaryName
 // never collides with inbound servers (caddy-naive / mita / trusttunnel_endpoint)
@@ -68,7 +84,7 @@ const (
 
 // All returns the supported INBOUND core names in display order.
 func All() []Name {
-	return []Name{Naive, Olcrtc, Qwdtt, Mieru, TrustTunnel}
+	return []Name{Naive, Olcrtc, Qwdtt, Csqtt, Mieru, TrustTunnel, Anytls, Tproxy, Mtproxy, TproxyCaddy, Cover, Gateway}
 }
 
 // ClientCores returns outbound-client binary names (orphan sweep + Cores UI).
@@ -79,7 +95,7 @@ func ClientCores() []Name {
 // Valid reports whether n is one of the supported core names.
 func (n Name) Valid() bool {
 	switch n {
-	case Naive, Olcrtc, Qwdtt, Mieru, TrustTunnel, NaiveClient, MieruClient, TrustTunnelClient:
+	case Naive, Olcrtc, Qwdtt, Csqtt, Mieru, TrustTunnel, Anytls, Tproxy, Mtproxy, TproxyCaddy, Cover, Gateway, NaiveClient, MieruClient, TrustTunnelClient:
 		return true
 	}
 	return false
@@ -94,10 +110,24 @@ func (n Name) DisplayName() string {
 		return "olcRTC"
 	case Qwdtt:
 		return "qWDTT"
+	case Csqtt:
+		return "CSQTT"
 	case Mieru:
 		return "mieru"
 	case TrustTunnel:
 		return "TrustTunnel"
+	case Anytls:
+		return "AnyTLS"
+	case Tproxy:
+		return "Telegram WEB proxy"
+	case Mtproxy:
+		return "MTProxy"
+	case TproxyCaddy:
+		return "Caddy (tproxy)"
+	case Cover:
+		return "Cover site"
+	case Gateway:
+		return "SNI gateway"
 	case NaiveClient:
 		return "NaiveProxy client"
 	case MieruClient:
@@ -115,8 +145,10 @@ func (n Name) DisplayName() string {
 func (n Name) BinaryName() string {
 	var name string
 	switch n {
-	case Naive:
+	case Naive, TproxyCaddy, Cover:
 		name = fmt.Sprintf("caddy-naive-%s-%s", runtime.GOOS, runtime.GOARCH)
+	case Gateway:
+		name = fmt.Sprintf("caddy-layer4-%s-%s", runtime.GOOS, runtime.GOARCH)
 	case NaiveClient:
 		name = fmt.Sprintf("naive-client-%s-%s", runtime.GOOS, runtime.GOARCH)
 	case MieruClient:
@@ -174,11 +206,11 @@ func trustTunnelHostsFileName(key string) string {
 func configPathFor(key string, n Name) string {
 	if key != "" && key != string(n) {
 		switch n {
-		case Naive:
+		case Naive, TproxyCaddy, Cover, Gateway:
 			return filepath.Join(workDir(), key+".caddyfile")
 		case Olcrtc:
 			return filepath.Join(workDir(), key+".yaml")
-		case Mieru, MieruClient, NaiveClient:
+		case Mieru, MieruClient, NaiveClient, Tproxy:
 			return filepath.Join(workDir(), key+".json")
 		case TrustTunnel, TrustTunnelClient:
 			return filepath.Join(workDir(), key+".toml")

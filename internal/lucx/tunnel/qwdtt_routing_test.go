@@ -7,10 +7,25 @@
 package tunnel
 
 import (
+	"net"
 	"testing"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 )
+
+func TestQwdttAndCsqttSubnetsDisjoint(t *testing.T) {
+	_, wg, err := net.ParseCIDR(qwdttSubnetWG)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cs, err := net.ParseCIDR(csqttSubnet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wg.Contains(cs.IP) || cs.Contains(wg.IP) {
+		t.Fatalf("overlap: qWDTT %s CSQTT %s", qwdttSubnetWG, csqttSubnet)
+	}
+}
 
 func TestQwdttTunHelpers(t *testing.T) {
 	if got := QwdttTunName(35); got != "tun35" {
@@ -21,6 +36,12 @@ func TestQwdttTunHelpers(t *testing.T) {
 	}
 	if got := QwdttTunGateway(35); got != "10.253.35.1/30" {
 		t.Fatalf("Gateway: %s", got)
+	}
+	if QwdttTunGateway(1) == QwdttTunGateway(255) {
+		t.Fatal("gateway must not wrap id 1 onto id 255")
+	}
+	if QwdttRouteTable(1) == QwdttRouteTable(91) {
+		t.Fatal("route table must not wrap at %90")
 	}
 }
 

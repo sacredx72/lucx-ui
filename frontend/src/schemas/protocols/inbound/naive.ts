@@ -19,7 +19,10 @@ export const NaiveClientSchema = z.object({
 export type NaiveClient = z.infer<typeof NaiveClientSchema>;
 
 export const NaiveInboundSettingsSchema = z.object({
-  domain: z.string().default(''),
+  domain: z
+    .string()
+    .refine((v) => !/[\n\r{}, ]/.test(v))
+    .default(''),
   useAcme: z.boolean().default(false),
   acmeEmail: z.string().default(''),
   certFile: z.string().default(''),
@@ -35,6 +38,8 @@ export const NaiveInboundSettingsSchema = z.object({
   routeXrayPort: z.number().int().min(0).max(65535).optional(),
   useRawConfig: z.boolean().default(false),
   rawConfig: z.string().default(''),
+  behindCover: z.boolean().default(false),
+  authSeed: z.string().optional(),
   clients: z.array(NaiveClientSchema).default([]),
 });
 export type NaiveInboundSettings = z.infer<typeof NaiveInboundSettingsSchema>;

@@ -8,10 +8,15 @@ package awg
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
+	"github.com/mhsanaei/3x-ui/v3/internal/logger"
 )
 
 // AwgTimer is the stored form of an AWG3 device-level timer/padding value.
@@ -22,6 +27,8 @@ import (
 // tolerates a JSON number as well (legacy inbounds / panel defaults store 0 as
 // a number), normalizing it to its string form.
 type AwgTimer string
+
+var awgTimerPat = regexp.MustCompile(`^[0-9]+(-[0-9]+)?$`)
 
 func (t *AwgTimer) UnmarshalJSON(b []byte) error {
 	s := strings.TrimSpace(string(b))
@@ -34,11 +41,37 @@ func (t *AwgTimer) UnmarshalJSON(b []byte) error {
 		if err := json.Unmarshal(b, &str); err != nil {
 			return err
 		}
-		*t = AwgTimer(strings.TrimSpace(str))
+		s = strings.TrimSpace(str)
+	}
+	if s != "" && !awgTimerPat.MatchString(s) {
+		*t = ""
 		return nil
 	}
 	*t = AwgTimer(s)
 	return nil
+}
+
+func validIptablesIface(name string) bool {
+	if name == "" || len(name) > 15 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_' || c == '.' || c == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func confValue(v string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == 0 {
+			return -1
+		}
+		return r
+	}, v)
 }
 
 // IsZero reports whether the value is empty or a zero (the kernel built-in
@@ -116,61 +149,64 @@ type Instance struct {
 	// TUN inbound for this AWG interface so decrypted packets flow through
 	// Xray's routing rules. Mirrors mtproto's RouteThroughXray.
 	RouteThroughXray bool
+	XrayRoutingMode  string
+	TproxyPort       int
 	OutboundTag      string
+	// P2P, when set, lets clients of this inbound reach each other by tunnel
+	// IP (kernel hairpin). Off (default, missing JSON key) isolates them.
+	// Server-only: not written to the .conf, so toggling does not bounce the iface.
+	P2P bool
 }
 
 // PeerSpec is one desired peer on an AWG interface.
 type PeerSpec struct {
-	PrivateKey string // client Curve25519 private key (stored so we can render a full client .conf/share-link, mirroring WireGuard)
-	PublicKey  string // client Curve25519 public key (stored as Client.ID / clients[].publicKey)
-	PSK        string // PresharedKey (stored as Client.Password / clients[].preSharedKey)
-	Keepalive  AwgTimer
-	AllowedIPs string
+	PrivateKey     string // client Curve25519 private key (stored so we can render a full client .conf/share-link, mirroring WireGuard)
+	PublicKey      string // client Curve25519 public key (stored as Client.ID / clients[].publicKey)
+	PSK            string // PresharedKey (stored as Client.Password / clients[].preSharedKey)
+	Keepalive      AwgTimer
+	AllowedIPs     string
+	Email          string
+	ForwardedPorts string
 }
 
-// fingerprint changes whenever any value that ends up in the generated .conf
-// changes, so ensureLocked restarts awg-quick when the operator edits a setting.
-func (inst Instance) fingerprint() string {
-	parts := []string{
-		inst.Ifname,
-		strconv.Itoa(inst.Port),
-		inst.PrivateKey,
-		strconv.Itoa(inst.MTU),
-		inst.DNS,
-		inst.Address,
-		strconv.Itoa(inst.Jc),
-		strconv.Itoa(inst.Jmin),
-		strconv.Itoa(inst.Jmax),
-		strconv.Itoa(inst.S1),
-		strconv.Itoa(inst.S2),
-		strconv.Itoa(inst.S3),
-		strconv.Itoa(inst.S4),
-		inst.H1,
-		inst.H2,
-		inst.H3,
-		inst.H4,
-		inst.I1,
-		inst.I2,
-		inst.I3,
-		inst.I4,
-		inst.I5,
-		inst.HeaderProtectionKey,
-		string(inst.ContentPaddingAddition),
-		string(inst.RekeyAfterTime),
-		string(inst.RekeyTimeout),
-		string(inst.RejectAfterTime),
-		string(inst.KeepaliveTimeout),
-		string(inst.MaxHandshakeAttempts),
-		strconv.FormatBool(inst.RandomTrailers),
-		strconv.FormatBool(inst.DisableCookies),
-		inst.AwgVersion,
-		strconv.FormatBool(inst.RouteThroughXray),
-		inst.OutboundTag,
-	}
+// deviceFingerprint takes a rendered server .conf and keeps the half awg-quick
+// can only apply by recreating the interface; peers go in through syncconf.
+func deviceFingerprint(serverConf string) string {
+	device, _, _ := strings.Cut(serverConf, "\n[Peer]\n")
+	return device
+}
+
+func (inst Instance) peerFingerprint() string {
+	parts := make([]string, 0, len(inst.Peers)*4)
 	for _, p := range inst.Peers {
 		parts = append(parts, p.PrivateKey, p.PublicKey, p.PSK, p.AllowedIPs)
 	}
 	return strings.Join(parts, "|")
+}
+
+// DefaultMTU is 1500 (typical Ethernet) minus AWG overhead — optimal for a
+// normal VPS; a client behind CGNAT may need 1320, set via the mtu field.
+const DefaultMTU = 1420
+
+// addresslessWarned keys the peers already reported. Reconcile re-derives every
+// instance every 10s, so an unthrottled line would be 8640 a day per client.
+var addresslessWarned sync.Map
+
+func addresslessKey(inboundID int, email string) string {
+	return strconv.Itoa(inboundID) + "\x00" + email
+}
+
+func warnAddresslessPeerOnce(inboundID int, email string) {
+	if _, seen := addresslessWarned.LoadOrStore(addresslessKey(inboundID, email), struct{}{}); seen {
+		return
+	}
+	logger.Warningf("awg: inbound %d: client %q has no allowedIPs, peer not written", inboundID, email)
+}
+
+// clearAddresslessPeerWarning re-arms the line once the client has an address,
+// so the same peer losing it again is reported rather than swallowed.
+func clearAddresslessPeerWarning(inboundID int, email string) {
+	addresslessWarned.Delete(addresslessKey(inboundID, email))
 }
 
 // InstanceFromInbound derives a desired Instance from an AWG inbound. Returns
@@ -204,23 +240,21 @@ func InstanceFromInbound(ib *model.Inbound) (Instance, bool) {
 		HeaderProtectionKey string `json:"headerProtectionKey"`
 		AwgVersion          string `json:"awgVersion"`
 		RouteThroughXray    bool   `json:"routeThroughXray"`
+		XrayRoutingMode     string `json:"xrayRoutingMode"`
+		TproxyPort          int    `json:"tproxyPort"`
 		OutboundTag         string `json:"outboundTag"`
+		P2P                 bool   `json:"p2p"`
 		Clients             []struct {
-			// New canonical fields (mirror WireGuard clients).
-			PublicKey    string   `json:"publicKey"`
-			PrivateKey   string   `json:"privateKey"`
-			PreSharedKey string   `json:"preSharedKey"`
-			AllowedIPs   []string `json:"allowedIPs"`
-			// KeepAlive is AwgTimer so AWG3 ranges ("15-25") and legacy JSON
-			// numbers both round-trip; 0/empty = off (no forced default of 25).
-			KeepAlive AwgTimer `json:"keepAlive"`
-			// Legacy fields kept for backward compat (old inbounds created
-			// before this change store id=publicKey, password=PSK). The JSON
-			// tag `enable` defaults to false when absent — but the panel
-			// always writes it, so absent-false only happens on malformed data.
-			ID       string `json:"id"`
-			Password string `json:"password"`
-			Enable   *bool  `json:"enable"`
+			PublicKey      string   `json:"publicKey"`
+			PrivateKey     string   `json:"privateKey"`
+			PreSharedKey   string   `json:"preSharedKey"`
+			AllowedIPs     []string `json:"allowedIPs"`
+			KeepAlive      AwgTimer `json:"keepAlive"`
+			Email          string   `json:"email"`
+			ForwardedPorts string   `json:"forwardedPorts"`
+			ID             string   `json:"id"`
+			Password       string   `json:"password"`
+			Enable         *bool    `json:"enable"`
 		} `json:"clients"`
 		// AWG3 device-level timers/padding. AwgTimer unmarshals a JSON number
 		// (legacy) or a string ("150" / "100-500" range) so native kernel ranges
@@ -246,12 +280,9 @@ func InstanceFromInbound(ib *model.Inbound) (Instance, bool) {
 		Listen: ib.Listen,
 		Port:   ib.Port,
 		Ifname: ifnameFor(ib.Id),
-		// 1420 = 1500 (typical Ethernet) minus WireGuard/AWG overhead, the
-		// throughput-optimal fallback on a normal VPS. Only used when an
-		// inbound's settings JSON omits mtu entirely (pre-lucx MTU field,
-		// or hand-crafted JSON); the panel form always sends an explicit
-		// value (1420 default, operator can drop to 1320 for mobile/CGNAT).
-		MTU:                    orDefault(s.MTU, 1420),
+		// Falls back only when settings JSON omits mtu (pre-lucx field,
+		// hand-crafted JSON); the panel form always sends an explicit value.
+		MTU:                    orDefault(s.MTU, DefaultMTU),
 		DNS:                    s.DNS,
 		Address:                s.Address,
 		PrivateKey:             s.PrivateKey,
@@ -274,7 +305,10 @@ func InstanceFromInbound(ib *model.Inbound) (Instance, bool) {
 		HeaderProtectionKey:    s.HeaderProtectionKey,
 		AwgVersion:             NormalizeAWGVersion(s.AwgVersion),
 		RouteThroughXray:       s.RouteThroughXray,
+		XrayRoutingMode:        s.XrayRoutingMode,
+		TproxyPort:             s.TproxyPort,
 		OutboundTag:            s.OutboundTag,
+		P2P:                    s.P2P,
 		ContentPaddingAddition: s.ContentPaddingAddition,
 		RekeyAfterTime:         s.RekeyAfterTime,
 		RekeyTimeout:           s.RekeyTimeout,
@@ -290,27 +324,37 @@ func InstanceFromInbound(ib *model.Inbound) (Instance, bool) {
 		if c.Enable != nil && !*c.Enable {
 			continue
 		}
-		pub := c.PublicKey
-		psk := c.PreSharedKey
+		pub := strings.TrimSpace(c.PublicKey)
+		psk := strings.TrimSpace(c.PreSharedKey)
 		if pub == "" {
-			pub = c.ID // legacy field
+			pub = strings.TrimSpace(c.ID) // legacy field
 		}
-		if psk == "" {
-			psk = c.Password // legacy field
+		// Form clients always carry password (16-char NumLower). That is NOT
+		// a PSK — awg syncconf then dies: "Key is not the correct length".
+		// Legacy AWG stored the real PSK in password only as the id/password
+		// pair (no publicKey).
+		if psk == "" && strings.TrimSpace(c.PublicKey) == "" {
+			psk = strings.TrimSpace(c.Password)
 		}
 		if pub == "" {
 			continue
 		}
-		allowed := "0.0.0.0/0, ::/0"
-		if len(c.AllowedIPs) > 0 && c.AllowedIPs[0] != "" {
-			allowed = strings.Join(c.AllowedIPs, ", ")
+		if len(c.AllowedIPs) == 0 || strings.TrimSpace(c.AllowedIPs[0]) == "" {
+			// Dropped rather than defaulted to 0.0.0.0/0, which made awg-quick
+			// seize the host's routing. Say so: the client just stops connecting.
+			warnAddresslessPeerOnce(ib.Id, c.Email)
+			continue
 		}
+		clearAddresslessPeerWarning(ib.Id, c.Email)
+		allowed := strings.Join(c.AllowedIPs, ", ")
 		inst.Peers = append(inst.Peers, PeerSpec{
-			PrivateKey: c.PrivateKey,
-			PublicKey:  pub,
-			PSK:        psk,
-			Keepalive:  c.KeepAlive,
-			AllowedIPs: allowed,
+			PrivateKey:     c.PrivateKey,
+			PublicKey:      pub,
+			PSK:            psk,
+			Keepalive:      c.KeepAlive,
+			AllowedIPs:     allowed,
+			Email:          c.Email,
+			ForwardedPorts: c.ForwardedPorts,
 		})
 	}
 	return inst, true
@@ -336,6 +380,100 @@ func NormalizeAWGVersion(v string) string {
 	default:
 		return "2"
 	}
+}
+
+// CollapseTimerForVersion returns a keepalive/timer string safe for the given
+// AWG protocol version. Pre-v3 tools parse PersistentKeepalive as a single
+// integer and reject "15-25". Empty/zero → "".
+func CollapseTimerForVersion(raw, version string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" || s == "0" || s == "0-0" {
+		return ""
+	}
+	if !IsAwg3Plus(version) {
+		if i := strings.IndexByte(s, '-'); i > 0 {
+			s = strings.TrimSpace(s[:i])
+		}
+	}
+	return s
+}
+
+var awgHFieldRe = regexp.MustCompile(`^[0-9]+(-[0-9]+)?$`)
+
+// ErrEmptyObfuscationHeader: blank H1-H4 on an obfuscated inbound falls back
+// to the kernel default 1,2,3,4 (cleartext WireGuard) — not silently applied.
+var ErrEmptyObfuscationHeader = errors.New("awg: H1-H4 must not be empty when obfuscation is enabled")
+
+// Blank H1-H4 writes "H1 = " to the .conf; awg setconf then rejects the
+// WHOLE file and the interface never comes up (1.5 also rejects range H: v1.x awg-quick errors "Unable to parse H1").
+func ValidateObfuscationFields(version string, jc, s1 int, h1, h2, h3, h4 string) error {
+	ver := NormalizeAWGVersion(version)
+	obfuscated := jc > 0 || s1 > 0
+	for i, h := range []string{h1, h2, h3, h4} {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			if obfuscated {
+				return fmt.Errorf("awg: H%d is empty: %w", i+1, ErrEmptyObfuscationHeader)
+			}
+			continue
+		}
+		if !awgHFieldRe.MatchString(h) {
+			return fmt.Errorf("awg: H%d is not an integer or lo-hi range", i+1)
+		}
+		if ver == "1.5" && strings.Contains(h, "-") {
+			return fmt.Errorf("awg: H%d is a range but awgVersion is 1.5 — regenerate obfuscation", i+1)
+		}
+	}
+	return nil
+}
+
+// ErrTimerOutOfRange: upstream tools bound-check against UINT32_MAX and
+// silently truncate (RekeyTimeout=70000 becomes 4464); catch it here first.
+var ErrTimerOutOfRange = errors.New("awg: device timer out of range")
+
+// ValidateDeviceTimer checks one AWG3 device timer (name labels the error).
+// Empty/zero passes; else it must match H1-H4's lo-hi grammar, hi >= lo, both <= 65535.
+func ValidateDeviceTimer(name string, t AwgTimer) error {
+	if t.IsZero() {
+		return nil
+	}
+	s := strings.TrimSpace(string(t))
+	if !awgHFieldRe.MatchString(s) {
+		return fmt.Errorf("awg: %s is not an integer or lo-hi range", name)
+	}
+	lo, hi := s, s
+	if i := strings.IndexByte(s, '-'); i >= 0 {
+		lo, hi = s[:i], s[i+1:]
+	}
+	loN, loErr := strconv.ParseUint(lo, 10, 32)
+	hiN, hiErr := strconv.ParseUint(hi, 10, 32)
+	if loErr != nil || hiErr != nil || loN > 65535 || hiN > 65535 {
+		return fmt.Errorf("%w: %s (%s) must be 0-65535", ErrTimerOutOfRange, name, s)
+	}
+	if hiN < loN {
+		return fmt.Errorf("%w: %s range %s has hi < lo", ErrTimerOutOfRange, name, s)
+	}
+	return nil
+}
+
+func timerHi(t AwgTimer) int64 {
+	s := strings.TrimSpace(string(t))
+	if s == "" || s == "0" || s == "0-0" {
+		return 0
+	}
+	if i := strings.LastIndexByte(s, '-'); i >= 0 {
+		s = strings.TrimSpace(s[i+1:])
+	}
+	n, _ := strconv.ParseInt(s, 10, 64)
+	return n
+}
+
+func onlineTTLSeconds(inst Instance) int64 {
+	ttl := int64(handshakeOnlineTTL)
+	if hi := timerHi(inst.RekeyAfterTime); hi+60 > ttl {
+		ttl = hi + 60
+	}
+	return ttl
 }
 
 // IsAwg3Plus reports whether v includes the AWG3 field set (HPK + device

@@ -267,7 +267,11 @@ func (c MieruConfig) ClientLink(host string, pair AuthPair, remark string) strin
 		return ""
 	}
 	var q []string
-	q = append(q, "profile=default")
+	profile := strings.TrimSpace(remark)
+	if profile == "" {
+		profile = "default"
+	}
+	q = append(q, "profile="+url.QueryEscape(profile))
 	if c.MTU > 0 {
 		q = append(q, "mtu="+strconv.Itoa(c.MTU))
 	}
@@ -286,7 +290,7 @@ func (c MieruConfig) ClientLink(host string, pair AuthPair, remark string) strin
 		q = append(q, "protocol="+strings.ToUpper(strings.TrimSpace(b.Protocol)))
 	}
 	if tp := c.TrafficPattern.LinkParam(); tp != "" {
-		q = append(q, "traffic-pattern="+url.QueryEscape(tp))
+		q = append(q, "traffic-pattern="+tp)
 	}
 	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
 		host = "[" + host + "]"

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
 import { Button, Checkbox, Form, Input, Modal, Select, Tag } from 'antd';
 import { DownloadOutlined, SyncOutlined } from '@ant-design/icons';
@@ -15,20 +16,33 @@ interface XrayLogModalProps {
 }
 
 interface XrayLogEntry {
-  DateTime?: string | number;
-  FromAddress?: string;
-  ToAddress?: string;
-  Inbound?: string;
-  Outbound?: string;
-  Email?: string;
-  Event?: number;
+  dateTime?: string | number;
+  fromAddress?: string;
+  toAddress?: string;
+  inbound?: string;
+  outbound?: string;
+  email?: string;
+  event?: number;
 }
 
-const EVENT_LABELS: Record<number, string> = { 0: 'DIRECT', 1: 'BLOCKED', 2: 'PROXY' };
+// The downloaded log is a data format people grep, so it keeps the stable
+// tokens; only what is rendered on screen follows the panel language.
+const EVENT_TOKENS: Record<number, string> = { 0: 'DIRECT', 1: 'BLOCKED', 2: 'PROXY' };
+
+const EVENT_KEYS: Record<number, string> = {
+  0: 'pages.index.accessDirect',
+  1: 'pages.index.accessBlocked',
+  2: 'pages.index.accessProxy',
+};
 const EVENT_COLORS: Record<number, string> = { 0: 'green', 1: 'red', 2: 'blue' };
 
-function eventLabel(ev?: number): string {
-  return EVENT_LABELS[ev ?? -1] ?? String(ev ?? '');
+function eventToken(ev?: number): string {
+  return EVENT_TOKENS[ev ?? -1] ?? String(ev ?? '');
+}
+
+function eventLabel(t: TFunction, ev?: number): string {
+  const key = EVENT_KEYS[ev ?? -1];
+  return key ? t(key) : String(ev ?? '');
 }
 
 function eventColor(ev?: number): string {
@@ -59,12 +73,10 @@ export default function XrayLogModal({ open, onClose }: XrayLogModalProps) {
   const [autoUpdate, setAutoUpdate] = useState(false);
   const [loading, setLoading] = useState(false);
   const [logs, setLogs] = useState<XrayLogEntry[]>([]);
-  const openRef = useRef(open);
 
   const orderedLogs = useMemo(() => [...logs].reverse(), [logs]);
 
-  const refresh = useCallback(async () => {
-    setLoading(true);
+  const runRefresh = useCallback(async () => {
     try {
       const msg = await HttpUtil.post<XrayLogEntry[]>(`/panel/api/server/xraylogs/${rows}`, {
         filter,
@@ -79,19 +91,30 @@ export default function XrayLogModal({ open, onClose }: XrayLogModalProps) {
     }
   }, [rows, filter, showDirect, showBlocked, showProxy]);
 
+  const refresh = useCallback(() => {
+    setLoading(true);
+    void runRefresh();
+  }, [runRefresh]);
+
   const refreshRef = useRef(refresh);
   useEffect(() => {
     refreshRef.current = refresh;
-  }, [refresh]);
+  });
+
+  // The spinner is raised during render so the fetch effect stays side-effect
+  // free until its response lands.
+  const refreshKey = open
+    ? `${rows}\u0000${showDirect}\u0000${showBlocked}\u0000${showProxy}`
+    : null;
+  const [loadingKey, setLoadingKey] = useState<string | null>(null);
+  if (refreshKey !== loadingKey) {
+    setLoadingKey(refreshKey);
+    if (refreshKey) setLoading(true);
+  }
 
   useEffect(() => {
-    openRef.current = open;
-    if (open) refresh();
-  }, [open, refresh]);
-
-  useEffect(() => {
-    if (openRef.current) refresh();
-  }, [rows, showDirect, showBlocked, showProxy, refresh]);
+    if (open) void runRefresh();
+  }, [open, rows, showDirect, showBlocked, showProxy, runRefresh]);
 
   useEffect(() => {
     if (!open || !autoUpdate) return;
@@ -108,17 +131,19 @@ export default function XrayLogModal({ open, onClose }: XrayLogModalProps) {
       FileManager.downloadTextFile('', 'x-ui.log');
       return;
     }
-    const lines = logs.map((l) => {
-      try {
-        const dt = l.DateTime ? new Date(l.DateTime) : null;
-        const dateStr = dt && !isNaN(dt.getTime()) ? dt.toISOString() : '';
-        const eventText = eventLabel(l.Event);
-        const emailPart = l.Email ? ` Email=${l.Email}` : '';
-        return `${dateStr} FROM=${l.FromAddress || ''} TO=${l.ToAddress || ''} INBOUND=${l.Inbound || ''} OUTBOUND=${l.Outbound || ''}${emailPart} EVENT=${eventText}`.trim();
-      } catch {
-        return JSON.stringify(l);
-      }
-    }).join('\n');
+    const lines = logs
+      .map((l) => {
+        try {
+          const dt = l.dateTime ? new Date(l.dateTime) : null;
+          const dateStr = dt && !isNaN(dt.getTime()) ? dt.toISOString() : '';
+          const eventText = eventToken(l.event);
+          const emailPart = l.email ? ` Email=${l.email}` : '';
+          return `${dateStr} FROM=${l.fromAddress || ''} TO=${l.toAddress || ''} INBOUND=${l.inbound || ''} OUTBOUND=${l.outbound || ''}${emailPart} EVENT=${eventText}`.trim();
+        } catch {
+          return JSON.stringify(l);
+        }
+      })
+      .join('\n');
     FileManager.downloadTextFile(lines, 'x-ui.log');
   }
 
@@ -133,7 +158,15 @@ export default function XrayLogModal({ open, onClose }: XrayLogModalProps) {
       title={
         <>
           {t('pages.index.accessLogs')}
-          <SyncOutlined spin={loading} className="reload-icon" role="button" tabIndex={0} aria-label={t('refresh')} onClick={refresh} onKeyDown={activateOnKey(refresh)} />
+          <SyncOutlined
+            spin={loading}
+            className="reload-icon"
+            role="button"
+            tabIndex={0}
+            aria-label={t('refresh')}
+            onClick={refresh}
+            onKeyDown={activateOnKey(refresh)}
+          />
         </>
       }
     >
@@ -142,7 +175,7 @@ export default function XrayLogModal({ open, onClose }: XrayLogModalProps) {
           <Select
             value={rows}
             size="small"
-            style={{ width: 70 }}
+            style={{ width: 100 }}
             onChange={setRows}
             options={[
               { value: '20', label: '20' },
@@ -178,7 +211,12 @@ export default function XrayLogModal({ open, onClose }: XrayLogModalProps) {
           </Checkbox>
         </Form.Item>
         <Form.Item className="download-item">
-          <Button type="primary" onClick={download} icon={<DownloadOutlined />} aria-label={t('download')} />
+          <Button
+            type="primary"
+            onClick={download}
+            icon={<DownloadOutlined />}
+            aria-label={t('download')}
+          />
         </Form.Item>
       </Form>
 
@@ -189,35 +227,35 @@ export default function XrayLogModal({ open, onClose }: XrayLogModalProps) {
           orderedLogs.map((log, idx) => (
             <div key={idx} className="log-card">
               <div className="log-card-head">
-                <span className="log-time" title={fullDate(log.DateTime)}>
-                  {shortTime(log.DateTime)}
+                <span className="log-time" title={fullDate(log.dateTime)}>
+                  {shortTime(log.dateTime)}
                 </span>
-                <Tag color={eventColor(log.Event)} className="log-event-tag">
-                  {eventLabel(log.Event)}
+                <Tag color={eventColor(log.event)} className="log-event-tag">
+                  {eventLabel(t, log.event)}
                 </Tag>
               </div>
               <div className="log-route">
-                <span className="log-addr">{log.FromAddress}</span>
+                <span className="log-addr">{log.fromAddress}</span>
                 <span className="log-arrow">→</span>
-                <span className="log-addr">{log.ToAddress}</span>
+                <span className="log-addr">{log.toAddress}</span>
               </div>
               <div className="log-meta">
-                {log.Inbound && (
+                {log.inbound && (
                   <span className="log-meta-pair">
                     <span className="log-meta-key">in</span>
-                    <span className="log-meta-val">{log.Inbound}</span>
+                    <span className="log-meta-val">{log.inbound}</span>
                   </span>
                 )}
-                {log.Outbound && (
+                {log.outbound && (
                   <span className="log-meta-pair">
                     <span className="log-meta-key">out</span>
-                    <span className="log-meta-val">{log.Outbound}</span>
+                    <span className="log-meta-val">{log.outbound}</span>
                   </span>
                 )}
-                {log.Email && (
+                {log.email && (
                   <span className="log-meta-pair">
                     <span className="log-meta-key">email</span>
-                    <span className="log-meta-val">{log.Email}</span>
+                    <span className="log-meta-val">{log.email}</span>
                   </span>
                 )}
               </div>
@@ -237,15 +275,15 @@ export default function XrayLogModal({ open, onClose }: XrayLogModalProps) {
             </thead>
             <tbody>
               {orderedLogs.map((log, idx) => (
-                <tr key={idx} className={`log-row-${log.Event}`}>
+                <tr key={idx} className={`log-row-${log.event}`}>
                   <td>
-                    <b>{fullDate(log.DateTime)}</b>
+                    <b>{fullDate(log.dateTime)}</b>
                   </td>
-                  <td>{log.FromAddress}</td>
-                  <td>{log.ToAddress}</td>
-                  <td>{log.Inbound}</td>
-                  <td>{log.Outbound}</td>
-                  <td>{log.Email}</td>
+                  <td>{log.fromAddress}</td>
+                  <td>{log.toAddress}</td>
+                  <td>{log.inbound}</td>
+                  <td>{log.outbound}</td>
+                  <td>{log.email}</td>
                 </tr>
               ))}
             </tbody>

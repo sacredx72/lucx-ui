@@ -4,8 +4,20 @@ Extracted from AGENTS.md. This file is project law.
 
 ---
 
+### Pattern 1ag: P2P on, clients still cannot ping each other (lucx.224)
+- **Symptom:** inbound `p2p` is on, `.conf` already `AllowedIPs = 0.0.0.0/0`, but `.2` cannot reach `.3`.
+- **Cause:** `routeThroughXray` policy rule `iif awgN lookup 1000+N` still steals dest=subnet into tunN, or leftover `FORWARD -i awgN -o awgN DROP`. Userspace/no-module: not supported.
+- **Check:** AWG diagnostics line `p2p`. Expect `dest <subnet> lookup main` (Xray mode) or no hairpin DROP (kernel-NAT). Reconcile (10s) re-adds; toggle does not bounce the iface.
+- **Not this:** extra AllowedIPs outside the inbound /24 (site-to-site) — v1 hairpin is subnet-only.
+
+### Pattern 1z: first install — GitHub git 401, no awg-quick — FIXED (lucx.203)
+- **Symptom (Igor, 02.09.2026):** first install → “AWG module not installed”. Cores → Install hung on `Username for 'https://github.com'` then `HTTP 401` cloning `amneziawg-tools`.
+- **Cause:** `git_clone_sha` used `git fetch` (smart HTTP). GitHub 401 makes git prompt for a password on a headless install, then fail. Panel install is best-effort, so AWG is simply missing.
+- **Fix:** download `codeload.github.com/.../tar.gz/<pin>` (archive fallback) with `GIT_TERMINAL_PROMPT=0`. Never prompt. DKMS version = pin SHA when the tree has no `.git`.
+- **Healing:** `x-ui install-awg` / Cores → Install after update.
+
 ### Pattern 1: AWG inbound won’t start
-- **Cause:** `awg-quick` not installed or kernel module not loaded. Since lucx.131 the module is installed by default again on `install.sh` (lucx.130 was opt-in, reverted by owner decision); hosts installed in the lucx.130–131 window without the module stay without it until manual install.
+- **Cause:** `awg-quick` not installed or kernel module not loaded. Since lucx.131 the module is installed by default again on `install.sh` (lucx.130 was opt-in, reverted by owner decision). v3.8 overlay dropped the call in .246; lucx.248 restored it in `install.sh` and `update.sh`. Hosts installed in lucx.130–131 or on .246 without the module stay without it until manual install.
 - **Fix:** `x-ui install-awg` / Settings → Cores → Install / `bash /usr/local/x-ui/bin/install-awg-module.sh`. Rollback: `x-ui uninstall-awg` (`.conf` kept). Check `awg show`, `ip link show awgN`.
 - **Cores button “doesn’t install”:** the panel runs the script with `--no-kernel-upgrade` + `DEBIAN_FRONTEND=noninteractive` (else apt/needrestart hangs without TTY). Watch logs `awg: rebuild | …`; status `rebuildRunning` spins while the build runs. After success a reboot is usually not needed.
 - **DKMS build fail with headers present:** Pattern 1s (udp_tunnel ABI on kernel ≥ 7.1.5).
@@ -82,6 +94,7 @@ Extracted from AGENTS.md. This file is project law.
   3. `Remove(id)` and the reconcile loop (procs no longer wanted) also **backup** instead of delete; delete only if backup failed.
   4. Marking existing LucX-UI configs (created before the fix): on reconcile for inbounds in `want` whose config has no marker — rewrite via `renderServerConf` (content is deterministic, fingerprint unchanged → no restart).
 - **Lesson:** `/etc/amnezia/amneziawg/` is shared with other tools (WGDashboard). An “orphan” sweep by name pattern `awg{N}.conf` must distinguish OWN configs (ownership marker), not treat everything ownerless as ours; prefer move-to-backup over delete.
+- **lucx.165:** the same rule applies to *live interfaces*. `killStrayAwgInterfaces` used to `ip link del` every `awg`+digit at first reconcile (even with zero LucX AWG inbounds), which killed toolza/awg-multi `awg0`/`awg1` within ~10s of panel start. It now calls `strayInterfaceIsOurs` (managed marker only). Import of those foreign ifaces is opt-in: Inbounds banner → preview → `Manager.Adopt` (rename in place).
 
 ### Pattern 1l: “connect works, no traffic” + client keeps old IP on re-attach to AWG — FIXED (lucx.91)
 - **Cause:** `defaultAwgClients` only fills EMPTY credentials (“existing values are never overwritten”). A client detached from an AWG inbound and re-attached — after the inbound subnet changed or from another AWG inbound — dragged the old single-host address from the clients-table row. Chain: awg-quick installs a peer /32 route onto a foreign subnet → either RTNETLINK conflict and interface rolls back (“stuck in starting…”), or the peer comes up but the server doesn’t own the address’s subnet → handshake succeeds (keys match), traffic dies. Report VladufQa + Aleksandr SacredX on lucx.85–90.
@@ -165,12 +178,126 @@ Extracted from AGENTS.md. This file is project law.
 - **Fix (lucx.135):** (1) `GET /panel/api/clients/subBody?url=…` — loopback to the local sub server (path+query only, host ignored; Host=subDomain for DomainValidator; neutral UA); frontend — all modal rows via `fetchSubscriptionBody`, Copy for AMNEZIA = config body; sub page gets `PageData.SubAwgUrl` and an AMNEZIA row (.conf/vpn:// — `<a href>` with attachment headers, copy = same-origin fetch). (2) `awg_speed_buffer.go` + LUCX-HOOK in `xray_traffic_job.go` — AWG deltas normalized to 5 s are folded into the same broadcast frame.
 - **Lesson:** a public listener without CORS ≠ a data source for the panel browser; any “download body” in the UI goes through a same-origin proxy. Live speed = broadcast deltas only; everything metered outside Xray (AWG, mtproto, tunnel) must fold its deltas into the shared frame.
 
-### Pattern 1s: DKMS “check kernel headers” but headers are fine — udp_tunnel ABI (kernel ≥ 7.1.5) — FIXED (lucx.147)
+### Pattern 1s: DKMS “check kernel headers” but headers are fine — udp_tunnel ABI (kernel ≥ 7.1.5) — FIXED (lucx.147, lucx.279)
 
-- **Cause:** Linux 7.1.5 changed `udp_tunnel_sock_release` / `setup_udp_tunnel_sock` from `struct socket *` to `struct sock *` (stable backport of Kuniyuki Iwashima’s udp_tunnel series). `amneziawg-linux-kernel-module` master (`v3.1.20260812` and later until PR #218 merges) still passes `struct socket *`. GCC 14 treats `-Wincompatible-pointer-types` as an error → `socket.o` fails. Headers **are** present; the old script message was wrong. Distros (Debian 13 `7.1.7+deb13`, CachyOS) ship this ABI under a 7.1.x `LINUX_VERSION_CODE`, so a version `#if` is not enough.
-- **Symptom:** `x-ui install-awg` / Cores → Install: clone succeeds, `dkms build` exit 2, “Ошибка сборки DKMS”. `make.log` shows `expected ‘struct sock *’ but argument is of type ‘struct socket *’` in `sock_free` / `wg_socket_init`. Build-first-safe leaves the old module loaded — do not reboot onto 7.1.x without a built module.
-- **Fix (lucx.147):** `bin/install-awg-module.sh` after clone applies the PR #218 wrappers (`__builtin_types_compatible_p` on the real signature) unless `wg_udp_tunnel_sock_release` is already in `socket.c` (no-op once upstream merges). DKMS failure prints the tail of `make.log` instead of blaming headers.
-- **Upstream:** [amneziawg-linux-kernel-module#218](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module/pull/218) (open 2026-08-17). Drop the in-script patch after that merge.
-- **Seen on:** zinn65de-lc, kernel `7.1.7+deb13-amd64`, 2026-08-20.
+- **Cause:** Linux 7.1.5 changed `udp_tunnel_sock_release` / `setup_udp_tunnel_sock` from `struct socket *` to `struct sock *` (stable backport of Kuniyuki Iwashima’s udp_tunnel series). `amneziawg-linux-kernel-module` before `v3.1.20260828` still passed `struct socket *`. GCC 14 treats `-Wincompatible-pointer-types` as an error → `socket.o` fails. Headers **are** present; the old script message was wrong. Distros (Debian 13 `7.1.7+deb13`, CachyOS) ship this ABI under a 7.1.x `LINUX_VERSION_CODE`, so a version `#if` is not enough.
+- **lucx.279 — backport BELOW the gate (Igor, 04.10.2026, Ubuntu `7.0.0-38-generic`):** the pin `3c38e168` tree already contains upstream’s own 7.1.5 fix (commit `0bcc6dfa`): call sites pass `new4->sk`, and `compat.h:1447` unwraps `sk → sk->sk_socket` **gated by `LINUX_VERSION_CODE < 7.1.5`**. Igor’s kernel has the **new** `struct sock *` ABI backported **under a 7.0.0 version code** → the gate enables the macro → it strips a `struct sock *` back to `sk->sk_socket` (a `struct socket *`) → same error, now caused by the tree’s own fix. The old lucx.147 `socket.c` patcher had become dead code: the needle `setup_udp_tunnel_sock(net, new4, &cfg)` no longer matches the `->sk` call sites, python exits 1, the `|| echo` swallowed it and the build ran unpatched — silent.
+- **Fix (lucx.279):** `apply_udp_tunnel_abi_compat compat/compat.h` now patches the **header**, not socket.c: replaces the version-gated macro pair with signature-dispatch wrappers (`__builtin_types_compatible_p(typeof(&setup_udp_tunnel_sock), …)`) that pick `struct sock *` vs `struct socket *` at compile time. Wrapper **bodies must be defined BEFORE the `#define`** — inside a body the raw symbol must still resolve to the real kernel function. `#if < 7.1.5` gate kept (the include must match the tree builtin shim window); the probe handles both ABIs, wrong gate or not. Applies to 4 call sites incl. `sock_free`; works with both the kernel `udp_tunnel.h` header and the tree’s own `compat/udp_tunnel/` shim.
+- **Verified (WSL gcc):** patched compat.h compiles `socket.c` clean on (a) new-ABI 7.1.5+, (b) new-ABI backported under 7.0.0 (Igor case), (c) old-ABI 6.12 with kernel header, (d) old-ABI with tree builtin shim; unpatched macro on (b) reproduces Igor’s exact error.
+- **Upstream:** the 7.1.5+ fix landed in tag `v3.1.20260828` (lucx.218 pin). Until upstream replaces the version `#if` with signature detection, the patch stays.
+- **Manual healing on a live box without waiting for a release** (kernel with backported ABI): delete the two `#define` lines from `/usr/src/amneziawg-*/compat/compat.h` — call sites then call the real `struct sock *` functions directly, correct on backported kernels — then `cd /usr/src/amneziawg-* && dkms build -m amneziawg -v <ver> -k $(uname -r) && dkms install -m amneziawg -v <ver> -k $(uname -r) && modprobe amneziawg`.
+- **Seen on:** zinn65de-lc, kernel `7.1.7+deb13-amd64`, 2026-08-20; Igor, `7.0.0-38-generic`, 2026-10-03.
 - **Workaround without a panel update:** boot 6.12 and rebuild; or apply PR #218 on the cloned tree and `dkms build` by hand. Do not reboot into 7.1.5+ until the module builds.
-- **Lesson:** a DKMS fail with headers in `/lib/modules/$(uname -r)/build` is an upstream ABI/source mismatch, not a missing-headers problem. Dump `make.log`. Kernel API changes that distros backport cannot be gated by `LINUX_VERSION_CODE`.
+- **Lesson:** a DKMS fail with headers in `/lib/modules/$(uname -r)/build` is an upstream ABI/source mismatch, not a missing-headers problem. Dump `make.log`. Kernel API changes that distros backport cannot be gated by `LINUX_VERSION_CODE` — and the backport can land **below** the gate the upstream fix uses, breaking even the fixed tree. Detect the signature, never the version.
+
+### Pattern 1t: add client → peer missing, table 100N empty, syncconf loop — FIXED (lucx.154)
+
+- **Cause:** lucx.153 `awg syncconf` was fed the awg-quick `.conf`. Parser rejects `Address=` / `MTU=` / `PostUp=`. `Ensure` returned before `ensureXrayRouting`. Only inbounds whose peer set changed were hit.
+- **Symptom:** `WARNING - awg: syncconf awgN: exit status 1`; `awg show awgN dump` has no new peer; `ip route show table 100N` empty. Handshake can work after a manual peer add, traffic cannot.
+- **Fix:** `stripAwgQuick` + temp file for `syncconf`. Full `.conf` stays for `awg-quick up`. After update the next reconcile retries (peerFP not saved on failure) and restores the route.
+- **Seen on:** Kirill, v3.6.0-lucx.153, amneziawg-tools v3.1.20260812, awgVersion 2 and 3.1.
+
+### Pattern 1u: multi-attach subscription repeats one Address — FIXED (lucx.154)
+
+- **Cause:** `clients.wg_allowed_ips` is one field; `/awg/` (`BuildAwgClientConf`), `/sub/` (`genAwgLink`), `/clash/` (`buildAwgProxy`) read it. Per-inbound IPs live in `settings.clients[].allowedIPs`. Panel QR already used `inboundAwgPeerAddresses`.
+- **Symptom:** two AWG inbounds, one client → both `.conf` blocks share one Address; handshake ok, traffic dies on the other subnet. Card in the panel shows the right IPs.
+- **Fix:** `AwgClientTunnelAddress` prefers `InboundAwgPeerAddresses(settings)[email]`, table field as fallback. Storage not unified (Rule 0).
+- **Seen on:** Kirill, v3.6.0-lucx.153.
+
+### Pattern 1v: routeThroughXray off → handshake ok, packets leave as 10.x — FIXED (lucx.156)
+
+- **Cause:** kernel NAT was mark-only (`mangle PREROUTING MARK` + `POSTROUTING -m mark MASQUERADE`). After toggling off routeThroughXray the MARK rule was often missing; MASQUERADE by mark never matched. Packets egressed with the tunnel source.
+- **Fix:** also install `-s <clientSubnet> -o <ext> MASQUERADE`. Mark path kept for peers outside the server /24. Reconcile deletes leftover `iif awgN lookup 100N`.
+- **Seen on:** Kirill, 2026-08-22. Manual workaround was the same `-s` rule.
+
+### Pattern 1w: Pro QUIC I1–I5 crashes awg-tools (segfault / glibc abort) — FIXED (lucx.156)
+
+- **Cause:** tools netlink buffer is one page (4096). I1–I5 are hex-put without bounds. QUIC Pro sum 1696–2044 B → ~35% of generated configs crash `awg set`/`setconf` on Linux.
+- **Fix:** `GenerateCPS` keeps payload ≤ 1800 B (retry, then drop I5…I2). Real fix is upstream [amneziawg-tools#69](https://github.com/amnezia-vpn/amneziawg-tools/issues/69).
+- **Not done:** MTU-clamp of I1 (needs form to send MTU). I1 stays ~1198 (QUIC minimum).
+
+### Pattern 1y: kernel card Stopped / 0 interfaces while module is loaded — FIXED (lucx.173)
+
+- **Cause:** lucx.169 `KernelAvailable` used `sync.Once`. First probe often false (module not loaded yet at first Xray start, or `LookPath("awg-quick")` on a thin systemd PATH). Cache stuck false → `AwgJob` `Reconcile(nil)`, `applyLocalAwg` no-op, LucX `awg` inbounds forced onto amneziawg-go. HostStatus live-probes `/sys/module/amneziawg`, so the UI shows module loaded + Stopped + 0 interfaces.
+- **Fix:** cache true only; retry every call while false. Probe via `awgBin` (LookPath + `/usr/bin` …).
+
+### Pattern 1z: new AWG client .conf has no PresharedKey — FIXED (lucx.175)
+
+- **Cause:** lucx.165 skipped PSK generation when `publicKey`/`privateKey` were already set (import). The inbound/client form always generates a keypair first, so every new AWG client hit that skip. Export omits an empty PSK (correct for WireGuard; Amnezia analyzers want the line).
+- **Fix:** generate PSK when the client is **new** (`existing` has no matching email/pubkey). Imported/existing empty PSK stays empty (Rule 0).
+- **Seen on:** Albert, 2026-08-24.
+
+### Pattern 1aa: AWG share-link used form password as PSK — FIXED (lucx.176)
+
+- **Cause:** `awgPeerShape` did `preSharedKey ?? password`. Empty PSK fell through to the 16-char form password. Same class of bug as lucx.173 on the export path.
+- **Fix:** only `preSharedKey`. H1–H4 in `inboundAwgHints` written by index (no `H =` rematch). Create-time `fillProtocolDefaults` mints one PSK for all attaches.
+- **Seen on:** Albert (fresh 169), Never (172 “broke everything”).
+
+### Pattern 1z: new AWG clients do not connect — `Key is not the correct length: 'vgmg…'` — FIXED (lucx.173)
+
+- **Cause:** `InstanceFromInbound` used `clients[].password` as PresharedKey when PSK was empty. Client form always sends `password` = `NumLower(16)`. `awg syncconf` rejects it; one bad peer blocks the whole iface. Old kernel peers stay (syncconf failed, state unchanged). Re-export of an old client also fails if settings now carry that password.
+- **Fix:** password → PSK only for the legacy id/password pair (`publicKey` absent). Form password is ignored.
+- **Seen on:** VladufQa inbound 32; Never new Amnezia clients.
+
+### Pattern 1x: Import existing AWG finds nothing while Docker Amnezia is running — FIXED (lucx.171)
+
+- **Cause:** official Amnezia `run_container.sh` does **not** bind-mount `/opt/amnezia`. Configs live only inside `amnezia-awg` / `amnezia-awg2` / `amnezia-wireguard` at `/opt/amnezia/awg/awg0.conf` (legacy `wg0.conf`). Discover only walked the host path, so preview said “no unmanaged interfaces”.
+- **Fix:** `scanLiveDocker` lists `docker ps` and `docker exec cat` those paths. Host `/opt/amnezia` scan kept for bind-mounts. Dedupe by private key.
+- **Seen on:** live host with three Amnezia containers (2026-08-24).
+
+### Pattern 1y: Import finds Docker AWG but only vanilla WG commits — FIXED (lucx.172)
+
+- **Cause:** `Validate` required S1–S4 ≥ 12 always. Official Amnezia 1.5 omits S3/S4 (0); AWG2 often has S3=1. Vanilla WG (`Jc=0,S1=0`) skipped the check, so only it imported. Next trap: all three stacks use `10.8.1.0/24` — `checkAwgSubnetConflict` would refuse the rest.
+- **Fix:** S≥12 only with HeaderProtectionKey. Import sets `awgImportInProgress` (do not rewrite IPs). Operator must stop Docker and change a subnet before bringing more than one kernel iface up.
+- **Seen on:** estonia-zakez-ru, 2026-08-24.
+
+### Pattern 1ab: after Docker import the kernel iface cannot bind the port — FIXED (lucx.177)
+
+- **Cause:** commit saved the inbound disabled (`DropOnImport`) so Amnezia Docker kept the UDP port. Operator had to `docker stop` by hand.
+- **Fix:** successful import stops that source (`docker stop` + `--restart=no`, or `systemctl stop awg3`) then enables the inbound. Container is not removed. Stop failure does not roll back the saved inbound.
+- **Seen on:** estonia-zakez-ru, 2026-08-24.
+
+### Pattern 1ac: live kernel import cannot rename awg0 → awgN — FIXED (lucx.206)
+
+- **Symptom:** commit reports `saved, adopt failed: ip link set awg0 name awg1: Device or resource busy`. Inbound exists in the DB. Reconcile every 10s creates `awg1`, hits `Address already in use`, deletes it. Live `awg0` stays up.
+- **Cause:** Linux will not rename an UP netdev. Import saved the inbound enabled, so `AddInbound` raced Adopt and tried to `awg-quick up awg1` beside the live iface. Failed Adopt left the row in the DB.
+- **Fix:** `renameAwgInterfaceSeq` does admin-down → rename → up. Commit saves disabled, Adopt, then enable. Adopt failure `DelInbound`s the row.
+- **Seen on:** n1 replica of dns (awg0 :55555), 2026-09-03.
+
+### Pattern 1ad: disable client → attach second AWG → enable, neither connects — FIXED
+
+- **Symptom (Never):** client on awg2 works; disable; attach awg3.1; enable. Neither connects. New configs still dead. Delete client, create on both inbounds at once → OK.
+- **Cause:** Clients page enable switch is a full `Update` that omits keys/PSK. `Create` reuses stored PSK; `Update` did not, so `fillProtocolDefaults` minted a **new PSK per inbound**. Issued .conf still has the old PSK. Two inbounds → two new PSKs; the record keeps the last one.
+- **Fix:** `Update` copies empty PrivateKey/PublicKey/PreSharedKey from the record, same as `Create`.
+- **Healing:** panel update, then re-download .conf (PSK already rotated). Or delete+recreate the client.
+- **Lesson:** any partial client save that can hit `fillProtocolDefaults` must preserve tunnel credentials the way Create does.
+
+### Pattern 1ag: DKMS fail on Ubuntu 22.04 5.15.0-194 — `timer_delete` redeclared — FIXED (lucx.267)
+
+- **Symptom (MasyGreen, issue #114):** fresh install / `x-ui install-awg` on `5.15.0-194-generic`. DKMS exit 2. `make.log`: `static declaration of timer_delete follows non-static declaration` in `compat.h`. Panel is up; AWG module is not.
+- **Cause:** lucx.207 always dropped the `ISUBUNTU2204` skip so the `del_timer` wrapper applied. That fixed `5.15.0-82` (no `timer_delete`). `5.15.0-194` backported the symbol; the static wrapper collides.
+- **Fix:** probe `/lib/modules/$BUILD_K/build/include/linux/timer.h` for `timer_delete(`. Declared → leave upstream skip. Absent → apply the wrap.
+- **Healing:** update, then `x-ui install-awg`.
+
+### Pattern 1ae: DKMS fail on Ubuntu 22.04 5.15 — `timer_delete` — FIXED
+
+- **Symptom:** `x-ui install-awg` / first install: DKMS exit 2, old module left. `make.log`: `implicit declaration of function ‘timer_delete’` in `device.c` / `wg_pm_notification`. Kernel `5.15.0-82-generic`.
+- **Cause:** pin `46803204e7ec` `compat.h` wraps `timer_delete` → `del_timer` for kernels `< 6.1.91`, but skips `ISUBUNTU2204` (assumed backport). 5.15.0-82 has no backport.
+- **Fix:** `apply_timer_delete_compat` drops the Ubuntu 22.04 exception after clone. Keep `ISUBUNTU2004` — 5.4.0-216 declares `timer_delete`.
+- **Healing:** update panel, then `x-ui install-awg` / Cores → Install.
+- **Not a bug (was):** `tproxy`/`mtproxy` curl 404 — they are release-built, never on GitHub raw. install/update now skip that fetch.
+
+### Pattern 1af: DKMS fail on Ubuntu 20.04 5.4 — `chacha_init` undeclared — FIXED (lucx.251)
+
+- **Symptom (VladufQa, 19.09.2026):** web update to lucx.250 ran `install-awg-module.sh`; DKMS exit 2; panel “AWG module not installed”. `make.log`: `‘chacha_init’ undeclared` / `‘chacha20_crypt’ undeclared` in `compat.h` `__compat_chacha_init`. Kernel `5.4.0-216-generic`. Reboot does nothing — module was never built.
+- **Cause:** AWG 3 header protection uses the ChaCha library API. Linux 5.5+ has `chacha_init(u32 *state, …)` / `chacha20_crypt`. The pin’s `< 6.16` wrapper assumes that API and calls `(chacha_init)(state->x, …)`. 5.4 still ships the skcipher `crypto/chacha.h` (`crypto_chacha_init` / `chacha_block`) — include succeeds, symbols do not. Upstream issue #210 / PR #244 (open; PR only shadows the header for VERSION<5.5, which loses to the kernel header already present on 5.4).
+- **Fix:** after clone: `apply_chacha_lib_compat` (Zinc `chacha_init`/`chacha20_crypt` on `< 5.5`) and `apply_blake2s_zinc_compat` (do not `#include <crypto/blake2s.h>` on `< 5.10`, where Zinc still builds `blake2s.o`). 5.5–6.15 keep the kernel ChaCha library. Do not drop `ISUBUNTU2004` on `timer_delete`.
+- **Healing:** update panel, then `x-ui install-awg` / Cores → Install. No reboot if DKMS installs for the running kernel.
+- **Not this:** Debian 13 (6.12 / 7.1.x) — Pattern 1s (udp_tunnel ABI). Ubuntu 22.04 5.15 already has `chacha_init` — Pattern 1ae.
+
+### Pattern 1ah: first install + SSL → AWG script never runs — FIXED
+
+- **Symptom (Igor, 21.09.2026):** fresh install, panel “AWG module not installed”. No dkms, no marker, no journal `awg: rebuild`. Ubuntu 26.04 / kernel 7.0 — headers fine; `x-ui install-awg` then builds in ~1 min.
+- **Cause:** `config_after_install` → `install_acme` does `cd ~`. The LUCX-HOOK then tests `-x bin/install-awg-module.sh` relative to cwd (`/root/bin/…` missing) and **silently skips**. Same in `update.sh` after SSL.
+- **Fix:** hook uses `${xui_folder}/bin/install-awg-module.sh`. Else prints the missing path.
+- **Healing:** `x-ui install-awg` / Cores → Install (already absolute). No reboot if DKMS built for the running kernel.

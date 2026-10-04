@@ -88,3 +88,52 @@ func (s *InboundService) restoreVisionFlowForEligibleInbound(tx *gorm.DB, settin
 	}
 	return string(out), true
 }
+
+// inboundShouldStripClientFlows reports whether this inbound must not carry
+// XTLS Vision on its clients: the operator ticked DisableFlow, or it is VLESS
+// on a transport that cannot use Vision (XHTTP+TLS without vlessenc, WS, …).
+// Leftover flow=xtls-rprx-vision on those inbounds is ignored or harmful in
+// Xray (VLESS+XHTTPS domain routing dies; testers, lucx.186).
+func inboundShouldStripClientFlows(ib *model.Inbound) bool {
+	if ib == nil {
+		return false
+	}
+	if ib.DisableFlow {
+		return true
+	}
+	if ib.Protocol != model.VLESS {
+		return false
+	}
+	return !inboundCanEnableTlsFlow(string(ib.Protocol), ib.StreamSettings, ib.Settings)
+}
+
+func stripClientFlows(settings string) (string, bool) {
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(settings), &parsed); err != nil {
+		return settings, false
+	}
+	clients, ok := parsed["clients"].([]any)
+	if !ok || len(clients) == 0 {
+		return settings, false
+	}
+	changed := false
+	for i := range clients {
+		cm, ok := clients[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		if flow, _ := cm["flow"].(string); flow != "" {
+			cm["flow"] = ""
+			clients[i] = cm
+			changed = true
+		}
+	}
+	if !changed {
+		return settings, false
+	}
+	out, err := json.MarshalIndent(parsed, "", "  ")
+	if err != nil {
+		return settings, false
+	}
+	return string(out), true
+}

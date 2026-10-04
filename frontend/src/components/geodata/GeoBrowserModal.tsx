@@ -1,6 +1,19 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Alert, Button, Empty, Input, Modal, Pagination, Select, Space, Table, Tag, Tooltip, Typography } from 'antd';
+import {
+  Alert,
+  Button,
+  Empty,
+  Input,
+  Modal,
+  Pagination,
+  Select,
+  Space,
+  Table,
+  Tag,
+  Tooltip,
+  Typography,
+} from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 
 import { useGeodataCategories, useGeodataEntries, useGeodataFiles } from '@/api/queries/useGeodata';
@@ -11,6 +24,10 @@ import type { GeoCategory, GeoEntry, GeoFile, GeoKind } from '@/generated/types'
 import './GeoBrowserModal.css';
 
 const ENTRY_PAGE_SIZE = 100;
+
+// Attributes are dropped server-side, so kind:value repeats within real
+// geosite categories; the page position is the only unique row key.
+type GeoEntryRow = GeoEntry & { position: number };
 const CATEGORY_SCROLL_HEIGHT = 438;
 const ENTRY_FILTER_DELAY = 500;
 
@@ -25,7 +42,9 @@ export interface GeoBrowserModalProps {
 // A geosite category inside an ip rule (or the reverse) is a config Xray will
 // reject, so a field only ever offers databases of its own kind.
 function databasesFor(files: GeoFile[], kind: GeoKind): GeoFile[] {
-  return files.filter((file) => file.kind === kind || (file.error && namePrefersKind(file.name, kind)));
+  return files.filter(
+    (file) => file.kind === kind || (file.error && namePrefersKind(file.name, kind)),
+  );
 }
 
 function namePrefersKind(name: string, kind: GeoKind): boolean {
@@ -38,7 +57,13 @@ function preferredFile(files: GeoFile[], kind: GeoKind): string | undefined {
   return usable.find((file) => file.name === preferredName)?.name ?? usable[0]?.name;
 }
 
-export default function GeoBrowserModal({ open, kind, value, onApply, onClose }: GeoBrowserModalProps) {
+export default function GeoBrowserModal({
+  open,
+  kind,
+  value,
+  onApply,
+  onClose,
+}: GeoBrowserModalProps) {
   const { t } = useTranslation();
   const [file, setFile] = useState<string | undefined>(undefined);
   const [categoryQuery, setCategoryQuery] = useState('');
@@ -48,13 +73,16 @@ export default function GeoBrowserModal({ open, kind, value, onApply, onClose }:
   const [entryPage, setEntryPage] = useState(1);
   const [selected, setSelected] = useState<string[]>([]);
 
-  const knownRef = useRef<Set<string>>(new Set());
-  const seededFilesRef = useRef<Set<string>>(new Set());
+  const [known, setKnown] = useState<Set<string>>(() => new Set());
+  const [seededFiles, setSeededFiles] = useState<Set<string>>(() => new Set());
 
   const filesQuery = useGeodataFiles(open);
   const files = useMemo(() => databasesFor(filesQuery.data ?? [], kind), [filesQuery.data, kind]);
-  const activeFile = files.find((candidate) => candidate.name === file);
-  const fileKind: GeoKind = activeFile?.kind ?? kind;
+  const activeFile = useMemo(
+    () => files.find((candidate) => candidate.name === file),
+    [files, file],
+  );
+  const fileKind: GeoKind = useMemo(() => activeFile?.kind ?? kind, [activeFile, kind]);
 
   const categoriesQuery = useGeodataCategories(file, '', open && !!file);
   // While a newly picked database loads, the query still serves the previous
@@ -96,33 +124,35 @@ export default function GeoBrowserModal({ open, kind, value, onApply, onClose }:
     return () => window.clearTimeout(handle);
   }, [entryQuery, entryFilter]);
 
-  useEffect(() => {
-    if (!open) return;
-    knownRef.current = new Set();
-    seededFilesRef.current = new Set();
-    setCategoryQuery('');
-    setEntryQuery('');
-    setEntryFilter('');
-    setActiveCode(undefined);
-    setEntryPage(1);
-    setSelected([]);
-  }, [open]);
-
-  useEffect(() => {
-    if (!open || file || files.length === 0) return;
+  // Opening, picking the default database and seeding the selection are all
+  // render-time adjustments — an effect would paint the previous state first.
+  const [wasOpen, setWasOpen] = useState(false);
+  if (open !== wasOpen) {
+    setWasOpen(open);
+    if (open) {
+      setKnown(new Set());
+      setSeededFiles(new Set());
+      setCategoryQuery('');
+      setEntryQuery('');
+      setEntryFilter('');
+      setActiveCode(undefined);
+      setEntryPage(1);
+      setSelected([]);
+    }
+  } else if (open && !file && files.length > 0) {
     setFile(preferredFile(files, kind));
-  }, [open, file, files, kind]);
-
-  useEffect(() => {
-    if (!open || !file || categories.length === 0 || seededFilesRef.current.has(file)) return;
+  } else if (open && file && categories.length > 0 && !seededFiles.has(file)) {
     const tokens = categories.map((category) => tokenFor(file, category.code, fileKind));
-    for (const token of tokens) knownRef.current.add(token);
-    seededFilesRef.current.add(file);
+    setKnown(new Set([...known, ...tokens]));
+    setSeededFiles(new Set(seededFiles).add(file));
     const fromValue = selectionFromValue(value, new Set(tokens));
     if (fromValue.length > 0) {
-      setSelected((previous) => [...previous, ...fromValue.filter((token) => !previous.includes(token))]);
+      setSelected((previous) => [
+        ...previous,
+        ...fromValue.filter((token) => !previous.includes(token)),
+      ]);
     }
-  }, [open, file, categories, fileKind, value]);
+  }
 
   const visibleCategories = useMemo(() => {
     const query = categoryQuery.trim().toLowerCase();
@@ -149,7 +179,9 @@ export default function GeoBrowserModal({ open, kind, value, onApply, onClose }:
       // The table reports keys for the rows it currently shows, so a selection
       // made before the search box was narrowed must survive untouched.
       const shown = new Set(
-        visibleCategories.map((category) => canonicalToken(tokenFor(file, category.code, fileKind))),
+        visibleCategories.map((category) =>
+          canonicalToken(tokenFor(file, category.code, fileKind)),
+        ),
       );
       setSelected((previous) => {
         const kept = previous.filter((token) => {
@@ -157,7 +189,10 @@ export default function GeoBrowserModal({ open, kind, value, onApply, onClose }:
           return !shown.has(canonical) || chosenCanonical.has(canonical);
         });
         const keptCanonical = new Set(kept.map(canonicalToken));
-        return [...kept, ...[...chosen].filter((token) => !keptCanonical.has(canonicalToken(token)))];
+        return [
+          ...kept,
+          ...[...chosen].filter((token) => !keptCanonical.has(canonicalToken(token))),
+        ];
       });
     },
     [visibleCategories, file, fileKind],
@@ -174,7 +209,7 @@ export default function GeoBrowserModal({ open, kind, value, onApply, onClose }:
             {category.attributes?.length > 0 && (
               <span className="geo-attrs">
                 {category.attributes.map((attribute) => (
-                  <Tag key={attribute} bordered={false}>
+                  <Tag key={attribute} variant="filled">
                     @{attribute}
                   </Tag>
                 ))}
@@ -193,13 +228,18 @@ export default function GeoBrowserModal({ open, kind, value, onApply, onClose }:
     [t],
   );
 
-  const entryColumns: ColumnsType<GeoEntry> = useMemo(
+  const entryRows: GeoEntryRow[] = useMemo(
+    () => (entriesQuery.data?.items ?? []).map((entry, position) => ({ ...entry, position })),
+    [entriesQuery.data],
+  );
+
+  const entryColumns: ColumnsType<GeoEntryRow> = useMemo(
     () => [
       {
         dataIndex: 'kind',
         width: 88,
         render: (entryKind: string) => (
-          <Tag bordered={false} className={`geo-kind geo-kind-${entryKind}`}>
+          <Tag variant="filled" className={`geo-kind geo-kind-${entryKind}`}>
             {entryKind}
           </Tag>
         ),
@@ -214,7 +254,9 @@ export default function GeoBrowserModal({ open, kind, value, onApply, onClose }:
 
   const fileOptions = files.map((candidate) => ({
     value: candidate.name,
-    label: candidate.error ? `${candidate.name} — ${describeFileError(candidate.error, t)}` : candidate.name,
+    label: candidate.error
+      ? `${candidate.name} — ${describeFileError(candidate.error, t)}`
+      : candidate.name,
     disabled: !!candidate.error,
   }));
 
@@ -229,9 +271,14 @@ export default function GeoBrowserModal({ open, kind, value, onApply, onClose }:
   const entriesTotal = entriesQuery.data?.total ?? 0;
   const activeCategory = categories.find((category) => category.code === activeCode);
   const countLabel = activeCategory
-    ? t(fileKind === 'ip' ? 'pages.xray.geoBrowser.subnetsCount' : 'pages.xray.geoBrowser.entriesCount', {
-        count: activeCategory.entries.toLocaleString(),
-      })
+    ? t(
+        fileKind === 'ip'
+          ? 'pages.xray.geoBrowser.subnetsCount'
+          : 'pages.xray.geoBrowser.entriesCount',
+        {
+          count: activeCategory.entries.toLocaleString(),
+        },
+      )
     : '';
 
   return (
@@ -240,12 +287,19 @@ export default function GeoBrowserModal({ open, kind, value, onApply, onClose }:
       title={t('pages.xray.geoBrowser.title')}
       width={880}
       onCancel={onClose}
-      onOk={() => onApply(mergeSelection(value, selected, knownRef.current))}
+      onOk={() => onApply(mergeSelection(value, selected, known))}
       okText={t('pages.xray.geoBrowser.apply')}
       cancelText={t('close')}
       className="geo-browser-modal"
     >
-      {filesQuery.isError && <Alert type="error" showIcon title={t('pages.xray.geoBrowser.loadFailed')} className="mb-12" />}
+      {filesQuery.isError && (
+        <Alert
+          type="error"
+          showIcon
+          title={t('pages.xray.geoBrowser.loadFailed')}
+          className="mb-12"
+        />
+      )}
 
       {!filesQuery.isError && !filesQuery.isLoading && files.length === 0 ? (
         <Empty
@@ -253,7 +307,9 @@ export default function GeoBrowserModal({ open, kind, value, onApply, onClose }:
             <span>
               {t('pages.xray.geoBrowser.noFiles')}
               <br />
-              <Typography.Text type="secondary">{t('pages.xray.geoBrowser.noFilesHint')}</Typography.Text>
+              <Typography.Text type="secondary">
+                {t('pages.xray.geoBrowser.noFilesHint')}
+              </Typography.Text>
             </span>
           }
         />
@@ -279,7 +335,9 @@ export default function GeoBrowserModal({ open, kind, value, onApply, onClose }:
               allowClear
             />
             <Button
-              onClick={() => toggle([...new Set([...selectedCodes, ...visibleCategories.map((c) => c.code)])])}
+              onClick={() =>
+                toggle([...new Set([...selectedCodes, ...visibleCategories.map((c) => c.code)])])
+              }
               disabled={visibleCategories.length === 0}
             >
               {`${t('pages.xray.geoBrowser.selectFound')} (${visibleCategories.length.toLocaleString()})`}
@@ -296,7 +354,11 @@ export default function GeoBrowserModal({ open, kind, value, onApply, onClose }:
                 rowKey="code"
                 columns={categoryColumns}
                 dataSource={visibleCategories}
-                loading={filesQuery.isLoading || categoriesQuery.isLoading || categoriesQuery.isPlaceholderData}
+                loading={
+                  filesQuery.isLoading ||
+                  categoriesQuery.isLoading ||
+                  categoriesQuery.isPlaceholderData
+                }
                 pagination={false}
                 scroll={{ y: CATEGORY_SCROLL_HEIGHT }}
                 locale={{ emptyText: t('pages.xray.geoBrowser.noMatches') }}
@@ -308,7 +370,8 @@ export default function GeoBrowserModal({ open, kind, value, onApply, onClose }:
                 }}
                 onRow={(category) => ({
                   onClick: (event) => {
-                    if ((event.target as HTMLElement).closest('.ant-table-selection-column')) return;
+                    if ((event.target as HTMLElement).closest('.ant-table-selection-column'))
+                      return;
                     setActiveCode(category.code);
                     clearEntryFilter();
                   },
@@ -337,9 +400,9 @@ export default function GeoBrowserModal({ open, kind, value, onApply, onClose }:
                     <Table
                       size="small"
                       showHeader={false}
-                      rowKey={(entry, index) => `${entry.value}-${index}`}
+                      rowKey="position"
                       columns={entryColumns}
-                      dataSource={entriesQuery.data?.items ?? []}
+                      dataSource={entryRows}
                       loading={entriesQuery.isLoading}
                       locale={{
                         emptyText: entriesQuery.isError
@@ -369,7 +432,9 @@ export default function GeoBrowserModal({ open, kind, value, onApply, onClose }:
                 </>
               ) : (
                 <div className="geo-placeholder">
-                  <Typography.Text type="secondary">{t('pages.xray.geoBrowser.pickCategory')}</Typography.Text>
+                  <Typography.Text type="secondary">
+                    {t('pages.xray.geoBrowser.pickCategory')}
+                  </Typography.Text>
                 </div>
               )}
             </div>
@@ -377,7 +442,9 @@ export default function GeoBrowserModal({ open, kind, value, onApply, onClose }:
 
           <div className="geo-footer">
             {selected.length === 0 ? (
-              <Typography.Text type="secondary">{t('pages.xray.geoBrowser.emptySelection')}</Typography.Text>
+              <Typography.Text type="secondary">
+                {t('pages.xray.geoBrowser.emptySelection')}
+              </Typography.Text>
             ) : (
               <>
                 <Space size={4} wrap className="geo-chips">
@@ -386,7 +453,9 @@ export default function GeoBrowserModal({ open, kind, value, onApply, onClose }:
                       key={token}
                       closable
                       color="processing"
-                      onClose={() => setSelected((previous) => previous.filter((item) => item !== token))}
+                      onClose={() =>
+                        setSelected((previous) => previous.filter((item) => item !== token))
+                      }
                     >
                       {token}
                     </Tag>

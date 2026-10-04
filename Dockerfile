@@ -1,7 +1,9 @@
 # ========================================================
 # Stage: Frontend (Vite)
 # ========================================================
-FROM --platform=$BUILDPLATFORM node:22-alpine AS frontend
+# LUCX-HOOK: upstream frontend stage is Node 26 (v3.9.0).
+FROM --platform=$BUILDPLATFORM node:26-alpine AS frontend
+# END LUCX-HOOK
 WORKDIR /src/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
@@ -12,7 +14,7 @@ RUN npm run build
 # ========================================================
 # Stage: Builder
 # ========================================================
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27-alpine AS builder
 WORKDIR /app
 ARG TARGETARCH
 

@@ -1,5 +1,8 @@
 import { Tag } from 'antd';
 import { Base64 } from '@/utils';
+// LUCX-HOOK: stored-block inflate for panel-minted vpn:// envelopes
+import { inflateStored } from '@/lib/awg/vpnuri';
+// END LUCX-HOOK
 
 /* Shared parsing + rendering for the "protocol / transport / security"
    labels shown above share links in the QR modal, the client info modal
@@ -26,15 +29,21 @@ const PROTOCOL_LABELS: Record<string, string> = {
   wireguard: 'WireGuard',
   wg: 'WireGuard',
   tg: 'MTProto',
+  vpn: 'AmneziaWG',
+  amneziawg: 'AmneziaWG',
+  awg: 'AmneziaWG (kernel)',
+  tuic: 'TUIC',
   // LUCX-HOOK: tunnel / AWG share schemes
   naive: 'Naive',
-  amneziawg: 'AmneziaWG',
   olcrtc: 'olcRTC',
   qwdtt: 'qWDTT',
+  csqtt: 'CSQTT',
   wdtt: 'qWDTT',
   mieru: 'mieru',
   mierus: 'mieru',
   tt: 'TrustTunnel',
+  anytls: 'AnyTLS',
+  webproxy: 'Telegram WEB',
 };
 
 const PROTOCOL_COLORS: Record<string, string> = {
@@ -46,12 +55,15 @@ const PROTOCOL_COLORS: Record<string, string> = {
   Hysteria2: 'magenta',
   WireGuard: 'cyan',
   MTProto: 'blue',
+  AmneziaWG: 'yellow',
+  'AmneziaWG (kernel)': 'yellow',
+  TUIC: 'orange',
   Naive: 'orange',
-  AmneziaWG: 'magenta',
   olcRTC: 'cyan',
   qWDTT: 'gold',
   mieru: 'geekblue',
   TrustTunnel: 'purple',
+  AnyTLS: 'gold',
 };
 
 const SECURITY_COLORS: Record<string, string> = {
@@ -64,6 +76,47 @@ const SECURITY_COLORS: Record<string, string> = {
 const TRANSPORT_COLOR = 'gold';
 
 const TAG_STYLE = { marginInlineEnd: 0, fontWeight: 600, letterSpacing: '0.3px' };
+
+function bytesFromBase64Url(value: string): Uint8Array {
+  const b64 = value.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4);
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function isQCompress(bytes: Uint8Array): boolean {
+  if (bytes.length < 6) return false;
+  return bytes[4] === 0x78 && [0x01, 0x5e, 0x9c, 0xda].includes(bytes[5]);
+}
+
+// LucX vpn:// is qCompress(JSON); upstream amneziawg is plain .conf text.
+// Never TextDecoder the compressed envelope — that is the client-card mojibake.
+function vpnLinkPlaintext(payload: string): string {
+  const bytes = bytesFromBase64Url(payload);
+  if (isQCompress(bytes)) {
+    // LUCX-HOOK: panel-minted envelopes use stored-block zlib — inflate them
+    // synchronously so labels keep the remark/port; Go-side (real deflate)
+    // envelopes return null and degrade to a protocol-only label.
+    const inflated = inflateStored(bytes);
+    if (!inflated) return '';
+    const text = new TextDecoder().decode(inflated);
+    if (text.includes('\uFFFD')) return '';
+    return text.trimStart().startsWith('{') ? text : '';
+    // END LUCX-HOOK
+  }
+  const text = new TextDecoder().decode(bytes);
+  if (text.includes('\uFFFD')) return '';
+  if (
+    !text.includes('[Interface]') &&
+    !text.includes('[Peer]') &&
+    !text.trimStart().startsWith('{')
+  ) {
+    return '';
+  }
+  return text;
+}
 
 /* Pull protocol, transport, security plus the remark and port out of a share
    link. vless/trojan carry network+security as `type`/`security` query params
@@ -86,8 +139,10 @@ export function parseLinkParts(link: string): LinkParts | null {
   }
 
   const baseScheme = scheme.includes('+') ? scheme.split('+')[0] : scheme;
-  const protocol = PROTOCOL_LABELS[baseScheme] ?? PROTOCOL_LABELS[scheme]
-    ?? scheme.charAt(0).toUpperCase() + scheme.slice(1);
+  const protocol =
+    PROTOCOL_LABELS[baseScheme] ??
+    PROTOCOL_LABELS[scheme] ??
+    scheme.charAt(0).toUpperCase() + scheme.slice(1);
   let network = '';
   let security = '';
   let remark = '';
@@ -104,18 +159,56 @@ export function parseLinkParts(link: string): LinkParts | null {
       security = json.tls ?? '';
       remark = typeof json.ps === 'string' ? json.ps : '';
       port = json.port != null ? String(json.port) : '';
-    } catch { /* unparseable payload, fall back to protocol only */ }
+    } catch {
+      /* unparseable payload, fall back to protocol only */
+    }
+  } else if (scheme === 'vpn') {
+    try {
+      const cfgText = vpnLinkPlaintext(trimmed.slice('vpn://'.length));
+      if (cfgText.trimStart().startsWith('{')) {
+        const env = JSON.parse(cfgText) as {
+          description?: string;
+          containers?: { awg?: { port?: string | number } }[];
+        };
+        remark = typeof env.description === 'string' ? env.description : '';
+        // LUCX-HOOK: the JSON container carries the endpoint port in
+        // containers[0].awg.port — surface it like the raw .conf branch does
+        const envPort = env.containers?.[0]?.awg?.port;
+        if (envPort != null && String(envPort) !== '') port = String(envPort);
+        // END LUCX-HOOK
+      } else if (cfgText) {
+        remark = /^#\s?(.*)$/m.exec(cfgText)?.[1]?.trim() ?? '';
+        port = /^Endpoint\s*=\s*.+:(\d+)\s*$/m.exec(cfgText)?.[1] ?? '';
+      }
+    } catch {
+      /* unparseable payload, fall back to protocol only */
+    }
   } else if (scheme === 'olcrtc') {
-    // olcrtc://provider?transport@room#key — remark = room (before #)
     const body = trimmed.slice('olcrtc://'.length);
     const hashIdx = body.indexOf('#');
     const main = hashIdx >= 0 ? body.slice(0, hashIdx) : body;
     const at = main.lastIndexOf('@');
     remark = at >= 0 ? main.slice(at + 1) : main;
+  } else if (scheme === 'anytls') {
+    try {
+      const url = new URL(trimmed);
+      port = url.port || '';
+      remark = url.hostname || '';
+    } catch {
+      remark = '';
+    }
   } else if (scheme === 'qwdtt' || scheme === 'wdtt') {
     try {
       const url = new URL(trimmed.replace(/^wdtt:/i, 'qwdtt:'));
       remark = url.searchParams.get('name') || url.searchParams.get('peer') || '';
+    } catch {
+      remark = '';
+    }
+  } else if (scheme === 'csqtt') {
+    try {
+      const url = new URL(trimmed);
+      remark = url.searchParams.get('host') || '';
+      port = url.searchParams.get('peer') || '';
     } catch {
       remark = '';
     }
@@ -124,8 +217,14 @@ export function parseLinkParts(link: string): LinkParts | null {
       const url = new URL(trimmed);
       port = url.port || '';
       const hash = url.hash.replace(/^#/, '');
-      try { remark = decodeURIComponent(hash); } catch { remark = hash; }
-    } catch { /* fall back */ }
+      try {
+        remark = decodeURIComponent(hash);
+      } catch {
+        remark = hash;
+      }
+    } catch {
+      /* fall back */
+    }
   } else {
     try {
       const url = new URL(trimmed);
@@ -135,9 +234,19 @@ export function parseLinkParts(link: string): LinkParts | null {
          the URL authority, so fall back to it when there is no authority port. */
       port = url.port || (url.searchParams.get('port') ?? '');
       const hash = url.hash.replace(/^#/, '');
-      try { remark = decodeURIComponent(hash); } catch { remark = hash; }
-    } catch { /* not URL-shaped, fall back to protocol only */ }
+      try {
+        remark = decodeURIComponent(hash);
+      } catch {
+        remark = hash;
+      }
+    } catch {
+      /* not URL-shaped, fall back to protocol only */
+    }
     if (scheme === 'tg') security = 'FakeTLS';
+    if (scheme === 'tuic') {
+      network = 'quic';
+      security = 'TLS';
+    }
   }
   if (security === 'none') security = '';
   return {
@@ -160,11 +269,19 @@ function parseNaiveLink(link: string, security: string): LinkParts {
     port = url.port || (security === 'HTTPS' ? '443' : '80');
     if (port === '443' || port === '80') port = '';
     const hash = url.hash.replace(/^#/, '');
-    try { remark = decodeURIComponent(hash); } catch { remark = hash; }
+    try {
+      remark = decodeURIComponent(hash);
+    } catch {
+      remark = hash;
+    }
   } catch {
     const hashIdx = link.indexOf('#');
     if (hashIdx >= 0) {
-      try { remark = decodeURIComponent(link.slice(hashIdx + 1)); } catch { remark = link.slice(hashIdx + 1); }
+      try {
+        remark = decodeURIComponent(link.slice(hashIdx + 1));
+      } catch {
+        remark = link.slice(hashIdx + 1);
+      }
     }
   }
   return {
@@ -185,11 +302,77 @@ export function linkMetaText(parts: LinkParts): string {
 export function LinkTags({ parts }: { parts: LinkParts }) {
   return (
     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
-      <Tag color={PROTOCOL_COLORS[parts.protocol]} style={TAG_STYLE}>{parts.protocol}</Tag>
-      {parts.network && <Tag color={TRANSPORT_COLOR} style={TAG_STYLE}>{parts.network}</Tag>}
+      <Tag color={PROTOCOL_COLORS[parts.protocol]} style={TAG_STYLE}>
+        {parts.protocol}
+      </Tag>
+      {parts.network && (
+        <Tag color={TRANSPORT_COLOR} style={TAG_STYLE}>
+          {parts.network}
+        </Tag>
+      )}
       {parts.security && (
-        <Tag color={SECURITY_COLORS[parts.security]} style={TAG_STYLE}>{parts.security}</Tag>
+        <Tag color={SECURITY_COLORS[parts.security]} style={TAG_STYLE}>
+          {parts.security}
+        </Tag>
       )}
     </span>
   );
 }
+
+// LUCX-HOOK: AWG share is amneziawg:// (has #remark) + vpn:// (opaque). Hide the
+// first; steal its remark. Group rows by protocol so mixed inbounds don't interleave.
+export interface DisplaySubLink {
+  link: string;
+  parts: LinkParts | null;
+}
+
+const PROTOCOL_RANK: Record<string, number> = {
+  Vless: 0,
+  Vmess: 1,
+  Trojan: 2,
+  Shadowsocks: 3,
+  Hysteria2: 4,
+  Hysteria: 5,
+  AnyTLS: 6,
+  Naive: 7,
+  MTProto: 8,
+  'Telegram WEB': 9,
+  WireGuard: 10,
+  AmneziaWG: 11,
+  olcRTC: 12,
+  qWDTT: 13,
+  mieru: 14,
+  TrustTunnel: 15,
+};
+
+export function displaySubLinks(links: string[]): DisplaySubLink[] {
+  const rows: DisplaySubLink[] = [];
+  for (let i = 0; i < links.length; i++) {
+    const link = links[i];
+    if (link.startsWith('amneziawg://')) continue;
+    let parts = parseLinkParts(link);
+    if (link.startsWith('vpn://') && i > 0 && links[i - 1].startsWith('amneziawg://')) {
+      const prev = parseLinkParts(links[i - 1]);
+      if (prev) {
+        parts = {
+          protocol: parts?.protocol || prev.protocol,
+          network: parts?.network || prev.network,
+          security: parts?.security || prev.security,
+          remark: (parts?.remark || prev.remark).trim(),
+          port: parts?.port || prev.port,
+        };
+      }
+    }
+    rows.push({ link, parts });
+  }
+  return rows
+    .map((row, idx) => ({ row, idx }))
+    .sort((a, b) => {
+      const ra = PROTOCOL_RANK[a.row.parts?.protocol ?? ''] ?? 50;
+      const rb = PROTOCOL_RANK[b.row.parts?.protocol ?? ''] ?? 50;
+      if (ra !== rb) return ra - rb;
+      return a.idx - b.idx;
+    })
+    .map((x) => x.row);
+}
+// END LUCX-HOOK

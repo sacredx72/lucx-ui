@@ -7,31 +7,53 @@
 import { useMemo, useState } from 'react';
 import { useFormContext } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
-import { Alert, Button, Form, Input, InputNumber, message, Modal, Select, Space, Switch, Tag, Tooltip } from 'antd';
-import { CheckCircleOutlined, CloseCircleOutlined, MedicineBoxOutlined, ReloadOutlined } from '@ant-design/icons';
+import {
+  Alert,
+  Button,
+  Form,
+  Input,
+  InputNumber,
+  message,
+  Modal,
+  Select,
+  Space,
+  Switch,
+  Tag,
+  Tooltip,
+} from 'antd';
+import {
+  CheckCircleOutlined,
+  CloseCircleOutlined,
+  MedicineBoxOutlined,
+  ReloadOutlined,
+} from '@ant-design/icons';
 
 import { FormField } from '@/components/form/rhf';
 import { HttpUtil, Wireguard } from '@/utils';
 import { useOutboundTags } from '@/api/queries/useOutboundTags';
+import { useStatusQuery } from '@/api/queries/useStatusQuery';
 import { maskSubnet, subnetsOverlap } from '@/lib/awg/subnet';
 import { useAwgInboundId } from '../awg-inbound-id-context';
 
-// LUCX-HOOK: AWG — map the panel obfLevel (1/2/3) and mimicryProfile to the
+// LUCX-HOOK: AWG — map the panel obfLevel (1/2/3/4) and mimicryProfile to the
 // backend cps package's profile enums. The backend owns the invariant-
 // enforcing RNG (Jmin<Jmax, |S1+56-S2|>=10, H1-H4 in disjoint quadrants) and
 // the CPS packet generators (TLS/DNS/SIP/QUIC), so the form calls the API
 // instead of a local Math.random stub.
-const OBF_PROFILE: Record<number, string> = { 1: 'lite', 2: 'standard', 3: 'pro' };
+const OBF_PROFILE: Record<number, string> = { 1: 'lite', 2: 'standard', 3: 'pro', 4: 'premium' };
 
 function levelToFullI1I5(level: number): boolean {
-  return level >= 3;
+  return level === 3;
 }
 
 // generateAwgObfuscationFromBackend calls /panel/api/inbounds/awg/generateObfuscation
 // to get a fresh Jc/Jmin/Jmax/S1-S4/H1-H4 + I1-I5 set from the server. When the
 // inbound targets AWG version '3', the response also carries a freshly generated
 // HeaderProtectionKey (the generator guarantees S1-S4 >= 12).
-async function generateAwgObfuscationFromBackend(getValue: (name: string) => unknown): Promise<Record<string, unknown> | null> {
+async function generateAwgObfuscationFromBackend(
+  getValue: (name: string) => unknown,
+  nodeId: number | null | undefined,
+): Promise<Record<string, unknown> | null> {
   const level = (getValue('settings.obfLevel') as number) ?? 2;
   const mimicryProfile = (getValue('settings.mimicryProfile') as string) || 'tls';
   const browserProfile = (getValue('settings.browserProfile') as string) || 'chrome';
@@ -39,22 +61,36 @@ async function generateAwgObfuscationFromBackend(getValue: (name: string) => unk
   const awgVersion = (getValue('settings.awgVersion') as string) || '2';
   const obfProfile = OBF_PROFILE[level] ?? 'standard';
   const fullI1I5 = levelToFullI1I5(level);
-  const msg = await HttpUtil.post('/panel/api/inbounds/awg/generateObfuscation', {
-    obfProfile,
-    mimicryProfile,
-    browserProfile,
-    region,
-    domain: '',
-    fullI1I5,
-    awgVersion,
-  }, { headers: { 'Content-Type': 'application/json' } });
+  const msg = await HttpUtil.post(
+    '/panel/api/inbounds/awg/generateObfuscation',
+    {
+      obfProfile,
+      mimicryProfile,
+      browserProfile,
+      region,
+      domain: '',
+      fullI1I5,
+      awgVersion,
+      nodeId,
+    },
+    { headers: { 'Content-Type': 'application/json' } },
+  );
   if (!msg?.success) return null;
   return (msg?.obj ?? null) as Record<string, unknown> | null;
 }
 
-// captureHostSignature captures a real QUIC handshake from the given domain.
-async function captureHostSignature(domain: string): Promise<Record<string, string> | null> {
-  const msg = await HttpUtil.post('/panel/api/inbounds/awg/captureHost', { domain }, { headers: { 'Content-Type': 'application/json' } });
+// awgVersion and the target host tell the backend whether the inbound will carry
+// a header-protection key, which narrows the capture's netlink byte budget.
+async function captureHostSignature(
+  domain: string,
+  awgVersion: string,
+  nodeId: number | null | undefined,
+): Promise<Record<string, string> | null> {
+  const msg = await HttpUtil.post(
+    '/panel/api/inbounds/awg/captureHost',
+    { domain, awgVersion, nodeId },
+    { headers: { 'Content-Type': 'application/json' } },
+  );
   if (!msg?.success) return null;
   return (msg?.obj ?? null) as Record<string, string> | null;
 }
@@ -103,9 +139,12 @@ export interface AwgFieldsProps {
   // warn when the operator types an overlapping subnet (kernel would install
   // two connected routes for the same prefix — see AGENTS.md Pattern 1e).
   otherAwgSubnets?: string[];
+  // Host the inbound will run on: null = this panel, a number = node-hosted.
+  // The generator endpoints gate the AWG3 block on it (awg.AwgVersionFieldsAllowed).
+  nodeId?: number | null;
 }
 
-export default function AwgFields({ otherAwgSubnets = [] }: AwgFieldsProps) {
+export default function AwgFields({ otherAwgSubnets = [], nodeId }: AwgFieldsProps) {
   const { t } = useTranslation();
   const [messageApi, messageContextHolder] = message.useMessage();
   // react-hook-form context (the inbound form is rhf, NOT AntD form). Use
@@ -118,9 +157,13 @@ export default function AwgFields({ otherAwgSubnets = [] }: AwgFieldsProps) {
   const awgVersion = watch('settings.awgVersion') as '1.5' | '2' | '3' | '3.1' | undefined;
   const awg3Plus = awgVersion === '3' || awgVersion === '3.1';
   const routeThroughXray = watch('settings.routeThroughXray') as boolean | undefined;
+  const xrayRoutingMode = watch('settings.xrayRoutingMode') as string | undefined;
+  const p2pOn = watch('settings.p2p') as boolean | undefined;
   const mimicryProfileVal = watch('settings.mimicryProfile') as string | undefined;
   const addressVal = watch('settings.address') as string | undefined;
   const { data: outboundTags } = useOutboundTags();
+  const { status, fetched: statusFetched } = useStatusQuery();
+  const kernelOk = nodeId != null || !statusFetched || status.awg.moduleLoaded;
 
   // Detect a subnet collision: the operator's Address overlaps with another
   // AWG inbound's tunnel subnet. Advisory-only (yellow Alert, not a form
@@ -143,7 +186,7 @@ export default function AwgFields({ otherAwgSubnets = [] }: AwgFieldsProps) {
   const regenerateObfuscation = async () => {
     setGenerating(true);
     try {
-      const obf = await generateAwgObfuscationFromBackend((name) => watch(name as never));
+      const obf = await generateAwgObfuscationFromBackend((name) => watch(name as never), nodeId);
       if (!obf) {
         messageApi.error(t('pages.inbounds.form.awgRegenerateFailed'));
         return;
@@ -151,10 +194,8 @@ export default function AwgFields({ otherAwgSubnets = [] }: AwgFieldsProps) {
       for (const [k, v] of Object.entries(obf)) {
         setValue(`settings.${k}`, v, { shouldDirty: true });
       }
-      // Lite/Standard only keep I1; drop stale Pro I2-I5 so client .conf does not
-      // inherit leftover packets after switching profile down.
       const level = (watch('settings.obfLevel') as number) ?? 2;
-      if (level < 3) {
+      if (level !== 3) {
         for (const k of ['i2', 'i3', 'i4', 'i5'] as const) {
           setValue(`settings.${k}`, '', { shouldDirty: true });
         }
@@ -176,7 +217,7 @@ export default function AwgFields({ otherAwgSubnets = [] }: AwgFieldsProps) {
     }
     setCapturing(true);
     try {
-      const res = await captureHostSignature(dom);
+      const res = await captureHostSignature(dom, awgVersion ?? '', nodeId);
       if (!res || !res.i1) {
         messageApi.error(t('pages.inbounds.form.awgCaptureFailed'));
         return;
@@ -239,43 +280,83 @@ export default function AwgFields({ otherAwgSubnets = [] }: AwgFieldsProps) {
       <FormField
         name={['settings', 'routeThroughXray']}
         label={t('pages.inbounds.form.awgRouteThroughXray')}
-        tooltip={t('pages.inbounds.form.awgRouteThroughXrayHint')}
+        tooltip={t('pages.inbounds.form.awgRoutingModeHint')}
         valueProp="checked"
       >
         <Switch />
       </FormField>
       {routeThroughXray && (
-        <>
-          <Alert
-            type="info"
-            showIcon
-            className="mb-12"
-            title={t('pages.inbounds.form.awgRouteThroughXrayNoReexport')}
+        <FormField
+          name={['settings', 'xrayRoutingMode']}
+          label={t('pages.inbounds.form.awgRoutingMode')}
+          tooltip={t('pages.inbounds.form.awgRoutingModeHint')}
+        >
+          <Select
+            options={[
+              { value: 'tun', label: 'Xray TUN' },
+              {
+                value: 'tproxy',
+                label: 'Xray TPROXY (TCP/UDP, IPv4)',
+                disabled: nodeId != null || !kernelOk,
+              },
+            ]}
           />
-          <FormField
-            name={['settings', 'outboundTag']}
-            label={t('pages.inbounds.form.awgRouteOutbound')}
-            tooltip={t('pages.inbounds.form.awgRouteOutboundHint')}
-          >
-            <Select
-              showSearch
-              optionFilterProp="label"
-              options={[
-                { value: '', label: t('pages.inbounds.form.awgRouteOutboundPlaceholder') },
-                ...(outboundTags ?? []).map((tag) => ({ value: tag, label: tag })),
-              ]}
-            />
-          </FormField>
-        </>
+        </FormField>
+      )}
+      {routeThroughXray && xrayRoutingMode === 'tproxy' && (
+        <FormField name={['settings', 'tproxyPort']} label={t('pages.inbounds.form.awgTproxyPort')}>
+          <InputNumber min={1024} max={65535} precision={0} style={{ width: '100%' }} />
+        </FormField>
+      )}
+      <FormField
+        name={['settings', 'p2p']}
+        label={t('pages.inbounds.form.awgP2P')}
+        tooltip={t('pages.inbounds.form.awgP2PHint')}
+        extra={!kernelOk ? t('pages.inbounds.form.awgP2PNeedsKernel') : undefined}
+        valueProp="checked"
+      >
+        <Switch disabled={!kernelOk} />
+      </FormField>
+      {(routeThroughXray || p2pOn) && (
+        <Alert
+          type="info"
+          showIcon
+          className="mb-12"
+          title={t('pages.inbounds.form.awgRouteThroughXrayNoReexport')}
+        />
+      )}
+      {routeThroughXray && (
+        <FormField
+          name={['settings', 'outboundTag']}
+          label={t('pages.inbounds.form.awgRouteOutbound')}
+          tooltip={t('pages.inbounds.form.awgRouteOutboundHint')}
+        >
+          <Select
+            showSearch
+            optionFilterProp="label"
+            options={[
+              { value: '', label: t('pages.inbounds.form.awgRouteOutboundPlaceholder') },
+              ...(outboundTags ?? []).map((tag) => ({ value: tag, label: tag })),
+            ]}
+          />
+        </FormField>
       )}
 
       <Form.Item label={t('pages.inbounds.form.awgServerKeys')}>
         <Space.Compact block>
           <FormField name={['settings', 'privateKey']} noStyle>
-            <Input readOnly placeholder={t('pages.inbounds.form.awgPrivateKey')} style={{ width: '50%' }} />
+            <Input
+              readOnly
+              placeholder={t('pages.inbounds.form.awgPrivateKey')}
+              style={{ width: '50%' }}
+            />
           </FormField>
           <FormField name={['settings', 'publicKey']} noStyle>
-            <Input readOnly placeholder={t('pages.inbounds.form.awgPublicKey')} style={{ width: 'calc(50% - 32px)' }} />
+            <Input
+              readOnly
+              placeholder={t('pages.inbounds.form.awgPublicKey')}
+              style={{ width: 'calc(50% - 32px)' }}
+            />
           </FormField>
           <Button icon={<ReloadOutlined />} onClick={regenerateKeys} />
         </Space.Compact>
@@ -288,9 +369,10 @@ export default function AwgFields({ otherAwgSubnets = [] }: AwgFieldsProps) {
       >
         <Select
           options={[
-            { value: 1, label: 'Lite — лёгкая обфускация (Jc + DNS I1)' },
-            { value: 2, label: 'Standard — средняя (Jc/S/H + TLS I1)' },
-            { value: 3, label: 'Pro — полная (Jc/S/H + I1-I5)' },
+            { value: 1, label: t('pages.inbounds.form.awgObfLite') },
+            { value: 2, label: t('pages.inbounds.form.awgObfStandard') },
+            { value: 3, label: t('pages.inbounds.form.awgObfPro') },
+            { value: 4, label: t('pages.inbounds.form.awgObfPremium') },
           ]}
         />
       </FormField>
@@ -331,7 +413,11 @@ export default function AwgFields({ otherAwgSubnets = [] }: AwgFieldsProps) {
       )}
       {/* END LUCX-HOOK */}
 
-      <FormField name={['settings', 'mimicryProfile']} label={t('pages.inbounds.form.awgMimicryProfile')} tooltip={t('pages.inbounds.form.awgMimicryProfileHint')}>
+      <FormField
+        name={['settings', 'mimicryProfile']}
+        label={t('pages.inbounds.form.awgMimicryProfile')}
+        tooltip={t('pages.inbounds.form.awgMimicryProfileHint')}
+      >
         <Select
           options={[
             { value: 'tls', label: 'TLS (ClientHello)' },
@@ -343,7 +429,11 @@ export default function AwgFields({ otherAwgSubnets = [] }: AwgFieldsProps) {
       </FormField>
 
       {mimicryProfileVal === 'tls' && (
-        <FormField name={['settings', 'browserProfile']} label={t('pages.inbounds.form.awgBrowserProfile')} tooltip={t('pages.inbounds.form.awgBrowserProfileHint')}>
+        <FormField
+          name={['settings', 'browserProfile']}
+          label={t('pages.inbounds.form.awgBrowserProfile')}
+          tooltip={t('pages.inbounds.form.awgBrowserProfileHint')}
+        >
           <Select
             options={[
               { value: 'chrome', label: t('pages.inbounds.form.awgBrowserChrome') },
@@ -354,16 +444,24 @@ export default function AwgFields({ otherAwgSubnets = [] }: AwgFieldsProps) {
         </FormField>
       )}
 
-      <FormField name={['settings', 'region']} label={t('pages.inbounds.form.awgRegion')} tooltip={t('pages.inbounds.form.awgRegionHint')}>
+      <FormField
+        name={['settings', 'region']}
+        label={t('pages.inbounds.form.awgRegion')}
+        tooltip={t('pages.inbounds.form.awgRegionHint')}
+      >
         <Select
           options={[
-            { value: 'ru', label: 'RU (включая РФ-сервисы: yandex/vk/gosuslugi)' },
-            { value: 'world', label: 'World (только глобальные домены)' },
+            { value: 'ru', label: t('pages.inbounds.form.awgRegionRu') },
+            { value: 'world', label: t('pages.inbounds.form.awgRegionWorld') },
           ]}
         />
       </FormField>
 
-      <FormField name={['settings', 'address']} label={t('pages.inbounds.form.awgAddress')} tooltip={t('pages.inbounds.form.awgAddressHint')}>
+      <FormField
+        name={['settings', 'address']}
+        label={t('pages.inbounds.form.awgAddress')}
+        tooltip={t('pages.inbounds.form.awgAddressHint')}
+      >
         <Input placeholder="10.200.0.1/24" />
       </FormField>
 
@@ -376,20 +474,27 @@ export default function AwgFields({ otherAwgSubnets = [] }: AwgFieldsProps) {
           type="warning"
           showIcon
           message={t('pages.inbounds.form.awgSubnetConflict')}
-          description={t('pages.inbounds.form.awgSubnetConflictHint', { subnet: conflictSubnet ?? '' })}
+          description={t('pages.inbounds.form.awgSubnetConflictHint', {
+            subnet: conflictSubnet ?? '',
+          })}
           style={{ marginBottom: 16 }}
         />
       )}
       {/* END LUCX-HOOK */}
 
-      <Form.Item label={t('pages.inbounds.form.awgMtu')} tooltip={t('pages.inbounds.form.awgMtuHint')}>
+      <Form.Item
+        label={t('pages.inbounds.form.awgMtu')}
+        tooltip={t('pages.inbounds.form.awgMtuHint')}
+      >
         <Space.Compact block>
           <FormField name={['settings', 'mtu']} noStyle>
             <InputNumber min={576} max={65535} style={{ width: 'calc(100% - 120px)' }} />
           </FormField>
           {inboundId == null ? (
             <Tooltip title={t('pages.inbounds.form.awgDiagSaveFirst')}>
-              <Button disabled style={{ width: 120 }}>{t('pages.inbounds.form.awgMtuTest')}</Button>
+              <Button disabled style={{ width: 120 }}>
+                {t('pages.inbounds.form.awgMtuTest')}
+              </Button>
             </Tooltip>
           ) : (
             <Button style={{ width: 120 }} onClick={testMtu} loading={mtuTestLoading}>
@@ -418,7 +523,10 @@ export default function AwgFields({ otherAwgSubnets = [] }: AwgFieldsProps) {
       </Form.Item>
 
       {/* LUCX-HOOK: AWG — host scan (QUIC capture → I1-I5, hoaxisr/awg-manager pattern) */}
-      <Form.Item label={t('pages.inbounds.form.awgCaptureHost')} tooltip={t('pages.inbounds.form.awgCaptureHostHint')}>
+      <Form.Item
+        label={t('pages.inbounds.form.awgCaptureHost')}
+        tooltip={t('pages.inbounds.form.awgCaptureHostHint')}
+      >
         <Space.Compact style={{ display: 'flex' }}>
           <Input
             placeholder="google.com"
@@ -434,7 +542,10 @@ export default function AwgFields({ otherAwgSubnets = [] }: AwgFieldsProps) {
       {/* END LUCX-HOOK */}
 
       {/* LUCX-HOOK: AWG — runtime diagnostics (read-only probe of the live kernel state) */}
-      <Form.Item label={t('pages.inbounds.form.awgDiagnostics')} tooltip={t('pages.inbounds.form.awgDiagnosticsHint')}>
+      <Form.Item
+        label={t('pages.inbounds.form.awgDiagnostics')}
+        tooltip={t('pages.inbounds.form.awgDiagnosticsHint')}
+      >
         {inboundId == null ? (
           <Tooltip title={t('pages.inbounds.form.awgDiagSaveFirst')}>
             <Button icon={<MedicineBoxOutlined />} disabled>
@@ -468,17 +579,28 @@ export default function AwgFields({ otherAwgSubnets = [] }: AwgFieldsProps) {
             <Alert
               type={diag.healthy ? 'success' : 'warning'}
               showIcon
-              message={diag.healthy ? t('pages.inbounds.form.awgDiagHealthy') : t('pages.inbounds.form.awgDiagUnhealthy')}
+              message={
+                diag.healthy
+                  ? t('pages.inbounds.form.awgDiagHealthy')
+                  : t('pages.inbounds.form.awgDiagUnhealthy')
+              }
               style={{ marginBottom: 12 }}
             />
             {diag.checks.map((c) => (
-              <div key={c.name} style={{ display: 'flex', gap: 8, marginBottom: 8, alignItems: 'flex-start' }}>
-                {c.ok
-                  ? <CheckCircleOutlined style={{ color: '#52c41a', marginTop: 4 }} />
-                  : <CloseCircleOutlined style={{ color: '#ff4d4f', marginTop: 4 }} />}
+              <div
+                key={c.name}
+                style={{ display: 'flex', gap: 8, marginBottom: 8, alignItems: 'flex-start' }}
+              >
+                {c.ok ? (
+                  <CheckCircleOutlined style={{ color: '#52c41a', marginTop: 4 }} />
+                ) : (
+                  <CloseCircleOutlined style={{ color: '#ff4d4f', marginTop: 4 }} />
+                )}
                 <div>
                   <div style={{ fontWeight: 600 }}>{c.name}</div>
-                  <div style={{ opacity: 0.75, fontSize: 12, wordBreak: 'break-all' }}>{c.detail}</div>
+                  <div style={{ opacity: 0.75, fontSize: 12, wordBreak: 'break-all' }}>
+                    {c.detail}
+                  </div>
                 </div>
               </div>
             ))}

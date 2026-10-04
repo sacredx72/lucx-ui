@@ -1,5 +1,8 @@
 services:
   3xui:
+    # LUCX-HOOK: prebuilt GHCR image; `docker compose build` still uses Dockerfile
+    image: ghcr.io/alexeylcp/lucx-ui:latest
+    # END LUCX-HOOK
     build:
       context: .
       dockerfile: ./Dockerfile
@@ -12,6 +15,10 @@ services:
     # with iptables, which needs NET_ADMIN. Without these caps a ban is logged
     # and shown in fail2ban status but never actually applied. NET_RAW covers
     # ip6tables. If you disable Fail2ban, you can drop cap_add.
+    #
+    # AmneziaWG works in this image: it runs embedded in the panel process
+    # (amneziawg-go over a gVisor userspace netstack), so it needs no kernel
+    # module and no host tooling. Publish its UDP listen port to use it.
     cap_add:
       - NET_ADMIN
       - NET_RAW

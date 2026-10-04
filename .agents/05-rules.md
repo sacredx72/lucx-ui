@@ -42,7 +42,7 @@ This includes (non-exhaustive):
 
 Typical tester path: MHSanaei/3x-ui is installed → installs LucX → opens Clients / Inbounds. Any regression here = “the fork won’t install”.
 
-**Before merge/release the agent must ask:** “If we take a fresh SQLite from upstream 3.6.x with WireGuard clients and `wg_keep_alive INTEGER` and run our binary — do the Clients page and Xray start work?” If no — **do not** merge.
+**Before merge/release the agent must ask:** “If we take a fresh SQLite from upstream 3.7.x with WireGuard clients and `wg_keep_alive INTEGER` and run our binary — do the Clients page and Xray start work?” If no — **do not** merge.
 
 **Strictly forbidden:**
 - Changing the Go field type mapped to an **existing** upstream column (`clients.*`, `inbounds.*`, …) **without** `sql.Scanner` / `driver.Valuer` (or equivalent) that accepts the driver’s **legacy form**. Lesson lucx.119: `KeepAlive int` → `KeepAliveValue string` without `Scan` → `unsupported Scan, storing driver.Value type int64 into type *model.KeepAliveValue` on every `Find(&[]ClientRecord)` — panel “Something went wrong”.
@@ -85,14 +85,18 @@ Run `grep -rn "LUCX-HOOK" internal/ frontend/ install.sh` to find all integratio
 
 New functionality lives ONLY in:
 - **Go:** `internal/awg/` — AWG sidecar (manager, process, instance, traffic, orphans)
-- **Go:** `internal/lucx/` — subdirectories: `parser/`, `nodetype/`, `outbound_link/` (Smart Cluster), `tunnel/` (tunnel sidecars: NaiveProxy, olcRTC, qWDTT, mieru, TrustTunnel)
+- **Go:** `internal/lucx/` — subdirectories: `parser/`, `nodetype/`, `outbound_link/` (Smart Cluster), `tunnel/` (tunnel sidecars: NaiveProxy, olcRTC, qWDTT, CSQTT, mieru, TrustTunnel)
 - **Go:** `internal/database/migrate_awg.go` — legacy DB migration
+- **Go:** `internal/database/migrate_geodata.go` — Xray geodata.assets stock list (Loyalsoldier + IR + RU + ROSCOM)
 - **Go:** `internal/web/service/tunnel.go`, `internal/web/controller/tunnel.go`, `internal/web/job/tunnel_job.go` — tunnel sidecar web layer
 - **Go:** `internal/web/service/sidecar_outbound.go`, `internal/web/controller/sidecar_outbound.go` — naive/mieru/TrustTunnel client outbounds
 - **Frontend:** `frontend/src/schemas/protocols/inbound/awg.ts` — Zod schema
 - **Frontend:** `frontend/src/pages/inbounds/form/protocols/awg.tsx` — React form
+- **Frontend:** `frontend/src/pages/inbounds/form/protocols/csqtt.tsx` — CSQTT form
 - **Frontend:** `frontend/src/schemas/tunnel.ts`, `frontend/src/api/tunnels.ts`, `frontend/src/pages/tunnels/TunnelsPage.tsx` — tunnel sidecar UI
 - **Shell:** `bin/install-awg-module.sh` — DKMS install
+- **Shell:** `bin/sourcecraft-release.sh` — SourceCraft (Yandex) release tarball
+- **Shell:** `bin/pack-sidecars.sh` — per-arch tunnel cores for GitHub tarballs
 
 Integration points (`model.go`, `db.go`, `web.go`, `runtime/local.go`, `service/xray.go`, `install.sh`, `inbound-defaults.ts`, `InboundFormModal.tsx`, `protocols/index.ts`, `primitives/protocol.ts`, `protocols/inbound/index.ts`, `api.go`, `routes.tsx`, `AppSidebar.tsx`, `queryKeys.ts`, `endpoints.ts`) get LUCX-HOOK blocks only.
 
@@ -121,10 +125,10 @@ The old architecture used a `tun2socks` userspace daemon to bridge the AWG kerne
 
 ### 8. Upstream Sync
 
-Procedure (validated on v3.5.0→v3.6.0, 103 upstream commits / 432 files / 7 conflicts):
+Procedure (validated on v3.5.0→v3.6.0, 103 upstream commits / 432 files / 7 conflicts; v3.6.0→v3.7.0 was incremental: 7 commits / 19 files / 0 conflicts):
 
 1. `git fetch origin --tags`, branch off our current head, then `git merge --no-commit --no-ff origin/main`.
-2. **Record the LUCX-HOOK marker count per file BEFORE resolving** (`git grep -c "LUCX-HOOK"`). After the merge, any file whose count dropped silently lost our code — that is the only reliable detector.
+2. **Record the LUCX-HOOK marker count per file BEFORE resolving** (`git grep -c "LUCX-HOOK"`). After the merge, any file whose count dropped silently lost our code — that is the only reliable detector. Overlay file list: `.agents/08-hooks.md`.
 3. **Resolve conflicts ONLY from the terminal.** Editing a file while it is in conflict state makes the IDE rewrite it from its own merge cache and silently drop content (v3.6.0: `install.sh` lost all 16 LUCX-HOOK blocks, `db.go` lost the new upstream functions).
 4. **Resolve block by block, never one blanket strategy.** Upstream usually *adds* code NEXT TO a HOOK block rather than replacing it, so a wholesale `--ours` yields uncompilable code (v3.6.0: `undefined: database.BackupSQLite`). Rule of thumb: take **both** sides when upstream added a sibling call/test/field; take **ours** only where our block is a deliberate substitution (fork URLs, `prerelease: false`).
 5. Verify: `go build ./...`, `go vet ./...`, `go test ./internal/awg/... ./internal/lucx/...`, `bin/check-lucx.sh`, and frontend `lint` + `typecheck` + `vitest run --project=unit` + `build`.
@@ -145,20 +149,20 @@ Upstream rewrote the frontend from Vue to React + TypeScript + AntD v6 + Zod. AW
 
 ### 10. License
 
-LucX-UI components (`internal/awg/`, `internal/awg/cps/`, `internal/awg/signature/`, `internal/lucx/`, `internal/database/migrate_awg*.go`, `internal/web/controller/awg.go`, `internal/web/controller/awg_outbound.go`, `internal/web/controller/lucx.go`, `internal/web/controller/tunnel.go`, `internal/web/job/awg_job.go`, `internal/web/job/tunnel_job.go`, `internal/web/service/client_awg.go`, `internal/web/service/awg_outbound.go`, `internal/web/service/tunnel.go`, `frontend/src/schemas/protocols/inbound/awg.ts`, `frontend/src/schemas/tunnel.ts`, `frontend/src/api/tunnels.ts`, `frontend/src/pages/inbounds/form/protocols/awg.tsx`, `frontend/src/pages/inbounds/form/protocols/mieru.tsx`, `frontend/src/pages/inbounds/form/protocols/trusttunnel.tsx`, `frontend/src/schemas/protocols/inbound/mieru.ts`, `frontend/src/schemas/protocols/inbound/trusttunnel.ts`, `frontend/src/pages/inbounds/form/awg-inbound-id-context.ts`, `frontend/src/lib/mieru/presets.ts`, `frontend/src/pages/tunnels/TunnelsPage.tsx`, `frontend/src/pages/clients/wireguardConfig.ts`, `bin/install-awg-module.sh`, `bin/check-lucx.sh`, `bin/pre-push`, `bin/build-release.sh`) are licensed under **PolyForm Noncommercial 1.0.0**. Free for personal and educational use. Commercial use (including VPN resale) requires explicit written permission from the author.
+LucX-UI components (`internal/awg/`, `internal/awg/cps/`, `internal/awg/signature/`, `internal/lucx/`, `internal/database/migrate_awg*.go`, `internal/database/migrate_geodata.go`, `internal/web/controller/awg.go`, `internal/web/controller/awg_outbound.go`, `internal/web/controller/lucx.go`, `internal/web/controller/tunnel.go`, `internal/web/job/awg_job.go`, `internal/web/job/tunnel_job.go`, `internal/web/service/client_awg.go`, `internal/web/service/awg_outbound.go`, `internal/web/service/tunnel.go`, `frontend/src/schemas/protocols/inbound/awg.ts`, `frontend/src/schemas/tunnel.ts`, `frontend/src/api/tunnels.ts`, `frontend/src/pages/inbounds/form/protocols/awg.tsx`, `frontend/src/pages/inbounds/form/protocols/mieru.tsx`, `frontend/src/pages/inbounds/form/protocols/trusttunnel.tsx`, `frontend/src/schemas/protocols/inbound/mieru.ts`, `frontend/src/schemas/protocols/inbound/trusttunnel.ts`, `frontend/src/pages/inbounds/form/awg-inbound-id-context.ts`, `frontend/src/lib/mieru/presets.ts`, `frontend/src/pages/tunnels/TunnelsPage.tsx`, `frontend/src/pages/clients/wireguardConfig.ts`, `bin/install-awg-module.sh`, `bin/check-lucx.sh`, `bin/pre-push`, `bin/build-release.sh`, `bin/sourcecraft-release.sh`) are licensed under **PolyForm Noncommercial 1.0.0**. Free for personal and educational use. Commercial use (including VPN resale) requires explicit written permission from the author.
 
 Original 3x-ui code remains under GPL-3.0.
 
-**Every new LucX-owned file MUST carry the SPDX header** (see any existing file in `internal/awg/` for the exact 5-line block). Files with `//go:build` tags put the header after the constraint line; shell scripts after the shebang. The full split (which files are PolyForm vs GPL, why, commercial contact) is documented in [LICENSING.md](LICENSING.md); the canonical license text is [LICENSE-PolyForm-Noncommercial.txt](LICENSE-PolyForm-Noncommercial.txt). Upstream files with LUCX-HOOK blocks stay GPL — never put SPDX headers in them.
+**Every new LucX-owned file MUST carry the SPDX header** (see any existing file in `internal/awg/` for the exact 5-line block). Files with `//go:build` tags put the header after the constraint line; shell scripts after the shebang. The full split (which files are PolyForm vs GPL, why, commercial contact) is documented in [LICENSING.md](../docs/LICENSING.md); the canonical license text is [LICENSE-PolyForm-Noncommercial.txt](../LICENSE-PolyForm-Noncommercial.txt). Upstream files with LUCX-HOOK blocks stay GPL — never put SPDX headers in them.
 
 ### 11. Documentation language — English
 
 **Law:** agent and project documentation is **English only**.
 
 Write in English:
-- `.agents/*`, `progress.md`, `LICENSING.md`, and any other agent/project ops docs
+- `.agents/*`, `docs/progress.md`, `docs/LICENSING.md`, and any other agent/project ops docs
 - Architecture Map, Known Issues, Debug Patterns, workflow notes
-- New entries in `progress.md` and edits to existing doc prose
+- New entries in `docs/progress.md` and edits to existing doc prose
 
 Exceptions (do not “translate away”):
 - **Commit messages** — Russian (see Commit Convention), unless asked otherwise
@@ -166,4 +170,4 @@ Exceptions (do not “translate away”):
 - **UI i18n** — locale files under `internal/web/translation/` stay multi-language
 - Quoted user/tester phrases, log lines, or fixed product strings that are inherently non-English
 
-Do not mix Russian/Chinese prose into `.agents/` or progress.md. English keeps one style and saves tokens for every agent session.
+Do not mix Russian/Chinese prose into `.agents/` or `docs/progress.md`. English keeps one style and saves tokens for every agent session.

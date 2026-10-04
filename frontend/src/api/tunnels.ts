@@ -15,6 +15,9 @@ import {
   QwdttStatusSchema,
   MieruStatusSchema,
   TrustTunnelStatusSchema,
+  AnytlsStatusSchema,
+  TproxyStatusSchema,
+  CsqttStatusSchema,
   type NaiveConfig,
   type NaiveStatus,
   type OlcrtcConfig,
@@ -23,9 +26,24 @@ import {
   type QwdttStatus,
   type MieruStatus,
   type TrustTunnelStatus,
+  type AnytlsStatus,
+  type TproxyStatus,
+  type CsqttStatus,
 } from '@/schemas/tunnel';
 
-export type { NaiveConfig, NaiveStatus, OlcrtcConfig, OlcrtcStatus, QwdttConfig, QwdttStatus, MieruStatus, TrustTunnelStatus };
+export type {
+  NaiveConfig,
+  NaiveStatus,
+  OlcrtcConfig,
+  OlcrtcStatus,
+  QwdttConfig,
+  QwdttStatus,
+  MieruStatus,
+  TrustTunnelStatus,
+  AnytlsStatus,
+  TproxyStatus,
+  CsqttStatus,
+};
 
 // JSON_HEADERS is load-bearing on every POST (lucx.69 lesson).
 const JSON_HEADERS = { headers: { 'Content-Type': 'application/json' } };
@@ -33,8 +51,12 @@ const JSON_HEADERS = { headers: { 'Content-Type': 'application/json' } };
 const NAIVE = '/panel/api/tunnel/naive';
 const OLCRTC = '/panel/api/tunnel/olcrtc';
 const QWDTT = '/panel/api/tunnel/qwdtt';
+const CSQTT = '/panel/api/tunnel/csqtt';
 const MIERU = '/panel/api/tunnel/mieru';
 const TRUSTTUNNEL = '/panel/api/tunnel/trusttunnel';
+const ANYTLS = '/panel/api/tunnel/anytls';
+const TPROXY = '/panel/api/tunnel/tproxy';
+const MTPROXY = '/panel/api/tunnel/mtproxy';
 
 export const tunnelsApi = {
   status: async (): Promise<Msg<NaiveStatus>> => {
@@ -59,7 +81,11 @@ export const tunnelsApi = {
     return parseMsg(raw, z.object({ caddyfile: z.string() }), 'tunnel/preview');
   },
   validate: async (text: string): Promise<Msg<{ valid: boolean }>> => {
-    const raw = await HttpUtil.post<{ valid: boolean }>(`${NAIVE}/validate`, { text }, JSON_HEADERS);
+    const raw = await HttpUtil.post<{ valid: boolean }>(
+      `${NAIVE}/validate`,
+      { text },
+      JSON_HEADERS,
+    );
     return parseMsg(raw, z.object({ valid: z.boolean() }), 'tunnel/validate');
   },
   download: (url: string, sha256?: string): Promise<Msg<null>> =>
@@ -69,7 +95,8 @@ export const tunnelsApi = {
     fd.append('file', file);
     return HttpUtil.post<null>(`${NAIVE}/upload`, fd);
   },
-  deleteBinary: (): Promise<Msg<null>> => HttpUtil.post<null>(`${NAIVE}/deleteBinary`, {}, JSON_HEADERS),
+  deleteBinary: (): Promise<Msg<null>> =>
+    HttpUtil.post<null>(`${NAIVE}/deleteBinary`, {}, JSON_HEADERS),
 
   olcrtcStatus: async (): Promise<Msg<OlcrtcStatus>> => {
     const raw = await HttpUtil.get<OlcrtcStatus>(`${OLCRTC}/status`, undefined, { silent: true });
@@ -81,7 +108,8 @@ export const tunnelsApi = {
   },
   olcrtcStart: (): Promise<Msg<null>> => HttpUtil.post<null>(`${OLCRTC}/start`, {}, JSON_HEADERS),
   olcrtcStop: (): Promise<Msg<null>> => HttpUtil.post<null>(`${OLCRTC}/stop`, {}, JSON_HEADERS),
-  olcrtcRestart: (): Promise<Msg<null>> => HttpUtil.post<null>(`${OLCRTC}/restart`, {}, JSON_HEADERS),
+  olcrtcRestart: (): Promise<Msg<null>> =>
+    HttpUtil.post<null>(`${OLCRTC}/restart`, {}, JSON_HEADERS),
   olcrtcLogs: (lines = 200): Promise<Msg<string[]>> =>
     HttpUtil.get<string[]>(`${OLCRTC}/logs?lines=${lines}`),
   olcrtcPreview: async (cfg: OlcrtcConfig): Promise<Msg<{ yaml: string }>> => {
@@ -121,6 +149,22 @@ export const tunnelsApi = {
   qwdttDeleteBinary: (): Promise<Msg<null>> =>
     HttpUtil.post<null>(`${QWDTT}/deleteBinary`, {}, JSON_HEADERS),
 
+  csqttStatus: async (): Promise<Msg<CsqttStatus>> => {
+    const raw = await HttpUtil.get<CsqttStatus>(`${CSQTT}/status`, undefined, { silent: true });
+    return parseMsg(raw, CsqttStatusSchema, 'tunnel/csqttStatus');
+  },
+  csqttLogs: (lines = 200): Promise<Msg<string[]>> =>
+    HttpUtil.get<string[]>(`${CSQTT}/logs?lines=${lines}`),
+  csqttDownload: (url: string, sha256?: string): Promise<Msg<null>> =>
+    HttpUtil.post<null>(`${CSQTT}/download`, { url, sha256 }, JSON_HEADERS),
+  csqttUpload: (file: File): Promise<Msg<null>> => {
+    const fd = new FormData();
+    fd.append('file', file);
+    return HttpUtil.post<null>(`${CSQTT}/upload`, fd);
+  },
+  csqttDeleteBinary: (): Promise<Msg<null>> =>
+    HttpUtil.post<null>(`${CSQTT}/deleteBinary`, {}, JSON_HEADERS),
+
   mieruStatus: async (): Promise<Msg<MieruStatus>> => {
     const raw = await HttpUtil.get<MieruStatus>(`${MIERU}/status`, undefined, { silent: true });
     return parseMsg(raw, MieruStatusSchema, 'tunnel/mieruStatus');
@@ -138,7 +182,9 @@ export const tunnelsApi = {
     HttpUtil.post<null>(`${MIERU}/deleteBinary`, {}, JSON_HEADERS),
 
   trustTunnelStatus: async (): Promise<Msg<TrustTunnelStatus>> => {
-    const raw = await HttpUtil.get<TrustTunnelStatus>(`${TRUSTTUNNEL}/status`, undefined, { silent: true });
+    const raw = await HttpUtil.get<TrustTunnelStatus>(`${TRUSTTUNNEL}/status`, undefined, {
+      silent: true,
+    });
     return parseMsg(raw, TrustTunnelStatusSchema, 'tunnel/trustTunnelStatus');
   },
   trustTunnelLogs: (lines = 200): Promise<Msg<string[]>> =>
@@ -152,4 +198,59 @@ export const tunnelsApi = {
   },
   trustTunnelDeleteBinary: (): Promise<Msg<null>> =>
     HttpUtil.post<null>(`${TRUSTTUNNEL}/deleteBinary`, {}, JSON_HEADERS),
+
+  anytlsStatus: async (): Promise<Msg<AnytlsStatus>> => {
+    const raw = await HttpUtil.get<AnytlsStatus>(`${ANYTLS}/status`, undefined, { silent: true });
+    return parseMsg(raw, AnytlsStatusSchema, 'tunnel/anytlsStatus');
+  },
+  anytlsLogs: (lines = 200): Promise<Msg<string[]>> =>
+    HttpUtil.get<string[]>(`${ANYTLS}/logs?lines=${lines}`),
+  anytlsDownload: (url: string, sha256?: string): Promise<Msg<null>> =>
+    HttpUtil.post<null>(`${ANYTLS}/download`, { url, sha256 }, JSON_HEADERS),
+  anytlsUpload: (file: File): Promise<Msg<null>> => {
+    const fd = new FormData();
+    fd.append('file', file);
+    return HttpUtil.post<null>(`${ANYTLS}/upload`, fd);
+  },
+  anytlsDeleteBinary: (): Promise<Msg<null>> =>
+    HttpUtil.post<null>(`${ANYTLS}/deleteBinary`, {}, JSON_HEADERS),
+
+  tproxyStatus: async (): Promise<Msg<TproxyStatus>> => {
+    const raw = await HttpUtil.get<TproxyStatus>(`${TPROXY}/status`, undefined, { silent: true });
+    return parseMsg(raw, TproxyStatusSchema, 'tunnel/tproxyStatus');
+  },
+  tproxyLogs: (lines = 200): Promise<Msg<string[]>> =>
+    HttpUtil.get<string[]>(`${TPROXY}/logs?lines=${lines}`),
+  tproxyDownload: (url: string, sha256?: string): Promise<Msg<null>> =>
+    HttpUtil.post<null>(`${TPROXY}/download`, { url, sha256 }, JSON_HEADERS),
+  tproxyUpload: (file: File): Promise<Msg<null>> => {
+    const fd = new FormData();
+    fd.append('file', file);
+    return HttpUtil.post<null>(`${TPROXY}/upload`, fd);
+  },
+  tproxyDeleteBinary: (): Promise<Msg<null>> =>
+    HttpUtil.post<null>(`${TPROXY}/deleteBinary`, {}, JSON_HEADERS),
+  tproxyUploadSite: (id: number, file: File): Promise<Msg<null>> => {
+    const fd = new FormData();
+    fd.append('file', file);
+    return HttpUtil.post<null>(`${TPROXY}/uploadSite?id=${id}`, fd);
+  },
+  tproxySiteFiles: (id: number): Promise<Msg<string[]>> =>
+    HttpUtil.get<string[]>(`${TPROXY}/site?id=${id}`, undefined, { silent: true }),
+
+  mtproxyStatus: async (): Promise<Msg<TproxyStatus>> => {
+    const raw = await HttpUtil.get<TproxyStatus>(`${MTPROXY}/status`, undefined, { silent: true });
+    return parseMsg(raw, TproxyStatusSchema, 'tunnel/mtproxyStatus');
+  },
+  mtproxyLogs: (lines = 200): Promise<Msg<string[]>> =>
+    HttpUtil.get<string[]>(`${MTPROXY}/logs?lines=${lines}`),
+  mtproxyDownload: (url: string, sha256?: string): Promise<Msg<null>> =>
+    HttpUtil.post<null>(`${MTPROXY}/download`, { url, sha256 }, JSON_HEADERS),
+  mtproxyUpload: (file: File): Promise<Msg<null>> => {
+    const fd = new FormData();
+    fd.append('file', file);
+    return HttpUtil.post<null>(`${MTPROXY}/upload`, fd);
+  },
+  mtproxyDeleteBinary: (): Promise<Msg<null>> =>
+    HttpUtil.post<null>(`${MTPROXY}/deleteBinary`, {}, JSON_HEADERS),
 };

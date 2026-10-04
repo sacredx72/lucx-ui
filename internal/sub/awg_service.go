@@ -27,8 +27,8 @@ func NewSubAwgService(sub *SubService) *SubAwgService {
 
 // GetAwg returns the subscription body and Subscription-Userinfo header.
 // format: "" or "conf" → plain .conf (multi-inbound separated by "# ---");
-// "vpn" → vpn:// lines (one per conf).
-func (s *SubAwgService) GetAwg(subId, host, format string) (body, header string, err error) {
+// "vpn" → vpn:// lines (one per conf). inboundId > 0 keeps only that inbound.
+func (s *SubAwgService) GetAwg(subId, host, format string, inboundId int) (body, header string, err error) {
 	subReq := s.SubService.ForRequest(host)
 	subReq.subscriptionBody = true
 	inbounds, err := subReq.getInboundsBySubId(subId)
@@ -38,9 +38,8 @@ func (s *SubAwgService) GetAwg(subId, host, format string) (body, header string,
 
 	var confs []string
 	seenEmails := make(map[string]struct{})
-	var lastBuildErr error
 	for _, inbound := range inbounds {
-		if inbound.Protocol != model.AWG {
+		if inbound.Protocol != model.AWG || !awgInboundWanted(inbound.Id, inboundId) {
 			continue
 		}
 		clients := subReq.matchingClients(inbound, subId)
@@ -53,16 +52,12 @@ func (s *SubAwgService) GetAwg(subId, host, format string) (body, header string,
 		}
 		for i := range clients {
 			client := clients[i]
-			if !client.Enable {
+			if !client.Enable || strings.TrimSpace(client.PrivateKey) == "" {
 				continue
 			}
 			seenEmails[client.Email] = struct{}{}
 			conf, confErr := service.BuildAwgClientConf(inbound, &client, endpointHost)
-			if confErr != nil {
-				lastBuildErr = confErr
-				continue
-			}
-			if strings.TrimSpace(conf) == "" {
+			if confErr != nil || strings.TrimSpace(conf) == "" {
 				continue
 			}
 			// Label multi-inbound confs so operators can split them.
@@ -71,6 +66,7 @@ func (s *SubAwgService) GetAwg(subId, host, format string) (body, header string,
 				if label == "" {
 					label = inbound.Tag
 				}
+				label = strings.NewReplacer("\n", " ", "\r", " ").Replace(label)
 				conf = "# " + label + "\n" + conf
 			}
 			confs = append(confs, conf)
@@ -78,9 +74,6 @@ func (s *SubAwgService) GetAwg(subId, host, format string) (body, header string,
 	}
 
 	if len(confs) == 0 {
-		if lastBuildErr != nil {
-			return "", "", lastBuildErr
-		}
 		return "", "", nil
 	}
 
@@ -108,4 +101,8 @@ func (s *SubAwgService) GetAwg(subId, host, format string) (body, header string,
 	}
 
 	return strings.Join(confs, "\n\n# ---\n\n"), header, nil
+}
+
+func awgInboundWanted(id, filter int) bool {
+	return filter <= 0 || id == filter
 }

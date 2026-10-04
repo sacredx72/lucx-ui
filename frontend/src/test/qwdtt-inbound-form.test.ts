@@ -1,3 +1,9 @@
+// Copyright (c) 2025 LucX-UI Project.
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// LucX-UI Component. Free for personal and educational use.
+// Commercial use (including VPN resale) requires explicit written permission from the author.
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
 import { describe, it, expect } from 'vitest';
 import { InboundFormSchema } from '@/schemas/forms/inbound-form';
 import { createDefaultQwdttInboundSettings } from '@/lib/xray/inbound-defaults';
@@ -66,10 +72,12 @@ describe('qwdtt inbound form', () => {
   });
 
   it('parses transportless stream after sidecar protocol switch shape', () => {
-    const r = InboundFormSchema.safeParse(base({
-      port: 56000,
-      streamSettings: { security: 'none' },
-    }));
+    const r = InboundFormSchema.safeParse(
+      base({
+        port: 56000,
+        streamSettings: { security: 'none' },
+      }),
+    );
     expect(r.success, JSON.stringify(r.success ? null : r.error.issues)).toBe(true);
   });
 });

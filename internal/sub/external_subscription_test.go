@@ -4,12 +4,17 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mhsanaei/3x-ui/v3/internal/database"
+	"github.com/mhsanaei/3x-ui/v3/internal/database/dbtest"
+	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 )
 
 func resetSubscriptionCache(t *testing.T) {
@@ -44,7 +49,7 @@ func TestFetchSubscriptionLinksSharesConcurrentRefresh(t *testing.T) {
 	var wg sync.WaitGroup
 	for range callers {
 		wg.Go(func() {
-			results <- fetchSubscriptionLinks(srv.URL)
+			results <- fetchSubscriptionLinks(srv.URL).links
 		})
 	}
 
@@ -73,7 +78,7 @@ func TestFetchSubscriptionLinksBoundsCacheSize(t *testing.T) {
 	defer srv.Close()
 
 	for i := range subscriptionCacheCapacity + 1 {
-		links := fetchSubscriptionLinks(srv.URL + "?id=" + strconv.Itoa(i))
+		links := fetchSubscriptionLinks(srv.URL + "?id=" + strconv.Itoa(i)).links
 		if len(links) != 1 {
 			t.Fatalf("links at %d = %#v", i, links)
 		}
@@ -122,12 +127,12 @@ func TestFetchSubscriptionLinksSharesStaleResultAfterRefreshFailure(t *testing.T
 	var wg sync.WaitGroup
 	for range callers {
 		wg.Go(func() {
-			results <- fetchSubscriptionLinks(staleURL)
+			results <- fetchSubscriptionLinks(staleURL).links
 		})
 	}
 
 	time.Sleep(100 * time.Millisecond)
-	if links := fetchSubscriptionLinks(srv.URL + "/fresh"); len(links) != 1 || links[0] != "vless://fresh@example.com:443" {
+	if links := fetchSubscriptionLinks(srv.URL + "/fresh").links; len(links) != 1 || links[0] != "vless://fresh@example.com:443" {
 		t.Fatalf("fresh links = %#v", links)
 	}
 	close(release)
@@ -176,5 +181,170 @@ func TestDoFetchSubscriptionLinks_AcceptsBodyAtLimit(t *testing.T) {
 	}
 	if len(links) != 1 || links[0] != link {
 		t.Fatalf("links = %v, want [%q]", links, link)
+	}
+}
+
+func TestRecordExternalSubscriptionFetchStampsEveryRowForTheURL(t *testing.T) {
+	initMutDB(t)
+	resetSubscriptionCache(t)
+	db := database.GetDB()
+
+	var failing atomic.Bool
+	failing.Store(true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if failing.Load() {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		_, _ = w.Write([]byte("vless://uuid@example.com:443#Node"))
+	}))
+	defer srv.Close()
+
+	owners := []model.ClientRecord{
+		{Email: "one@example.com", SubID: "sub-fetch", UUID: "uuid-1", Enable: true},
+		{Email: "two@example.com", SubID: "sub-fetch", UUID: "uuid-2", Enable: true},
+	}
+	for i := range owners {
+		if err := db.Create(&owners[i]).Error; err != nil {
+			t.Fatalf("seed client %d: %v", i, err)
+		}
+		row := model.ClientExternalLink{
+			ClientId: owners[i].Id,
+			Kind:     model.ExternalLinkKindSubscription,
+			Value:    srv.URL,
+		}
+		if err := db.Create(&row).Error; err != nil {
+			t.Fatalf("seed external link %d: %v", i, err)
+		}
+	}
+
+	svc := NewSubService("")
+	entries, err := svc.getClientExternalLinksBySubId("sub-fetch")
+	if err != nil {
+		t.Fatalf("getClientExternalLinksBySubId: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(entries))
+	}
+
+	for _, e := range entries {
+		expandEntry(e)
+	}
+
+	var rows []model.ClientExternalLink
+	if err := db.Where("value = ?", srv.URL).Find(&rows).Error; err != nil {
+		t.Fatalf("read rows: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %d, want 2", len(rows))
+	}
+	for _, row := range rows {
+		if row.LastFetchAt <= 0 {
+			t.Fatalf("row %d lastFetchAt = %d, want a stamped timestamp", row.Id, row.LastFetchAt)
+		}
+		if row.LastFetchError != errBadStatus.Error() {
+			t.Fatalf("row %d lastFetchError = %q, want %q", row.Id, row.LastFetchError, errBadStatus)
+		}
+	}
+
+	failing.Store(false)
+	resetSubscriptionCache(t)
+	for _, e := range entries {
+		expandEntry(e)
+	}
+
+	if err := db.Where("value = ?", srv.URL).Find(&rows).Error; err != nil {
+		t.Fatalf("re-read rows: %v", err)
+	}
+	for _, row := range rows {
+		if row.LastFetchError != "" {
+			t.Fatalf("row %d lastFetchError = %q, want cleared after a good fetch", row.Id, row.LastFetchError)
+		}
+		if row.LastFetchAt <= 0 {
+			t.Fatalf("row %d lastFetchAt = %d, want a stamped timestamp", row.Id, row.LastFetchAt)
+		}
+	}
+}
+
+func TestExpandEntryCacheHitWritesNothing(t *testing.T) {
+	initMutDB(t)
+	resetSubscriptionCache(t)
+	db := database.GetDB()
+
+	const subURL = "https://provider.example/cached"
+	rec := model.ClientRecord{Email: "cached@example.com", SubID: "sub-cached", UUID: "uuid", Enable: true}
+	if err := db.Create(&rec).Error; err != nil {
+		t.Fatalf("seed client: %v", err)
+	}
+	row := model.ClientExternalLink{ClientId: rec.Id, Kind: model.ExternalLinkKindSubscription, Value: subURL}
+	if err := db.Create(&row).Error; err != nil {
+		t.Fatalf("seed external link: %v", err)
+	}
+
+	subscriptionCache.Lock()
+	subscriptionCache.m[subURL] = subscriptionCacheEntry{
+		links:     []string{"vless://uuid@example.com:443#Node"},
+		fetchedAt: time.Now(),
+	}
+	subscriptionCache.Unlock()
+
+	if got := expandEntry(externalLinkEntry{Kind: model.ExternalLinkKindSubscription, Value: subURL}); len(got) != 1 {
+		t.Fatalf("expandEntry = %#v, want the cached link", got)
+	}
+
+	var after model.ClientExternalLink
+	if err := db.First(&after, row.Id).Error; err != nil {
+		t.Fatalf("read row: %v", err)
+	}
+	if after.LastFetchAt != 0 || after.LastFetchError != "" {
+		t.Fatalf("cache hit wrote fetch status: %#v", after)
+	}
+}
+
+func TestFetchUsesConfiguredExternalSubUserAgent(t *testing.T) {
+	resetSubscriptionCache(t)
+	dbtest.InitDB(t, filepath.Join(t.TempDir(), "ua.db"))
+
+	const customUA = "Happ/4.2.1"
+	if err := database.GetDB().Create(&model.Setting{
+		Key:   "externalSubUserAgent",
+		Value: customUA,
+	}).Error; err != nil {
+		t.Fatalf("save setting: %v", err)
+	}
+
+	var gotUA string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUA = r.Header.Get("User-Agent")
+		_, _ = w.Write([]byte("vless://uuid@host:443?security=none#x"))
+	}))
+	defer srv.Close()
+
+	res := fetchSubscriptionLinks(srv.URL)
+	if res.err != nil {
+		t.Fatalf("fetch: %v", res.err)
+	}
+	if gotUA != customUA {
+		t.Fatalf("User-Agent = %q, want %q", gotUA, customUA)
+	}
+}
+
+func TestFetchFallsBackToDefaultExternalSubUserAgent(t *testing.T) {
+	resetSubscriptionCache(t)
+	dbtest.InitDB(t, filepath.Join(t.TempDir(), "ua-default.db"))
+
+	var gotUA string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUA = r.Header.Get("User-Agent")
+		_, _ = w.Write([]byte("vless://uuid@host:443?security=none#x"))
+	}))
+	defer srv.Close()
+
+	res := fetchSubscriptionLinks(srv.URL)
+	if res.err != nil {
+		t.Fatalf("fetch: %v", res.err)
+	}
+	if gotUA != "v2rayNG/1.8.5" {
+		t.Fatalf("User-Agent = %q, want default v2rayNG/1.8.5", gotUA)
 	}
 }

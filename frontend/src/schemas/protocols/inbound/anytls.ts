@@ -1,0 +1,24 @@
+// Copyright (c) 2025 LucX-UI Project.
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// LucX-UI Component. Free for personal and educational use.
+// Commercial use (including VPN resale) requires explicit written permission from the author.
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+import { z } from 'zod';
+
+export const AnytlsInboundSettingsSchema = z.object({
+  port: z.number().int().min(1).max(65535).default(8443),
+  password: z.string().default(''),
+  sni: z.string().default(''),
+  certFile: z.string().default(''),
+  keyFile: z.string().default(''),
+  // lucx.273: uid REDIRECT bridge (tproxy pattern) — anytls-go has no SOCKS
+  // dialer, so routing works through iptables, not through the binary.
+  routeThroughXray: z.boolean().default(false),
+  routeXrayPort: z.number().int().min(1).max(65535).optional(),
+  outboundTag: z.string().default(''),
+  // Clients are edited in the client modal, not this form. Without the field
+  // Zod strips them and a no-op save detaches every client.
+  clients: z.array(z.record(z.string(), z.unknown())).default([]),
+});
+export type AnytlsInboundSettings = z.infer<typeof AnytlsInboundSettingsSchema>;

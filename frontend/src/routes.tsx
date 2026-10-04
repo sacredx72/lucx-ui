@@ -1,7 +1,9 @@
 import { lazy, Suspense } from 'react';
-import { createBrowserRouter, type RouteObject } from 'react-router';
+import { createBrowserRouter, useRouteError, type RouteObject } from 'react-router';
+import { Spin } from 'antd';
 
 import PanelLayout from '@/layouts/PanelLayout';
+import { reloadOnceOnStaleChunk } from '@/lib/stale-chunk';
 
 const IndexPage = lazy(() => import('@/pages/index/IndexPage'));
 const InboundsPage = lazy(() => import('@/pages/inbounds/InboundsPage'));
@@ -12,18 +14,47 @@ const HostsPage = lazy(() => import('@/pages/hosts/HostsPage'));
 const SettingsPage = lazy(() => import('@/pages/settings/SettingsPage'));
 const XrayPage = lazy(() => import('@/pages/xray/XrayPage'));
 const ApiDocsPage = lazy(() => import('@/pages/api-docs/ApiDocsPage'));
+const SponsorsPage = lazy(() => import('@/pages/sponsors/SponsorsPage'));
 // LUCX-HOOK: tunnel sidecars (NaiveProxy) page
 const TunnelsPage = lazy(() => import('@/pages/tunnels/TunnelsPage'));
+const MaskingPage = lazy(() => import('@/pages/masking/MaskingPage'));
 // END LUCX-HOOK
 
 function withSuspense(node: React.ReactNode) {
-  return <Suspense fallback={null}>{node}</Suspense>;
+  return (
+    <Suspense
+      fallback={
+        <div
+          style={{
+            display: 'flex',
+            justifyContent: 'center',
+            alignItems: 'center',
+            minHeight: '60vh',
+          }}
+        >
+          <Spin size="large" />
+        </div>
+      }
+    >
+      {node}
+    </Suspense>
+  );
+}
+
+function StaleAssetReload() {
+  const error = useRouteError();
+  if (reloadOnceOnStaleChunk(error)) return null;
+  const msg = error instanceof Error ? error.message : String(error ?? '');
+  return (
+    <div style={{ padding: 48, textAlign: 'center' }}>{msg || 'Unexpected Application Error'}</div>
+  );
 }
 
 const routes: RouteObject[] = [
   {
     path: '/',
     element: <PanelLayout />,
+    errorElement: <StaleAssetReload />,
     children: [
       { index: true, element: withSuspense(<IndexPage />) },
       { path: 'inbounds', element: withSuspense(<InboundsPage />) },
@@ -33,12 +64,14 @@ const routes: RouteObject[] = [
       { path: 'hosts', element: withSuspense(<HostsPage />) },
       /* LUCX-HOOK: tunnel sidecars (NaiveProxy) */
       { path: 'tunnels', element: withSuspense(<TunnelsPage />) },
+      { path: 'masking', element: withSuspense(<MaskingPage />) },
       /* END LUCX-HOOK */
       { path: 'settings', element: withSuspense(<SettingsPage />) },
       { path: 'xray', element: withSuspense(<XrayPage />) },
       { path: 'outbound', element: withSuspense(<XrayPage />) },
       { path: 'routing', element: withSuspense(<XrayPage />) },
       { path: 'api-docs', element: withSuspense(<ApiDocsPage />) },
+      { path: 'sponsors', element: withSuspense(<SponsorsPage />) },
     ],
   },
 ];

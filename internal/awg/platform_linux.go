@@ -15,32 +15,38 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
 
-// defaultRouteInterface returns the name of the interface holding the default
-// route (the one that would carry outbound traffic to the internet). Used as
-// the -o target for the MASQUERADE rule in PostUp. Returns empty when no
-// default route exists (an unusual server, but we degrade gracefully: PostUp
-// uses the rule but iptables will simply fail to match, which is logged but
-// non-fatal).
+func renameAwgInterface(oldName, newName string) error {
+	return renameAwgInterfaceSeq(ipLinkSet, oldName, newName)
+}
+
+func ipLinkSet(args ...string) error {
+	cmdArgs := append([]string{"link", "set"}, args...)
+	out, err := exec.CommandContext(context.Background(), "ip", cmdArgs...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ip link set %s: %w (%s)", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 func defaultRouteInterface() string {
 	out, err := exec.CommandContext(context.Background(), "ip", "-o", "-4", "route", "show", "default").Output()
 	if err != nil {
-		return ""
+		out = nil
 	}
-	return parseDefaultRouteInterface(string(out))
+	return stickyDefaultRoute(parseDefaultRouteInterface(string(out)))
 }
 
 // killStrayAwgInterfaces removes AWG kernel interfaces left over from a
 // previous x-ui run and returns how many were removed. A survivor holds the
 // inbound's UDP port with stale obfuscation, so new clients cannot connect.
-// x-ui is the sole owner of awgN interfaces, so any "awg*" interface at
-// startup is an orphan and is safe to delete. Routing of decrypted traffic
-// into Xray is via an injected TUN inbound (no tun2socks daemon), so there
-// are no userspace orphans to sweep — the TUN device is owned by Xray and
-// dies with it.
+// Only interfaces whose .conf carries the x-ui ownership marker are removed.
+// Foreign awg0/awg1 (awg-multi-script, toolza3, WGDashboard) share the same
+// name pattern and must stay up until the operator imports them.
 //
 // IMPORTANT: this sweep must NOT touch "awgo-*" interfaces — those belong to
 // the AWG outbound subsystem (client-mode tunnels named "awgo-{Id}"). The
@@ -62,29 +68,15 @@ func killStrayAwgInterfaces() int {
 		if !isInboundAwgInterface(name) {
 			continue
 		}
+		if !strayInterfaceIsOurs(name) {
+			continue
+		}
+		cleanupTproxyConfig(filepath.Join(awgConfigDir, name+".conf"))
 		if err := exec.CommandContext(context.Background(), "ip", "link", "del", name).Run(); err == nil {
 			killed++
 		}
 	}
 	return killed
-}
-
-// isInboundAwgInterface reports whether name is an inbound AWG interface
-// (e.g. "awg1") and NOT an outbound one (e.g. "awgo-1"). The rule: the name
-// starts with "awg" and the next character is a digit. The "awgo-" prefix
-// is rejected because 'o' is not a digit. This is deliberately stricter than
-// `strings.HasPrefix(name, "awg")` so the inbound orphan sweep can never
-// collide with the outbound interface namespace.
-func isInboundAwgInterface(name string) bool {
-	if !strings.HasPrefix(name, "awg") {
-		return false
-	}
-	rest := name[len("awg"):]
-	if rest == "" {
-		return false
-	}
-	r := rune(rest[0])
-	return r >= '0' && r <= '9'
 }
 
 var (
@@ -103,12 +95,9 @@ var (
 // the half-built interface back, and every reconcile fails with "Device
 // <awgN> does not exist".
 //
-// The probe is functional, not version-based. Upstream hardcodes
-// PACKAGE_VERSION="1.0.0" (dkms.conf) and WIREGUARD_VERSION=1.0.0 (Makefile)
-// in EVERY release, so modinfo reports the same "1.0.0" for the pre-AWG3
-// tags (v1.0.20260611 …) and the AWG3 tags (v3.0.20260730 …) — the previous
-// major=="3" parse never matched and silently dropped HPK on every host,
-// including hosts whose module WAS rebuilt from master.
+// The probe is functional, not version-based: sysfs module-version reporting
+// is confirmed accurate on a 3.1 module (measured on ru1). Whether pre-3.1
+// modules report accurately too is unverified, so kallsyms stays the check here.
 //
 // Only a positive result is cached. A negative one is transient (module not
 // loaded yet right after boot, tools mid-rebuild during an update), so the
@@ -209,12 +198,29 @@ var (
 
 var moduleSupportsAwg31Override *bool
 
-// ModuleSupportsAwg31 reports whether this host can consume AWG 3.1 fields
-// (RandomTrailers / DisableCookies). Tools older than v3.1 reject those
-// .conf lines with "Line unrecognized" and awg-quick rolls the interface
-// back — same Pattern 1d as HPK on a v1 module. Only a positive result is
-// cached; a negative one is transient (tools mid-rebuild) so the next call
-// retries.
+// moduleVersionPath is a package var so tests can point it at a fixture
+// file — the real sysfs file cannot be downgraded on a live module.
+var moduleVersionPath = "/sys/module/amneziawg/version"
+
+// moduleVersionAtLeast checks the LOADED module, not the awg tools — the two
+// upgrade independently, so a stale module still rejects RandomTrailers/DisableCookies.
+func moduleVersionAtLeast(wantMajor, wantMinor int) bool {
+	data, err := os.ReadFile(moduleVersionPath)
+	if err != nil {
+		return false
+	}
+	major, minor := parseAwgToolsVersion("v" + strings.TrimSpace(string(data)))
+	if major < 0 {
+		return false
+	}
+	if major != wantMajor {
+		return major > wantMajor
+	}
+	return minor >= wantMinor
+}
+
+// ModuleSupportsAwg31 needs module AND tools at v3.1+: a stale module accepts
+// the .conf line without the semantics; older tools reject it outright ("Line unrecognized").
 func ModuleSupportsAwg31() bool {
 	if moduleSupportsAwg31Override != nil {
 		return *moduleSupportsAwg31Override
@@ -222,11 +228,16 @@ func ModuleSupportsAwg31() bool {
 	if moduleAwg31Checked {
 		return moduleAwg31Supported
 	}
+	if !moduleVersionAtLeast(3, 1) {
+		return false
+	}
 	out, err := exec.CommandContext(context.Background(), awgBin("awg"), "version").Output()
 	if err != nil {
 		return false
 	}
 	supported := awgToolsAtLeast(string(out), 3, 1)
+	// Cache only success — a miss may be a transient mid-upgrade race, so
+	// the next call retries instead of latching a false result.
 	if supported {
 		moduleAwg31Checked = true
 		moduleAwg31Supported = true
@@ -260,22 +271,31 @@ func awg3CapabilityCheck(p prober) DiagCheck {
 	return DiagCheck{awg3SupportCheckName, kernelOK && toolsOK, detail}
 }
 
-// awg31CapabilityCheck builds the informational diagnostics line for AWG 3.1
-// (RandomTrailers / DisableCookies) readiness: the awg tools must be v3.1+.
-// A failing line does not make the inbound unhealthy (Healthy skips it) — it
-// only explains why the panel renders configs without those fields here. The
-// tools probe goes through the prober so tests can replay it.
+// awg31CapabilityCheck reports informational readiness only — a failing line
+// does not mark the inbound unhealthy (Healthy skips it); see ModuleSupportsAwg31.
 func awg31CapabilityCheck(p prober) DiagCheck {
+	moduleOK := moduleVersionAtLeast(3, 1)
 	toolsOut, err := p.Run("awg", "version")
 	toolsOK := err == nil && awgToolsAtLeast(toolsOut, 3, 1)
-	detail := "tools: " + oneLine(strings.TrimSpace(toolsOut))
+	detail := fmt.Sprintf("module: %s; tools: %s", yesNo(moduleOK), oneLine(strings.TrimSpace(toolsOut)))
 	if err != nil {
-		detail = "tools: awg version failed"
+		detail = "module: " + yesNo(moduleOK) + "; tools: awg version failed"
 	}
-	if !toolsOK {
+	supported := moduleOK && toolsOK
+	if !supported {
 		detail += " — RandomTrailers/DisableCookies are omitted in rendered configs on this host"
 	}
-	return DiagCheck{awg31SupportCheckName, toolsOK, detail}
+	return DiagCheck{awg31SupportCheckName, supported, detail}
+}
+
+func kernelAvailable() bool {
+	if _, err := os.Stat("/sys/module/amneziawg"); err != nil {
+		return false
+	}
+	// awgBin already LookPaths then /usr/bin|/usr/local/bin|sbin. A
+	// LookPath-only probe missed tools on a thin systemd PATH and, with the
+	// old sync.Once cache, locked the process into userspace forever.
+	return awgBin("awg-quick") != "awg-quick"
 }
 
 func yesNo(b bool) string {

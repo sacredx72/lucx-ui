@@ -52,12 +52,50 @@ done
 
 [[ $EUID -ne 0 ]] && { echo -e "${RED}Запустите с правами root${NC}"; exit 1; }
 
-# Marker file written after a successful DKMS install: the upstream commit
-# SHA the module was built from. update.sh compares it against `git ls-remote
-# refs/heads/master` to decide whether a rebuild is due — a version string
-# cannot work because upstream stamps PACKAGE_VERSION="1.0.0" into every
-# module build (v1 and v3 alike).
+# Marker file written after a successful DKMS install: the commit SHA the
+# module was built from. Compared against AWG_KMOD_PIN (not floating master) —
+# unpinned master made every panel update a rebuild and could swap a v3
+# netlink ABI under pre-v3 host tools. Bump the pins only after a stand test.
+# PACKAGE_VERSION is always "1.0.0" (v1 and v3 alike), so a version string
+# cannot discriminate builds.
 AWG_MODULE_MARKER="/etc/x-ui/.awg-module-version"
+AWG_KMOD_PIN="3c38e168beb7c60dec41dfe423d41555205a3dac"
+AWG_TOOLS_PIN="ee0f0a9aa34ff0a0da4b3433b9512781cfe02843"
+
+# Prefer a GitHub tarball over `git fetch`. git-smart-HTTP 401 prompts
+# Username/Password on a headless install (Igor, 2026-09-02) and then dies.
+git_clone_sha() {
+    local url="$1" sha="$2" dest="$3"
+    local repo tmp
+    repo="${url#https://github.com/}"
+    repo="${repo%.git}"
+    tmp="$(mktemp /tmp/awg-src-XXXXXX.tar.gz)"
+    export GIT_TERMINAL_PROMPT=0
+    export GIT_ASKPASS=/bin/true
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 20 --max-time 180 \
+            -o "$tmp" "https://codeload.github.com/${repo}/tar.gz/${sha}" \
+            && tar -tzf "$tmp" >/dev/null 2>&1; then
+            rm -rf "$dest"
+            mkdir -p "$dest"
+            tar -C "$dest" --strip-components=1 -xzf "$tmp"
+            rm -f "$tmp"
+            return 0
+        fi
+        if curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 20 --max-time 180 \
+            -o "$tmp" "https://github.com/${repo}/archive/${sha}.tar.gz" \
+            && tar -tzf "$tmp" >/dev/null 2>&1; then
+            rm -rf "$dest"
+            mkdir -p "$dest"
+            tar -C "$dest" --strip-components=1 -xzf "$tmp"
+            rm -f "$tmp"
+            return 0
+        fi
+    fi
+    rm -f "$tmp"
+    echo -e "${RED}failed to fetch ${repo}@${sha}${NC}" >&2
+    return 1
+}
 
 uninstall_awg_module() {
     echo -e "${YELLOW}=== Удаление модуля ядра AmneziaWG ===${NC}"
@@ -75,6 +113,10 @@ uninstall_awg_module() {
     if command -v ip >/dev/null 2>&1; then
         while read -r iface; do
             [[ -n "$iface" ]] || continue
+            conf="/etc/amnezia/amneziawg/${iface}.conf"
+            if ! grep -qF "# Managed by x-ui - do not edit" "$conf" 2>/dev/null; then
+                continue
+            fi
             echo -e "${YELLOW}ip link delete ${iface}${NC}"
             ip link delete "$iface" >/dev/null 2>&1 || true
         done < <(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E '^(awg[0-9]+|awgo-[0-9]+)$' || true)
@@ -139,88 +181,267 @@ awg_tools_stale() {
     return 1
 }
 
-# Compat for Linux ≥ 7.1.5 (and distro backports): udp_tunnel_sock_release /
-# setup_udp_tunnel_sock take struct sock * instead of struct socket *.
-# Upstream PR amnezia-vpn/amneziawg-linux-kernel-module#218. No-op when
-# master already has the wrappers — drop this after that merge.
+# Compat for the udp_tunnel ABI change: Linux 7.1.5 changed
+# udp_tunnel_sock_release / setup_udp_tunnel_sock from struct socket * to
+# struct sock *, but distros backport the new ABI BELOW that version — the
+# version-gated macro in the tree then mis-decodes struct sock * again
+# (Igor, Ubuntu generic 7.0.0-38: "expected 'struct sock *' but argument is
+# of type 'struct socket *'"). Replace the LINUX_VERSION_CODE-gated macro
+# pair in compat/compat.h with a compile-time signature probe (PR #218
+# style); call sites in socket.c already pass struct sock *.
 apply_udp_tunnel_abi_compat() {
-    local f="${1:-socket.c}"
-    if grep -qF 'wg_udp_tunnel_sock_release' "$f" 2>/dev/null; then
+    local f="${1:-compat/compat.h}"
+    if grep -qF 'wg_setup_udp_tunnel_sock' "$f" 2>/dev/null; then
         echo -e "${GREEN}udp_tunnel ABI wrappers already in tree — skip.${NC}"
         return 0
     fi
     if ! command -v python3 >/dev/null 2>&1; then
-        echo -e "${YELLOW}python3 нет — патч udp_tunnel ABI пропущен (ядра 7.1.5+ не соберутся).${NC}"
+        echo -e "${YELLOW}python3 нет — патч udp_tunnel ABI пропущен (ядра с backport-ABI не соберутся).${NC}"
         return 0
     fi
-    echo -e "${YELLOW}Патч udp_tunnel ABI (ядро 7.1.5+, PR #218)...${NC}"
+    echo -e "${YELLOW}Патч udp_tunnel ABI (детект сигнатуры вместо версии)...${NC}"
     python3 - "$f" <<'PY'
 import sys
 path = sys.argv[1]
 text = open(path, encoding="utf-8", errors="surrogateescape").read()
-repls = [
-    ("udp_tunnel_sock_release(sock->sk_socket)",
-     "wg_udp_tunnel_sock_release(sock, sock->sk_socket)"),
-    ("setup_udp_tunnel_sock(net, new4, &cfg)",
-     "wg_setup_udp_tunnel_sock(net, new4, &cfg)"),
-    ("udp_tunnel_sock_release(new4)",
-     "wg_udp_tunnel_sock_release(new4->sk, new4)"),
-    ("setup_udp_tunnel_sock(net, new6, &cfg)",
-     "wg_setup_udp_tunnel_sock(net, new6, &cfg)"),
-]
-new = text
-for old, repl in repls:
-    if old not in new:
-        sys.stderr.write("udp_tunnel ABI: no match for %s\n" % old)
-        sys.exit(1)
-    new = new.replace(old, repl, 1)
-needle = "static void sock_free(struct sock *sock)"
-if needle not in new:
-    sys.stderr.write("udp_tunnel ABI: sock_free not found\n")
-    sys.exit(1)
-wrapper = """\
+needle = """\
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 1, 5)
+#include <net/udp_tunnel.h>
+#define setup_udp_tunnel_sock(net, sk, sock_cfg) setup_udp_tunnel_sock(net, sk->sk_socket, sock_cfg)
+#define udp_tunnel_sock_release(sk) udp_tunnel_sock_release(sk->sk_socket)
+#endif
+"""
+dispatch = """\
 /*
- * Linux 7.1.5+ (and some distro backports) changed
- * udp_tunnel_sock_release()/setup_udp_tunnel_sock() to take struct sock *
- * instead of struct socket *. Detect the real signature at compile time.
- * From amneziawg-linux-kernel-module PR #218. Remove once upstream merges.
+ * Linux 7.1.5 changed udp_tunnel_sock_release()/setup_udp_tunnel_sock() from
+ * struct socket * to struct sock *, but distros backport the new ABI below
+ * that version (Ubuntu generic 7.0.0-38, Debian 13 7.1.7+deb13), so
+ * LINUX_VERSION_CODE cannot detect it. Probe the real signature at compile
+ * time instead; call sites in socket.c already pass struct sock *.
+ * From amneziawg-linux-kernel-module PR #218, adapted. LucX-UI patch.
  */
-static inline void wg_udp_tunnel_sock_release(struct sock *sk, struct socket *sock)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 1, 5)
+#include <net/udp_tunnel.h>
+
+static inline void wg_udp_tunnel_sock_release(struct sock *sk)
 {
 	if (__builtin_types_compatible_p(typeof(&udp_tunnel_sock_release), void (*)(struct sock *)))
 		((void (*)(struct sock *))udp_tunnel_sock_release)(sk);
 	else
-		((void (*)(struct socket *))udp_tunnel_sock_release)(sock);
+		((void (*)(struct socket *))udp_tunnel_sock_release)(sk->sk_socket);
 }
 
-static inline void wg_setup_udp_tunnel_sock(struct net *net, struct socket *sock,
-					     struct udp_tunnel_sock_cfg *cfg)
+static inline void wg_setup_udp_tunnel_sock(struct net *net, struct sock *sk,
+					    struct udp_tunnel_sock_cfg *cfg)
 {
 	if (__builtin_types_compatible_p(typeof(&setup_udp_tunnel_sock),
-					  void (*)(struct net *, struct sock *, struct udp_tunnel_sock_cfg *)))
-		((void (*)(struct net *, struct sock *, struct udp_tunnel_sock_cfg *))setup_udp_tunnel_sock)(net, sock->sk, cfg);
+					 void (*)(struct net *, struct sock *, struct udp_tunnel_sock_cfg *)))
+		((void (*)(struct net *, struct sock *, struct udp_tunnel_sock_cfg *))setup_udp_tunnel_sock)(net, sk, cfg);
 	else
-		((void (*)(struct net *, struct socket *, struct udp_tunnel_sock_cfg *))setup_udp_tunnel_sock)(net, sock, cfg);
+		((void (*)(struct net *, struct socket *, struct udp_tunnel_sock_cfg *))setup_udp_tunnel_sock)(net, sk->sk_socket, cfg);
 }
 
+/* Macros come AFTER the wrapper bodies: inside a wrapper the raw symbol
+ * must still resolve to the real kernel function, not to itself. */
+#define setup_udp_tunnel_sock(net, sk, sock_cfg) wg_setup_udp_tunnel_sock(net, sk, sock_cfg)
+#define udp_tunnel_sock_release(sk) wg_udp_tunnel_sock_release(sk)
+#endif
 """
-new = new.replace(needle, wrapper + needle, 1)
-open(path, "w", encoding="utf-8", errors="surrogateescape").write(new)
+if needle not in text:
+    sys.stderr.write("udp_tunnel ABI: version-gated block not found in compat.h\n")
+    sys.exit(1)
+open(path, "w", encoding="utf-8", errors="surrogateescape").write(text.replace(needle, dispatch, 1))
 PY
 }
 
-# Skip DKMS/kernel when the installed module SHA already matches upstream
-# master (lucx.145). --force-rebuild (Cores / x-ui install-awg) bypasses.
-# Marker is the build commit SHA — PACKAGE_VERSION is always "1.0.0".
+# True when the kernel headers already declare timer_delete(). A static
+# wrapper then conflicts (Ubuntu 22.04 5.15.0-194). Older 5.15 (0-82) has
+# no declaration and needs the del_timer wrap.
+kernel_declares_timer_delete() {
+    local kver="${1:-$(uname -r)}"
+    local hdr="/lib/modules/${kver}/build/include/linux/timer.h"
+    [[ -f "$hdr" ]] && grep -qE 'timer_delete[[:space:]]*\(' "$hdr"
+}
+
+# Upstream compat skips timer_delete() on ISUBUNTU2204, assuming a 5.15
+# backport. 5.15.0-82-generic has none → implicit declaration, DKMS fails.
+# Drop that exception only when this kernel's headers do not declare it.
+# 5.15.0-194 and 5.4.0-216 do declare it; a static wrapper conflicts.
+apply_timer_delete_compat() {
+    local f="${1:-compat/compat.h}"
+    local kver="${2:-$(uname -r)}"
+    if [[ ! -f "$f" ]]; then
+        return 0
+    fi
+    if kernel_declares_timer_delete "$kver"; then
+        echo -e "${GREEN}timer_delete есть в заголовках ${kver} — обёртку не ставим.${NC}"
+        return 0
+    fi
+    if ! grep -qF 'KERNEL_VERSION(6, 1, 91) && !defined(ISUBUNTU2004) && !defined(ISUBUNTU2204)' "$f"; then
+        echo -e "${GREEN}timer_delete compat already patched — skip.${NC}"
+        return 0
+    fi
+    echo -e "${YELLOW}Патч timer_delete (ядро ${kver} без timer_delete)...${NC}"
+    sed -i 's/KERNEL_VERSION(6, 1, 91) && !defined(ISUBUNTU2004) && !defined(ISUBUNTU2204) && !defined(ISRHEL9)/KERNEL_VERSION(6, 1, 91) \&\& !defined(ISUBUNTU2004) \&\& !defined(ISRHEL9)/' "$f"
+}
+
+# AWG 3 header protection needs the ChaCha library API
+# (chacha_init / chacha20_crypt on u32 state). That API exists from Linux 5.5.
+# 5.4 (Ubuntu 20.04) still ships the skcipher header, so the <6.16 struct
+# wrapper calls functions that are not there → DKMS dies in main.o.
+# Zinc is built into the module on kernels < 5.10, which covers < 5.5.
+# Upstream PR amnezia-vpn/amneziawg-linux-kernel-module#244. No-op once merged.
+apply_chacha_lib_compat() {
+    local f="${1:-compat/compat.h}"
+    if [[ ! -f "$f" ]]; then
+        return 0
+    fi
+    if grep -qF 'CHACHA20_CONSTANT_EXPA' "$f" 2>/dev/null; then
+        echo -e "${GREEN}chacha library compat already in tree — skip.${NC}"
+        return 0
+    fi
+    if ! grep -qF '(chacha_init)(state->x, key, iv)' "$f" 2>/dev/null; then
+        echo -e "${GREEN}chacha library wrappers absent — skip.${NC}"
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo -e "${YELLOW}python3 нет — патч chacha library пропущен (ядра < 5.5 не соберутся).${NC}"
+        return 0
+    fi
+    echo -e "${YELLOW}Патч chacha library (ядро < 5.5, PR #244)...${NC}"
+    python3 - "$f" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8", errors="surrogateescape").read()
+old = """\
+static inline void __compat_chacha_init(struct chacha_state *state,
+					const u32 *key,
+					const u8 *iv)
+{
+	(chacha_init)(state->x, key, iv);
+}
+#define chacha_init(state, key, iv) __compat_chacha_init((state), (key), (iv))
+
+static inline void __compat_chacha20_crypt(struct chacha_state *state,
+					       u8 *dst, const u8 *src,
+					       unsigned int bytes)
+{
+	(chacha20_crypt)(state->x, dst, src, bytes);
+}
+#define chacha20_crypt(s, d, src, b) __compat_chacha20_crypt((s),(d),(src),(b))
+"""
+new = """\
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 5, 0)
+#include <linux/string.h>
+#include <zinc/chacha20.h>
+static inline void __compat_chacha_init(struct chacha_state *state,
+					const u32 *key,
+					const u8 *iv)
+{
+	state->x[0] = CHACHA20_CONSTANT_EXPA;
+	state->x[1] = CHACHA20_CONSTANT_ND_3;
+	state->x[2] = CHACHA20_CONSTANT_2_BY;
+	state->x[3] = CHACHA20_CONSTANT_TE_K;
+	state->x[4] = key[0];
+	state->x[5] = key[1];
+	state->x[6] = key[2];
+	state->x[7] = key[3];
+	state->x[8] = key[4];
+	state->x[9] = key[5];
+	state->x[10] = key[6];
+	state->x[11] = key[7];
+	state->x[12] = get_unaligned_le32(iv + 0);
+	state->x[13] = get_unaligned_le32(iv + 4);
+	state->x[14] = get_unaligned_le32(iv + 8);
+	state->x[15] = get_unaligned_le32(iv + 12);
+}
+static inline void __compat_chacha20_crypt(struct chacha_state *state,
+					       u8 *dst, const u8 *src,
+					       unsigned int bytes)
+{
+	struct chacha20_ctx ctx;
+
+	memcpy(ctx.state, state->x, sizeof(ctx.state));
+	chacha20(&ctx, dst, src, bytes, DONT_USE_SIMD);
+	memcpy(state->x, ctx.state, sizeof(ctx.state));
+}
+#else
+static inline void __compat_chacha_init(struct chacha_state *state,
+					const u32 *key,
+					const u8 *iv)
+{
+	(chacha_init)(state->x, key, iv);
+}
+static inline void __compat_chacha20_crypt(struct chacha_state *state,
+					       u8 *dst, const u8 *src,
+					       unsigned int bytes)
+{
+	(chacha20_crypt)(state->x, dst, src, bytes);
+}
+#endif
+#define chacha_init(state, key, iv) __compat_chacha_init((state), (key), (iv))
+#define chacha20_crypt(s, d, src, b) __compat_chacha20_crypt((s),(d),(src),(b))
+"""
+if old not in text:
+    sys.stderr.write("chacha library ABI: wrapper block not found\n")
+    sys.exit(1)
+open(path, "w", encoding="utf-8", errors="surrogateescape").write(text.replace(old, new, 1))
+PY
+}
+
+# 6.19 compat includes <crypto/blake2s.h> for the state/arg rename. On
+# kernels < 5.10 Zinc still builds blake2s.o; Ubuntu 20.04 5.4.0-216 also
+# ships the kernel header → redefinition. Skip the kernel include when Zinc
+# owns blake2s. cookie.c still compiles via zinc/blake2s.h + blake2s_ctx alias.
+apply_blake2s_zinc_compat() {
+    local f="${1:-compat/compat.h}"
+    if [[ ! -f "$f" ]]; then
+        return 0
+    fi
+    if grep -A4 'KERNEL_VERSION(6, 19, 0)' "$f" 2>/dev/null | grep -qF 'KERNEL_VERSION(5, 10, 0)'; then
+        echo -e "${GREEN}blake2s zinc include already patched — skip.${NC}"
+        return 0
+    fi
+    if ! grep -qF '#include <crypto/blake2s.h>' "$f" 2>/dev/null; then
+        echo -e "${GREEN}blake2s kernel include absent — skip.${NC}"
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo -e "${YELLOW}python3 нет — патч blake2s zinc пропущен (ядра < 5.10 + backported blake2s не соберутся).${NC}"
+        return 0
+    fi
+    echo -e "${YELLOW}Патч blake2s include (Zinc vs kernel header на < 5.10)...${NC}"
+    python3 - "$f" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8", errors="surrogateescape").read()
+old = """\
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 19, 0)
+#include <crypto/blake2s.h>
+#define blake2s_ctx blake2s_state
+"""
+new = """\
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 19, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+#include <crypto/blake2s.h>
+#endif
+#define blake2s_ctx blake2s_state
+"""
+if old not in text:
+    sys.stderr.write("blake2s zinc: include block not found\n")
+    sys.exit(1)
+open(path, "w", encoding="utf-8", errors="surrogateescape").write(text.replace(old, new, 1))
+PY
+}
+
+# Skip DKMS/kernel when the installed module SHA already matches AWG_KMOD_PIN
+# (lucx.145/153). --force-rebuild (Cores / x-ui install-awg) bypasses.
 # No network + module already present → do not force a reinstall.
 AWG_NEED_MODULE=1
 if [[ $FORCE_REBUILD -eq 0 ]]; then
     INSTALLED_AWG_SHA=""
     [[ -f "$AWG_MODULE_MARKER" ]] && INSTALLED_AWG_SHA=$(tr -d '[:space:]' < "$AWG_MODULE_MARKER" 2>/dev/null)
-    UPSTREAM_AWG_SHA=$(git ls-remote https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git refs/heads/master 2>/dev/null | awk '{print $1}')
-    if [[ -n "$UPSTREAM_AWG_SHA" && -n "$INSTALLED_AWG_SHA" && "$INSTALLED_AWG_SHA" == "$UPSTREAM_AWG_SHA" ]]; then
-        AWG_NEED_MODULE=0
-    elif [[ -z "$UPSTREAM_AWG_SHA" && ( -d /sys/module/amneziawg || -n "$INSTALLED_AWG_SHA" ) ]]; then
+    if [[ -n "$INSTALLED_AWG_SHA" && "$INSTALLED_AWG_SHA" == "$AWG_KMOD_PIN" ]]; then
         AWG_NEED_MODULE=0
     fi
     if [[ $AWG_NEED_MODULE -eq 0 ]] && ! awg_tools_stale; then
@@ -271,7 +492,7 @@ apt-get update -qq
 # transaction and leave dkms missing → "dkms: command not found" at `dkms
 # build` (line ~232). Optional utilities stay best-effort and never block.
 apt-get install -y -q \
-    build-essential dkms git libmnl-dev pkg-config python3 \
+    build-essential dkms git libmnl-dev pkg-config python3 curl ca-certificates \
     2>/dev/null || true
 apt-get install -y -q \
     unzip curl python3 net-tools qrencode bc ca-certificates gnupg \
@@ -381,7 +602,7 @@ fi
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 rm -f "$AWG_REBOOT_FLAG" 2>/dev/null || true
 if [[ ! -d "/lib/modules/${RUNNING_KERNEL}/build" ]]; then
-    NEWEST_HEADERS=$(ls -d /lib/modules/*/build 2>/dev/null | head -1)
+    NEWEST_HEADERS=$(ls -d /lib/modules/*/build 2>/dev/null | sort -V | tail -1)
     if [[ -n "$NEWEST_HEADERS" ]]; then
         NEWEST_KERNEL=$(basename "$(dirname "$NEWEST_HEADERS")")
         echo -e "${YELLOW}Headers for running kernel ${RUNNING_KERNEL} missing; found ${NEWEST_KERNEL}.${NC}"
@@ -412,24 +633,25 @@ fi
 #    module — never module-less (the old rmmod-first order could strand a
 #    host without amneziawg when the new build failed).
 if [[ $AWG_NEED_MODULE -eq 1 ]]; then
-    echo -e "${GREEN}Сборка модуля ядра из исходников...${NC}"
+    echo -e "${GREEN}Сборка модуля ядра из исходников (pin ${AWG_KMOD_PIN:0:12})...${NC}"
     KERNEL_MOD_DIR="/tmp/amneziawg-kmod-$$"
-    rm -rf "$KERNEL_MOD_DIR"
-    git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git "$KERNEL_MOD_DIR"
+    git_clone_sha "https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git" "$AWG_KMOD_PIN" "$KERNEL_MOD_DIR" || {
+        echo -e "${RED}Не удалось клонировать amneziawg-linux-kernel-module @ ${AWG_KMOD_PIN:0:12}${NC}"
+        exit 1
+    }
     cd "$KERNEL_MOD_DIR/src"
 
-    MOD_VER=$(git describe --tags --always --dirty 2>/dev/null || echo "1.0.0")
-    MOD_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+    if [[ -d "$KERNEL_MOD_DIR/.git" ]]; then
+        MOD_VER=$(git describe --tags --always --dirty 2>/dev/null || echo "${AWG_KMOD_PIN:0:12}")
+        MOD_SHA=$(git rev-parse HEAD 2>/dev/null || echo "$AWG_KMOD_PIN")
+    else
+        MOD_VER="${AWG_KMOD_PIN:0:12}"
+        MOD_SHA="$AWG_KMOD_PIN"
+    fi
     OLD_DKMS_VER=$(dkms status amneziawg 2>/dev/null | grep -oP 'amneziawg, \K[^,]+(?=,)' | head -1 || true)
 
-    apply_udp_tunnel_abi_compat socket.c || \
-        echo -e "${YELLOW}Патч udp_tunnel ABI не применился — продолжаем (ядра 7.1.5+ могут не собраться).${NC}"
-
-    # Stage the sources under the real version and compile for the booted kernel.
-    sed -i "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"${MOD_VER}\"/" dkms.conf
-    rm -rf "/usr/src/amneziawg-${MOD_VER}"
-    make dkms-install WIREGUARD_VERSION="${MOD_VER}" 2>/dev/null || true
-    dkms add -m amneziawg -v "${MOD_VER}" 2>/dev/null || true
+    apply_udp_tunnel_abi_compat compat/compat.h || \
+        echo -e "${YELLOW}Патч udp_tunnel ABI не применился — продолжаем (backport-ABI не соберётся).${NC}"
     # Prefer the running kernel; if its headers are missing (meta-upgrade
     # already pulled a newer image), build for the first kernel that has
     # headers so install can finish without a mid-script reboot (lucx.122).
@@ -442,6 +664,18 @@ if [[ $AWG_NEED_MODULE -eq 1 ]]; then
             fi
         done
     fi
+    apply_timer_delete_compat compat/compat.h "$BUILD_K" || \
+        echo -e "${YELLOW}Патч timer_delete не применился — Ubuntu 22.04 5.15 может не собраться.${NC}"
+    apply_chacha_lib_compat compat/compat.h || \
+        echo -e "${YELLOW}Патч chacha library не применился — ядра < 5.5 могут не собраться.${NC}"
+    apply_blake2s_zinc_compat compat/compat.h || \
+        echo -e "${YELLOW}Патч blake2s zinc не применился — Ubuntu 20.04 5.4 может не собраться.${NC}"
+
+    # Stage the sources under the real version and compile for the booted kernel.
+    sed -i "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"${MOD_VER}\"/" dkms.conf
+    rm -rf "/usr/src/amneziawg-${MOD_VER}"
+    make dkms-install WIREGUARD_VERSION="${MOD_VER}" 2>/dev/null || true
+    dkms add -m amneziawg -v "${MOD_VER}" 2>/dev/null || true
     dkms build -m amneziawg -v "${MOD_VER}" -k "${BUILD_K}" || {
         echo -e "${RED}Ошибка сборки DKMS — текущий модуль не тронут.${NC}"
         mklog="/var/lib/dkms/amneziawg/${MOD_VER}/build/make.log"
@@ -456,14 +690,34 @@ if [[ $AWG_NEED_MODULE -eq 1 ]]; then
     }
 
     # Build succeeded → swap: unload the old module and retire its DKMS tree,
-    # then install the new one...
+    # then install the new one. Skip rmmod when a foreign (unmanaged) awgN is
+    # up — those clients must stay online until the operator imports them.
+    foreign_awg=0
+    if command -v ip >/dev/null 2>&1; then
+        while read -r iface; do
+            [[ -n "$iface" ]] || continue
+            conf="/etc/amnezia/amneziawg/${iface}.conf"
+            if [[ -f "$conf" ]] && grep -qF "# Managed by x-ui - do not edit" "$conf" 2>/dev/null; then
+                continue
+            fi
+            echo -e "${YELLOW}Чужой интерфейс ${iface} оставлен (не x-ui) — rmmod пропущен.${NC}"
+            foreign_awg=1
+            break
+        done < <(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E '^awg[0-9]+$' || true)
+    fi
     if [[ -n "$OLD_DKMS_VER" && "$OLD_DKMS_VER" != "$MOD_VER" ]]; then
-        if ! rmmod amneziawg 2>/dev/null; then
+        if [[ "$foreign_awg" -eq 1 ]]; then
+            mkdir -p "$(dirname "$AWG_REBOOT_FLAG")"
+            uname -r > "$AWG_REBOOT_FLAG" 2>/dev/null || true
+            echo -e "${YELLOW}Новый модуль загрузится после reboot, текущие AWG-клиенты не сброшены.${NC}"
+        elif ! rmmod amneziawg 2>/dev/null; then
             echo -e "${YELLOW}Не удалось выгрузить amneziawg (занят?) — новый модуль подхватится после перезагрузки.${NC}"
             mkdir -p "$(dirname "$AWG_REBOOT_FLAG")"
             uname -r > "$AWG_REBOOT_FLAG" 2>/dev/null || true
         fi
-        dkms remove -m amneziawg -v "$OLD_DKMS_VER" --all 2>/dev/null || true
+        if [[ "$foreign_awg" -eq 0 ]]; then
+            dkms remove -m amneziawg -v "$OLD_DKMS_VER" --all 2>/dev/null || true
+        fi
     fi
     dkms install -m amneziawg -v "${MOD_VER}" -k "${BUILD_K}" || {
         echo -e "${RED}dkms install не удалась — проверь /var/lib/dkms/amneziawg${NC}"
@@ -493,10 +747,9 @@ fi
 #    < v3.1 reject RandomTrailers / DisableCookies with "Line unrecognized").
 #    See awg_tools_stale above for the version rule.
 if awg_tools_stale; then
-    echo -e "${GREEN}Сборка утилит awg...${NC}"
+    echo -e "${GREEN}Сборка утилит awg (pin ${AWG_TOOLS_PIN:0:12})...${NC}"
     TOOLS_DIR="/tmp/amneziawg-tools-$$"
-    rm -rf "$TOOLS_DIR"
-    if git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-tools.git "$TOOLS_DIR" 2>&1; then
+    if git_clone_sha "https://github.com/amnezia-vpn/amneziawg-tools.git" "$AWG_TOOLS_PIN" "$TOOLS_DIR"; then
         ( cd "$TOOLS_DIR/src" && make && make install ) \
             && echo -e "${GREEN}Утилиты awg установлены.${NC}" \
             || echo -e "${RED}Сборка утилит awg упала — проверь build-essential (apt install build-essential). AWG не стартует без awg-quick.${NC}"
@@ -510,7 +763,7 @@ fi
 # with a running kernel module but no awg-quick (reconcile fails every 10s).
 if ! command -v awg-quick &>/dev/null; then
     echo -e "${RED}ВНИМАНИЕ: awg-quick не найден после установки. AWG-инбаунды не поднимутся.${NC}"
-    echo -e "${RED}Дособрать вручную: apt install build-essential && cd /tmp && git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-tools.git && cd amneziawg-tools/src && make && make install${NC}"
+    echo -e "${RED}Дособрать вручную: apt install build-essential curl && bash /usr/local/x-ui/bin/install-awg-module.sh${NC}"
 fi
 
 # 5. Load module and enable autostart (only if the running kernel has the module)

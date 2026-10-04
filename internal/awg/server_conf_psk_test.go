@@ -1,3 +1,9 @@
+// Copyright (c) 2025 LucX-UI Project.
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// LucX-UI Component. Free for personal and educational use.
+// Commercial use (including VPN resale) requires explicit written permission from the author.
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
 package awg
 
 import (
@@ -96,5 +102,48 @@ func TestRenderServerConf_ManagedMarkerFirstLine(t *testing.T) {
 	// The marker must precede [Interface].
 	if strings.Index(conf, "[Interface]") < strings.Index(conf, xuiManagedMarker) {
 		t.Errorf("ownership marker must precede [Interface], got:\n%s", conf)
+	}
+}
+
+// The server emits its CPS burst before every handshake initiation it sends,
+// and either side can initiate. Leaving I1-I5 out made the mimicry one-sided:
+// a watcher saw the imitated protocol from the client and bare AmneziaWG back.
+func TestRenderServerConf_CarriesIFields(t *testing.T) {
+	inst := Instance{
+		Ifname:     "awg9",
+		PrivateKey: "cJp4uHNyKcRVeTSanE/Xn/Y7OTaTjxbYq+wUOxOKMWQ=",
+		Port:       51820,
+		AwgVersion: "2",
+		Jc:         6, Jmin: 11, Jmax: 76,
+		S1: 40, S2: 55, S3: 56, S4: 12,
+		I1: "<b 0x160301><r 32>",
+		I2: "<b 0x1403030001>",
+		I5: "<b 0x0d0a0d0a>",
+	}
+	conf := renderServerConf(inst)
+	for _, want := range []string{"I1 = <b 0x160301><r 32>", "I2 = <b 0x1403030001>", "I5 = <b 0x0d0a0d0a>"} {
+		if !strings.Contains(conf, want) {
+			t.Errorf("server conf must carry %q, got:\n%s", want, conf)
+		}
+	}
+	// An unset field must stay out: "I3 = " is rejected by awg setconf.
+	if strings.Contains(conf, "I3 =") || strings.Contains(conf, "I4 =") {
+		t.Errorf("empty I-fields must be omitted, got:\n%s", conf)
+	}
+}
+
+// The netlink read budget is a property of the interface, not of who sends the
+// packets, so the server is gated exactly like the client export.
+func TestRenderServerConf_OmitsIFieldsOverTheNetlinkBudget(t *testing.T) {
+	huge := "<b 0x" + strings.Repeat("ab", 1800) + ">"
+	inst := Instance{
+		Ifname:     "awg9",
+		PrivateKey: "cJp4uHNyKcRVeTSanE/Xn/Y7OTaTjxbYq+wUOxOKMWQ=",
+		Port:       51820,
+		AwgVersion: "2",
+		I1:         huge, I2: huge,
+	}
+	if conf := renderServerConf(inst); strings.Contains(conf, "I1 =") {
+		t.Errorf("an oversized set leaves the interface unreadable by `awg show`; it must be omitted, got %d bytes for I1", len(huge))
 	}
 }

@@ -36,6 +36,7 @@ mapfile -t PKG_FILES < <(find internal/awg internal/lucx -name '*.go' 2>/dev/nul
 # LucX-файлы вне изолированных пакетов и без LUCX-HOOK маркеров (новые файлы
 # веб-слоя туннельных сайдкаров — SPDX-заголовок есть, маркера нет).
 EXTRA_FILES=(
+    internal/web/service/awg_import.go
     internal/web/service/awg_host.go
     internal/web/service/awg_host_tail_test.go
     internal/web/service/tunnel.go
@@ -49,6 +50,8 @@ EXTRA_FILES=(
     internal/web/controller/client_subbody_test.go
     internal/web/service/sidecar_outbound.go
     internal/web/service/sidecar_outbound_inject_test.go
+    internal/web/service/lucx_online.go
+    internal/web/service/lucx_online_test.go
     internal/web/controller/sidecar_outbound.go
 )
 
@@ -69,3 +72,33 @@ if [ -n "$BAD" ]; then
     exit 1
 fi
 echo "gofumpt: OK ($(echo "$FILES" | wc -l) файлов)"
+
+# AWG must run on fresh install and update (dropped in v3.8 overlay, lucx.248).
+for f in install.sh update.sh; do
+    if ! grep -q 'bin/install-awg-module.sh' "$f"; then
+        echo "missing AWG install call in $f" >&2
+        exit 1
+    fi
+done
+echo "AWG install hooks: OK"
+
+# SPDX header on every LucX file. Go: the same set gofumpt checks. Shell:
+# bin/*.sh. Frontend: files under LucX-owned dirs/names (awg, lucx, tunnel,
+# sidecar, mieru, masking, trusttunnel, tproxy, anytls, cover, gateway,
+# csqtt, olcrtc, qwdtt) — upstream files have no header and stay exempt.
+NO_SPDX=$(echo "$FILES" | xargs grep -L "SPDX-License-Identifier" 2>/dev/null)
+LUCX_FE=$(find frontend/src \( -iname '*awg*' -o -iname '*lucx*' -o -iname '*tunnel*' \
+    -o -iname '*sidecar*' -o -iname '*mieru*' -o -iname '*masking*' \
+    -o -iname '*trusttunnel*' -o -iname '*tproxy*' -o -iname '*anytls*' \
+    -o -iname '*cover*' -o -iname '*gateway*' -o -iname '*csqtt*' \
+    -o -iname '*olcrtc*' -o -iname '*qwdtt*' -o -iname '*wireguardConfig*' \
+    -o -iname '*VpnConfBlock*' \) \
+    \( -name '*.ts' -o -name '*.tsx' \) 2>/dev/null | xargs grep -L "SPDX-License-Identifier" 2>/dev/null || true)
+LUCX_SH=$(find bin -name '*.sh' 2>/dev/null | xargs grep -L "SPDX-License-Identifier" 2>/dev/null || true)
+NO_SPDX=$(printf '%s\n%s\n%s\n' "$NO_SPDX" "$LUCX_FE" "$LUCX_SH" | grep -v '^$' | sort -u)
+if [ -n "$NO_SPDX" ]; then
+    echo "missing SPDX-License-Identifier header:" >&2
+    echo "$NO_SPDX" >&2
+    exit 1
+fi
+echo "SPDX headers: OK"

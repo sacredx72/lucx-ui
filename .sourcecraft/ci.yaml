@@ -1,0 +1,88 @@
+on:
+  pull_request:
+    - workflows: [ci]
+      filter:
+        target_branches: ["main"]
+  push:
+    - workflows: [ci]
+      filter:
+        branches: ["main"]
+    - workflows: [release]
+      filter:
+        tags: ["v*"]
+
+workflows:
+  ci:
+    settings:
+      max_cube_duration: 20m
+    checkout:
+      fetch_depth: 1
+    tasks:
+      - name: go-test
+        cubes:
+          - name: test
+            image: golang:1.26
+            script:
+              - mkdir -p internal/web/dist && touch internal/web/dist/.gitkeep
+              - CGO_ENABLED=0 go test ./internal/awg/... ./internal/lucx/... -count=1
+      - name: frontend
+        cubes:
+          - name: setup-node
+            action: actions/setup-node@v4
+            with:
+              node-version-file: .nvmrc
+              cache: npm
+              cache-dependency-path: frontend/package-lock.json
+          - name: check
+            script:
+              - cd frontend
+              - npm ci
+              - npm run lint
+              - npm run typecheck
+              - npx vitest run --project=unit
+
+  release:
+    settings:
+      max_cube_duration: 45m
+    checkout:
+      fetch_depth: 0
+    tasks:
+      - name: build-and-publish
+        cubes:
+          - name: setup-node
+            action: actions/setup-node@v4
+            with:
+              node-version-file: .nvmrc
+              cache: npm
+              cache-dependency-path: frontend/package-lock.json
+          - name: package
+            env:
+              SLIM: "1"
+              SRC_TOKEN: ${{ secrets.SRC_TOKEN }}
+            script:
+              - |
+                set -euo pipefail
+                bash bin/sourcecraft-release.sh
+                TAG="${SOURCECRAFT_COMMIT_REF_NAME}"
+                test -s x-ui-linux-amd64.tar.gz
+                test -s x-ui-geo.tar.gz
+                rm -rf /tmp/lucx-dist
+                mkdir -p /tmp/lucx-dist
+                cp x-ui-linux-amd64.tar.gz x-ui-geo.tar.gz install.sh update.sh x-ui.sh /tmp/lucx-dist/
+                if [[ -s x-ui-sidecars-amd64.tar.gz ]]; then
+                  cp x-ui-sidecars-amd64.tar.gz /tmp/lucx-dist/
+                fi
+                if [[ -d sidecars ]]; then
+                  cp -a sidecars /tmp/lucx-dist/
+                fi
+                printf '%s\n' "${SOURCECRAFT_COMMIT_SHA}" > /tmp/lucx-dist/sha.txt
+                printf '%s\n' "${TAG}" > /tmp/lucx-dist/version.txt
+                cd /tmp/lucx-dist
+                git init -q -b dist
+                git config user.email "ci@lucx-ui.local"
+                git config user.name "LucX CI"
+                git add -A
+                git commit -qm "dist ${TAG}"
+                TOKEN="${SRC_TOKEN:-${SOURCECRAFT_TOKEN:-}}"
+                test -n "$TOKEN"
+                git push -f "https://git:${TOKEN}@git.sourcecraft.dev/alexeylcp/lucx-ui.git" dist:dist

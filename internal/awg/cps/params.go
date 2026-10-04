@@ -9,16 +9,28 @@ package cps
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	crand "math/rand"
 	"strings"
+	"time"
 )
 
-// rng is the package-level random source. In Go 1.20+ the global rand is
-// automatically seeded, but tests need deterministic output. rand.Seed is
-// deprecated; instead tests call SetRand with a seeded source.
-var rng = crand.New(crand.NewSource(1))
+// rng is the package-level random source. It must be seeded per process: Jc,
+// S1-S4 and H1-H4 all come from here, so a fixed seed would hand every server
+// running this code the same obfuscation in the same order.
+var rng = newSeededRand()
+
+// newSeededRand takes its seed from crypto/rand. math/rand is fine for the
+// structural choices it drives; a predictable seed is not.
+func newSeededRand() *crand.Rand {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return crand.New(crand.NewSource(time.Now().UnixNano()))
+	}
+	return crand.New(crand.NewSource(int64(binary.BigEndian.Uint64(b[:]))))
+}
 
 // SetRand replaces the package-level random source. Used by tests for
 // deterministic output; production code leaves the auto-seeded source.
@@ -201,12 +213,17 @@ func genHSingle(n int) string {
 //   - "2"/"3"/"3.1"/empty: "lo-hi" ranges in disjoint narrow bands. See genHRange.
 //     v3 HPK still encrypts the on-wire header; H is randomized anyway so the
 //     form does not look broken and v2/v3 share one generator.
+//   - ObfPremium on "3"/"3.1": H=1,2,3,4 (HPK encrypts them). Other versions
+//     keep the same H format as lite/standard/pro.
 //
 // An empty awgVersion is treated as "2" (the project default; see
 // awg.NormalizeAWGVersion). The caller is responsible for adding a
 // HeaderProtectionKey (via WithHeaderProtectionKey) only when a version "3"
 // or "3.1" inbound is generated.
 func GenerateAWGParams(profile ObfProfile, awgVersion string) (AWGParams, error) {
+	if profile == ObfPremium {
+		return generatePremiumParams(awgVersion), nil
+	}
 	r, err := rangesFor(profile)
 	if err != nil {
 		return AWGParams{}, err
@@ -252,6 +269,19 @@ func GenerateAWGParams(profile ObfProfile, awgVersion string) (AWGParams, error)
 		H3:   h3,
 		H4:   h4,
 	}, nil
+}
+
+func generatePremiumParams(awgVersion string) AWGParams {
+	p := AWGParams{Jc: 5, Jmin: 10, Jmax: 80, S1: 164, S2: 528, S3: 389, S4: 12}
+	switch awgVersion {
+	case "1.5":
+		p.H1, p.H2, p.H3, p.H4 = genHSingle(0), genHSingle(1), genHSingle(2), genHSingle(3)
+	case "3", "3.1":
+		p.H1, p.H2, p.H3, p.H4 = "1", "2", "3", "4"
+	default:
+		p.H1, p.H2, p.H3, p.H4 = genHRange(0), genHRange(1), genHRange(2), genHRange(3)
+	}
+	return p
 }
 
 // WithHeaderProtectionKey returns a copy of the params with a freshly
@@ -323,16 +353,35 @@ func awg3Range(lo, hi int) string {
 //	RejectAfterTime must exceed KeepaliveTimeout+RekeyTimeout or the receiving
 //	side's key-refresh window collapses to zero; RekeyAfterTime must finish
 //	before RejectAfterTime; MaxHandshakeAttempts >= 1.
+func generatePremiumTimings() Awg3DeviceTimings {
+	rekeyTimeoutLo := randInt(4, 6)
+	rekeyTimeoutHi := rekeyTimeoutLo + randInt(1, 4)
+	rejectLo := 170
+	if rejectLo <= 120+13+rekeyTimeoutHi {
+		rejectLo = 120 + 13 + rekeyTimeoutHi + 15
+	}
+	attemptsLo := randInt(12, 18)
+	return Awg3DeviceTimings{
+		ContentPaddingAddition: "10-100",
+		RekeyAfterTime:         "100-120",
+		RekeyTimeout:           awg3Range(rekeyTimeoutLo, rekeyTimeoutHi),
+		RejectAfterTime:        awg3Range(rejectLo, rejectLo+randInt(10, 25)),
+		KeepaliveTimeout:       "7-13",
+		MaxHandshakeAttempts:   awg3Range(attemptsLo, attemptsLo+randInt(2, 10)),
+	}
+}
+
 func GenerateAwg3DeviceTimings(profile ObfProfile) Awg3DeviceTimings {
-	// Intensity knobs, keyed by profile. padLo/padHi bound ContentPaddingAddition;
-	// spread is the timing-jitter width.
+	if profile == ObfPremium {
+		return generatePremiumTimings()
+	}
 	var padLo, padHi, spread int
 	switch profile {
 	case ObfLite:
 		padLo, padHi, spread = 8, 64, 10
 	case ObfPro:
 		padLo, padHi, spread = 24, 200, 45
-	default: // ObfStandard and anything unrecognised
+	default:
 		padLo, padHi, spread = 16, 128, 25
 	}
 
@@ -437,13 +486,11 @@ func (p AWGParams) Validate() error {
 			}
 		}
 	}
-	// S1-S4 must be >= MinSForHPK so an AWG3 (version "3") kernel accepts a
-	// HeaderProtectionKey. We enforce this unconditionally because a config
-	// generated for v2 today may be promoted to v3 tomorrow by editing only
-	// the version, and a too-small S would then break reconcile with -EINVAL.
-	for _, s := range []int{p.S1, p.S2, p.S3, p.S4} {
-		if s < MinSForHPK {
-			return fmt.Errorf("awg: S values must be >= %d for AWG3 header-protection compatibility (got %d)", MinSForHPK, s)
+	if p.HeaderProtectionKey != "" {
+		for _, s := range []int{p.S1, p.S2, p.S3, p.S4} {
+			if s < MinSForHPK {
+				return fmt.Errorf("awg: S values must be >= %d for AWG3 header-protection compatibility (got %d)", MinSForHPK, s)
+			}
 		}
 	}
 	for _, v := range []struct {

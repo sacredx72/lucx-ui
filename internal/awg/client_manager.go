@@ -8,6 +8,7 @@ package awg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -30,7 +31,17 @@ import (
 // avoid touching the server-side helper surface (scrapePeers runs its own
 // `awg show <iface> dump` directly and is unaffected).
 func awgShowIfname(ifname string) ([]byte, error) {
-	return exec.CommandContext(context.Background(), awgBin("awg"), "show", ifname, "dump").CombinedOutput()
+	if err := stuckReadErr(ifname); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), awgShowTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, awgBin("awg"), "show", ifname, "dump").CombinedOutput()
+	noteAwgRead(ctx, ifname, err)
+	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return out, fmt.Errorf("awg show %s: %w", ifname, ctx.Err())
+	}
+	return out, err
 }
 
 // clientState tracks one running client interface so EnsureClient can detect
@@ -40,10 +51,58 @@ type clientState struct {
 }
 
 var (
-	clientMu    sync.Mutex
-	clients     = map[string]clientState{} // ifname -> state
+	clientMu sync.Mutex
+	clients  = map[string]clientState{} // ifname -> state
+	// clientUp is liveness, kept apart from the fingerprint above: a reader may
+	// record it for an interface this process has not brought up itself.
+	clientUp    = map[string]bool{}
 	clientSwept sync.Once
 )
+
+// ClientIfaceUp reports an outbound interface's liveness from what the
+// reconcile job last recorded, so a caller on a hot path never shells out. An
+// interface this process has not seen earns one probe, then it is remembered.
+func (m *Manager) ClientIfaceUp(ifname string) bool {
+	clientMu.Lock()
+	if up, ok := clientUp[ifname]; ok {
+		clientMu.Unlock()
+		return up
+	}
+	clientMu.Unlock()
+
+	_, err := awgShowIfname(ifname)
+	// A read that ran out of time says nothing. Recording down here would
+	// blackhole a wedged but live tunnel and rewrite the config to do it.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	up := err == nil
+
+	clientMu.Lock()
+	defer clientMu.Unlock()
+	// A reconcile tick that landed while the probe ran knows better.
+	if fresh, ok := clientUp[ifname]; ok {
+		return fresh
+	}
+	clientUp[ifname] = up
+	return up
+}
+
+// noteClientUp records liveness; the caller already holds clientMu.
+func noteClientUp(ifname string, up bool) {
+	clientUp[ifname] = up
+}
+
+// recordClientRead turns a probe's outcome into recorded liveness. A read that
+// ran out of time says nothing about the interface, so it changes nothing.
+func recordClientRead(ifname string, err error) {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	clientMu.Lock()
+	defer clientMu.Unlock()
+	clientUp[ifname] = err == nil
+}
 
 // EnsureClient reconciles a single client AWG interface to desired state.
 // Writes the awg-quick .conf (mode 0600 — awg-quick rejects world-readable
@@ -53,29 +112,81 @@ var (
 // client (egress) side. Lives on the same *Manager singleton as the server
 // methods but keeps its own state map and mutex so the two sides never block
 // each other.
+func (m *Manager) AdoptClient(ci ClientInstance, currentIfname string) error {
+	clientMu.Lock()
+	defer clientMu.Unlock()
+	if currentIfname != "" && currentIfname != ci.Ifname {
+		if isInboundAwgInterface(currentIfname) {
+			return fmt.Errorf("awg: refuse to rename inbound interface %s", currentIfname)
+		}
+		if currentIfname == defaultRouteInterface() {
+			return fmt.Errorf("awg: refuse to rename default-route interface %s", currentIfname)
+		}
+		if err := renameAwgInterface(currentIfname, ci.Ifname); err != nil {
+			return err
+		}
+	}
+	confPath := filepath.Join(awgConfigDir, ci.Ifname+".conf")
+	conf := renderClientConf(ci)
+	if err := os.WriteFile(confPath, []byte(conf), 0o600); err != nil {
+		return err
+	}
+	clients[ci.Ifname] = clientState{fp: conf}
+	noteClientUp(ci.Ifname, true)
+	logger.Infof("awg: adopted client interface %s as %s", currentIfname, ci.Ifname)
+	return nil
+}
+
 func (m *Manager) EnsureClient(ci ClientInstance) error {
-	m.sweepOrphanClientsOnce()
+	if rebuildPaused.Load() {
+		return fmt.Errorf("awg: module rebuild in progress")
+	}
 	clientMu.Lock()
 	defer clientMu.Unlock()
 	confPath := filepath.Join(awgConfigDir, ci.Ifname+".conf")
-	newFP := ci.fingerprint()
-	if st, ok := clients[ci.Ifname]; ok && st.fp == newFP {
+	// The rendered file IS the restart trigger here: an outbound has no
+	// syncconf path, so every change goes in by taking the interface down and up.
+	conf := renderClientConf(ci)
+	st, tracked := clients[ci.Ifname]
+	// A restart empties the map, but the .conf on disk still records what the
+	// live interface was brought up with — adopt it instead of bouncing it.
+	if !tracked {
+		if disk, rerr := os.ReadFile(confPath); rerr == nil {
+			st, tracked = clientState{fp: string(disk)}, true
+		}
+	}
+	if tracked && st.fp == conf {
 		if _, err := awgShowIfname(ci.Ifname); err == nil {
+			clients[ci.Ifname] = clientState{fp: conf}
+			noteClientUp(ci.Ifname, true)
 			return nil
 		}
 	}
-	if err := os.WriteFile(confPath, []byte(renderClientConf(ci)), 0o600); err != nil {
+	prev, hadPrev := os.ReadFile(confPath)
+	if err := os.WriteFile(confPath, []byte(conf), 0o600); err != nil {
 		return err
 	}
-	if _, err := awgShowIfname(ci.Ifname); err == nil {
+	_, readErr := awgShowIfname(ci.Ifname)
+	if readErr == nil {
 		if out, err := awgQuick("down", confPath); err != nil {
 			logger.Warningf("awg: awg-quick down failed before restart: %s %v", string(out), err)
 		}
 	}
 	if out, err := awgQuick("up", confPath); err != nil {
+		// Put the old file back: a .conf the kernel never ran would be adopted
+		// as the live fingerprint on the next start and believed forever.
+		if hadPrev == nil {
+			_ = os.WriteFile(confPath, prev, 0o600)
+		}
+		// A wedged read is not proof the interface is down, and up failing
+		// against a live device is what a wedged read looks like from here.
+		if !errors.Is(readErr, context.DeadlineExceeded) {
+			noteClientUp(ci.Ifname, false)
+		}
 		return fmt.Errorf("awg-quick up %s: %w (%s)", confPath, err, string(out))
 	}
-	clients[ci.Ifname] = clientState{fp: newFP}
+	clients[ci.Ifname] = clientState{fp: conf}
+	noteClientUp(ci.Ifname, true)
 	return nil
 }
 
@@ -93,6 +204,7 @@ func (m *Manager) RemoveClient(ifname string) error {
 	}
 	_ = os.Remove(confPath)
 	delete(clients, ifname)
+	delete(clientUp, ifname)
 	return nil
 }
 
@@ -113,14 +225,15 @@ func (m *Manager) StopAllClients() {
 		}
 	}
 	clients = map[string]clientState{}
+	clientUp = map[string]bool{}
 }
 
-// SweepOrphanClients removes awgo-* interfaces and .conf files left over from
-// a previous x-ui run that have no matching awg_outbounds row (or whose row is
-// disabled). Runs once on first EnsureClient call (sync.Once) — not every tick.
-// Uses a sync.Once separate from the server-side m.swept flag so the two
-// sweeps stay independent.
-func (m *Manager) sweepOrphanClientsOnce() {
+// SweepOrphanClients removes awgo-N interfaces and .conf files left over from a
+// previous x-ui run that have no awg_outbounds row. want holds the ifname of
+// every row the caller read from the database — this package must not reach for
+// it itself. Runs once per process (sync.Once), on a flag separate from the
+// server-side m.swept so the two sweeps stay independent.
+func (m *Manager) SweepOrphanClients(want map[string]struct{}) {
 	clientSwept.Do(func() {
 		clientMu.Lock()
 		defer clientMu.Unlock()
@@ -134,10 +247,21 @@ func (m *Manager) sweepOrphanClientsOnce() {
 				continue
 			}
 			ifname := strings.TrimSuffix(name, ".conf")
-			if _, ok := clients[ifname]; ok {
+			if !isOutboundAwgInterface(ifname) {
+				continue
+			}
+			if _, ok := want[ifname]; ok {
+				continue
+			}
+			if !configIsManaged(filepath.Join(awgConfigDir, name)) {
 				continue
 			}
 			if _, err := awgShowIfname(ifname); err != nil {
+				// A read that ran out of time says nothing about whether the
+				// interface exists, so it must not be swept as an orphan.
+				if errors.Is(err, context.DeadlineExceeded) {
+					continue
+				}
 				_ = os.Remove(filepath.Join(awgConfigDir, name))
 				continue
 			}
@@ -196,6 +320,7 @@ func (m *Manager) RunningClientIfnames() []string {
 // tx=6), which is the proven server-side parser.
 func (m *Manager) CollectClientTraffic(ifname string) (handshakeAge time.Duration, rx, tx int64, ok bool) {
 	out, err := awgShowIfname(ifname)
+	recordClientRead(ifname, err)
 	if err != nil {
 		return 0, 0, 0, false
 	}

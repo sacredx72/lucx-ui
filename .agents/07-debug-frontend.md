@@ -4,6 +4,51 @@ Extracted from AGENTS.md. This file is project law.
 
 ---
 
+### Pattern 18: Client Info has no AWG .conf download, only QR — FIXED (lucx.240)
+- **Symptom (Art, 16.09.2026):** Amnezia .conf used to be in Client Info; after v3.8 only QR has download.
+- **Cause:** merge rebuilt ClientInfoModal from origin and dropped the kernel AWG LUCX-HOOK ConfigBlock. Userspace `amneziawg` block stayed; LucX `awg` did not.
+- **Fix:** restore per-inbound ConfigBlock + version selector + vpn:// copy in Client Info.
+- **Not a handshake bug.**
+
+### Pattern 17: overview Access Logs empty though enabled — FIXED (lucx.237)
+- **Symptom (Art, 16.09.2026):** after 235, Access Logs on the home page do not work; Xray settings still have access log on.
+- **Cause:** `LogEntry` json tags became camelCase (`dateTime`, `fromAddress`, …) in d8fdd5ff (v3.8.0 merge). `XrayLogModal` still read PascalCase, so rows rendered blank.
+- **Fix:** modal fields match the API / generated `LogEntry`.
+- **Healing without update:** none in the UI. `journalctl` / `access.log` file still has the lines.
+- **Lesson:** generated OpenAPI type is the wire contract. A local duplicate struct will rot.
+
+### Pattern 16: Sub page .conf buttons do nothing / imported AWG is 1 row + 500 — FIXED (lucx.228)
+- **Symptom (Nik Targon, lucx.226):** `/sub/` AMNEZIA `vpn://` copy works; both `.conf` buttons do nothing. Duplicate Amnezia list in “subscription info” and “copy link”. A client imported from an AWG docker has one AMNEZIA row even after more inbounds; the buttons return HTTP 500.
+- **Cause 1:** `vpnConfFromLink` wrote into `DecompressionStream` then read the output. Large AWG 3.1 `vpn://` (I1–I5) fills the writable and deadlocks in the browser — no toast, no copy. Node tests used a tiny fixture so CI stayed green.
+- **Cause 2:** Docker import often has peer public keys only. `genAwgLink` returns "" without a private key, `displaySubLinks` hides `amneziawg://`, the page fell back to one `/awg/{subId}` row, `GetAwg` returned `lastBuildErr` → 500.
+- **Fix:** `pipeThrough` inflate (stored-block first). Drop the top AMNEZIA block; `.conf` / `vpn://` live on the copy-link AmneziaWG row. `GetAwg` skips empty keys and returns empty body, not 500. No key invented (Rule 0) — without a recovered client private key there is nothing to export.
+- **Not a handshake bug.** Existing imported tunnels keep working; the phone still has the key.
+
+### Pattern 15: Sub page AMNEZIA copies all servers / “Link N” / white QR — FIXED (lucx.222)
+- **Symptom (Nik Targon, 05.09.2026):** `/sub/` AMNEZIA copy dumps every inbound; AmneziaVPN keeps only the first. Copy-link rows are `AmneziaWG Link N`. QR is a white square.
+- **Cause:** `/awg/{subId}` is the concatenated body. Share lines are `amneziawg://#remark` + opaque `vpn://`; the page hid the first so the remark vanished. `vpn://` is thousands of chars — antd QRCode renders empty.
+- **Fix:** `displaySubLinks` (steal remark, group by protocol). One AMNEZIA row per `vpn://`. QrPanel for copy-link QR (`qrTooLarge` over 2000 chars).
+- **Not a handshake bug.**
+
+### Pattern 14: Sub page “Конфиг AmneziaWG” is binary garbage — FIXED (lucx.180)
+- **Symptom:** public `/sub/` page, AmneziaWG ConfigBlock is zlib/mojibake. Copy/download from that block is unusable. Title often “Link N” (lucx.170 already skipped the remark).
+- **Cause:** lucx.169 ConfigBlock uses upstream `amneziawgConfigFromLink` = UTF-8 of `vpn://` bytes. LucX `vpn://` is `qCompress(JSON)`, not plain `.conf`.
+- **Fix:** `vpnConfFromLink` inflates and reads `last_config.config`. SubPage `VpnConfBlock`. Sync decoder returns "" for qCompress so diamonds never render.
+- **Not Throne.** `/sub/` AWG lines are `amneziawg://` + `vpn://`; Throne skips both. Manual `.conf` still works; a sub refresh replaces the profile.
+
+### Pattern 13: AmneziaWG copy-link row shows mojibake (�) — FIXED (lucx.170)
+- **Symptom (Never, 24.08.2026):** Client Info → Copy link → AmneziaWG title is diamonds / CJK garbage. Only some clients. `.conf` / vpn:// copy still works.
+- **Cause:** lucx.140+ `genAwgLink` appends official Amnezia `vpn://` = `qCompress(JSON)`. The modal hides `amneziawg://`, so only that line is labeled. `parseLinkParts` treated the payload as UTF-8 `.conf` and took `/^#/` from the binary.
+- **Fix:** detect Qt qCompress (zlib magic at offset 4) and skip; only parse remark/port from plain `.conf` / uncompressed JSON.
+- **Not a handshake bug.** Amnezia app qUncompresses the same URI.
+
+### Pattern 12: Inbounds page crash `null.length` after lucx.165 — FIXED (lucx.168)
+- **Symptom (VladufQa, 24.08.2026):** `/panel/inbounds` → `Unexpected Application Error! Cannot read properties of null (reading 'length')` in `InboundsPage-*.js`. Clients/other pages fine.
+- **Cause:** `AwgImportBanner` always fetches `/awg/import/preview` on mount. Empty `Discover` is a nil Go slice → `"candidates":null`. Zod fails; `parseMsg` (non-strict) still returns the raw obj. Banner `setCandidates(null)` then `candidates.length` on render. Same for `peers: null` on a zero-peer candidate.
+- **Fix:** emit `[]` from Discover/Preview; schema preprocess null→[]; banner `?? []`.
+- **Healing without lucx.168:** none on the page. Stay on Clients until update.
+- **Lesson:** a banner that always mounts must tolerate an empty payload. Never let a nil slice reach a React `.length`.
+
 ### Pattern 3: Frontend doesn’t see the AWG protocol
 - **Cause:** Registration forgotten in one of: `protocols/index.ts`, `schemas/inbound/index.ts`, `primitives/protocol.ts`, `InboundFormModal.tsx`.
 - **Fix:** `grep -rn "awg\|Awg\|AWG" frontend/src/` — check all 5 registration points.
@@ -34,3 +79,9 @@ Extracted from AGENTS.md. This file is project law.
 - **Fix (lucx.125, full):** shared `requestServerHost(c, trusted)` — trusted `X-Forwarded-Host`, else host from `Host`; `X-Real-IP` is never read. `ResolveRequest` and `AwgEndpointHost` moved onto it; `X-Real-IP` branch removed from controller `resolveHost`. Tests: `TestResolveRequest_HostNeverRealIP`, `TestGetProxies_AwgWithoutOwnAddressUsesSubscriptionHost`, `TestResolveHostNeverUsesRealIp`.
 - **Diagnostics (one command, repro without a client):** `curl -s -H 'X-Real-IP: 203.0.113.77' https://<sub-domain>/clash/<subId> | grep -B2 'type: wireguard'` — if `server:` shows `203.0.113.77`, the panel still leaks.
 - **Lesson:** `X-Real-IP`/`X-Forwarded-For` answer “who came”, not “where to connect”. In any code that builds a SERVER ADDRESS for the client, those headers are forbidden; only `X-Forwarded-Host` (from a trusted proxy) and `Host` are allowed.
+
+### Pattern 11: Client Info vpn:// button identical on every AWG inbound — FIXED (lucx.155)
+
+- **Cause:** the button sat inside `awgConfigs.map` but copied `linksBuilt.amneziaVpn` (`/awg/{subId}?format=vpn`). That endpoint returns every attached inbound. `.conf` already used `cfg.text` per inbound.
+- **Fix:** `GetAwg` / `awgBody` / public `/awg/` take `inboundId`. The button appends it. Omit the param → all profiles, as before.
+- **Seen on:** Kirill, 2026-08-22.

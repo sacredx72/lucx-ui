@@ -294,7 +294,8 @@ func (s *TunnelService) PreviewNaive(cfg tunnel.NaiveConfig) (string, error) {
 }
 
 // ValidateCaddyfile runs `caddy adapt` against the raw text using the
-// installed core binary, returning the parser output on failure.
+// installed core binary, returning the parser output on failure. It adapts the
+// hardened form, which is what the server runs — the editor's text never is.
 func (s *TunnelService) ValidateCaddyfile(text string) error {
 	if strings.TrimSpace(text) == "" {
 		return common.NewError("tunnel: Caddyfile is empty")
@@ -306,7 +307,7 @@ func (s *TunnelService) ValidateCaddyfile(text string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, "adapt", "--adapter", "caddyfile", "--config", "-")
-	cmd.Stdin = strings.NewReader(text)
+	cmd.Stdin = strings.NewReader(tunnel.HardenRawCaddyfile(text))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := strings.TrimSpace(string(out))
@@ -340,11 +341,21 @@ func (s *TunnelService) DownloadBinary(downloadURL, wantSHA256 string) error {
 // cron job and after panel boot. A crashed core is revived; a disabled one
 // stays down.
 func (s *TunnelService) Reconcile() {
+	s.inboundService.ReleaseMaskedNaive()
+	if s.inboundService.BindAppliedRealityDest() {
+		_ = (&XrayService{inboundService: s.inboundService}).RestartXray(false)
+	}
+	s.inboundService.sweepOrphanGatewayHosts()
 	s.reconcileNaiveInbounds()
 	s.reconcileOlcrtcInbounds()
 	s.reconcileQwdttInbound()
+	s.reconcileCsqttInbound()
 	s.reconcileMieruInbounds()
 	s.reconcileTrustTunnelInbounds()
+	s.reconcileAnytlsInbounds()
+	s.reconcileTproxyInbounds()
+	s.reconcileCoverInbounds()
+	s.reconcileGatewayInbounds()
 }
 
 // tunnelBlobMigrated reports whether the legacy settings blob carries the
@@ -400,6 +411,7 @@ func (s *TunnelService) legacyLifecycleBlocked(proto model.Protocol, settingKey 
 // lucxTunnel_naive settings core (pre-migration hosts).
 func (s *TunnelService) reconcileNaiveInbounds() {
 	secret, _ := s.settingService.GetSecret()
+	panelCert, panelKey := panelCertFiles()
 	inbounds, err := s.inboundService.GetAllInbounds()
 	if err != nil {
 		logger.Warning("tunnel: naive inbound list failed:", err)
@@ -413,6 +425,10 @@ func (s *TunnelService) reconcileNaiveInbounds() {
 		inst, ok := tunnel.InstanceFromInbound(ib, secret)
 		if !ok {
 			continue
+		}
+		if tunnel.GatewayAbsorbed(ib, inbounds) ||
+			tunnel.NaiveFrontedByCover(ib, inbounds, secret, panelCert, panelKey) {
+			inst.Enabled = false
 		}
 		want = append(want, inst)
 	}
@@ -524,6 +540,43 @@ func (s *TunnelService) reconcileQwdttInbound() {
 	}
 }
 
+func (s *TunnelService) reconcileCsqttInbound() {
+	inbounds, err := s.inboundService.GetAllInbounds()
+	if err != nil {
+		logger.Warning("tunnel: csqtt inbound list failed:", err)
+		return
+	}
+	var one *model.Inbound
+	for _, ib := range inbounds {
+		if ib == nil || ib.Protocol != model.Csqtt || ib.NodeID != nil {
+			continue
+		}
+		if one == nil || (ib.Enable && !one.Enable) {
+			one = ib
+		}
+	}
+	if one == nil {
+		_ = tunnel.GetManager().Stop(tunnel.Csqtt)
+		return
+	}
+	inst, ok := tunnel.CsqttInstanceFromInbound(one)
+	if !ok {
+		return
+	}
+	if err := tunnel.GetManager().Ensure(inst); err != nil {
+		logger.Warning("tunnel: csqtt inbound reconcile failed:", err)
+		return
+	}
+	if !inst.Enabled {
+		return
+	}
+	if inst.RouteThroughXray {
+		tunnel.GetManager().EnsureQwdttRouting(inst)
+		return
+	}
+	tunnel.EnsureCsqttDirect()
+}
+
 // reconcileMieruInbounds Ensures every mieru inbound sidecar and stops
 // orphans. mieru is inbound-only (lucx.117+): there is no legacy settings
 // blob, so with zero inbounds the wanted set is empty and every mieru-* key
@@ -547,6 +600,135 @@ func (s *TunnelService) reconcileMieruInbounds() {
 		want = append(want, inst)
 	}
 	tunnel.GetManager().ReconcileMieru(want)
+}
+
+// reconcileAnytlsInbounds Ensures every AnyTls inbound sidecar and stops
+// orphans. Inbound-only like mieru: zero inbounds sweeps every anytls-* key.
+func (s *TunnelService) reconcileAnytlsInbounds() {
+	panelCert, panelKey := panelCertFiles()
+	inbounds, err := s.inboundService.GetAllInbounds()
+	if err != nil {
+		logger.Warning("tunnel: anytls inbound list failed:", err)
+		return
+	}
+	var want []tunnel.Instance
+	routedPort := 0
+	for _, ib := range inbounds {
+		if ib == nil || ib.Protocol != model.Anytls || ib.NodeID != nil {
+			continue
+		}
+		inst, ok := tunnel.AnytlsInstanceFromInbound(ib, panelCert, panelKey)
+		if !ok {
+			continue
+		}
+		want = append(want, inst)
+		if ib.Enable {
+			if cfg, cfgOK := tunnel.AnytlsConfigFromInbound(ib); cfgOK && cfg.RouteThroughXray && cfg.RouteXrayPort > 0 {
+				routedPort = cfg.RouteXrayPort
+			}
+		}
+	}
+	if routedPort > 0 {
+		// One uid REDIRECT rule (lucx-mtproxy user) serves every routed AnyTLS.
+		tunnel.EnsureAnytlsXraySocks(routedPort)
+	} else {
+		tunnel.ClearAnytlsXraySocks()
+	}
+	tunnel.GetManager().ReconcileAnytls(want)
+}
+
+func (s *TunnelService) reconcileTproxyInbounds() {
+	panelCert, panelKey := panelCertFiles()
+	inbounds, err := s.inboundService.GetAllInbounds()
+	if err != nil {
+		logger.Warning("tunnel: tproxy inbound list failed:", err)
+		return
+	}
+	var relays, mtps, caddies []tunnel.Instance
+	routedPort := 0
+	for _, ib := range inbounds {
+		if ib == nil || ib.Protocol != model.Tproxy || ib.NodeID != nil {
+			continue
+		}
+		insts, ok := tunnel.TproxyInstancesFromInbound(ib, panelCert, panelKey, inbounds...)
+		if !ok {
+			continue
+		}
+		for _, inst := range insts {
+			switch inst.Core {
+			case tunnel.Tproxy:
+				relays = append(relays, inst)
+			case tunnel.Mtproxy:
+				mtps = append(mtps, inst)
+			case tunnel.TproxyCaddy:
+				if tunnel.GatewayAbsorbed(ib, inbounds) {
+					inst.Enabled = false
+				}
+				caddies = append(caddies, inst)
+			}
+		}
+		if ib.Enable {
+			tunnel.EnsureMtproxyLocalOnly(ib.Id)
+			if cfg, cfgOK := tunnel.TproxyConfigFromInbound(ib); cfgOK && cfg.RouteThroughXray && cfg.RouteXrayPort > 0 {
+				routedPort = cfg.RouteXrayPort
+			}
+		} else {
+			tunnel.ClearMtproxyLocalOnly(ib.Id)
+		}
+	}
+	if routedPort > 0 {
+		tunnel.EnsureMtproxyXraySocks(routedPort)
+	} else {
+		tunnel.ClearMtproxyXraySocks()
+	}
+	mgr := tunnel.GetManager()
+	mgr.ReconcileMtproxy(mtps)
+	mgr.ReconcileTproxy(relays)
+	mgr.ReconcileTproxyCaddy(caddies)
+}
+
+func (s *TunnelService) reconcileCoverInbounds() {
+	panelCert, panelKey := panelCertFiles()
+	secret, _ := s.settingService.GetSecret()
+	inbounds, err := s.inboundService.GetAllInbounds()
+	if err != nil {
+		logger.Warning("tunnel: cover inbound list failed:", err)
+		return
+	}
+	var want []tunnel.Instance
+	for _, ib := range inbounds {
+		if ib == nil || ib.Protocol != model.Cover || ib.NodeID != nil {
+			continue
+		}
+		inst, ok := tunnel.StandaloneCoverInstance(ib, inbounds, secret, panelCert, panelKey)
+		if !ok {
+			continue
+		}
+		want = append(want, inst)
+	}
+	tunnel.GetManager().ReconcileCover(want)
+}
+
+func (s *TunnelService) reconcileGatewayInbounds() {
+	secret, _ := s.settingService.GetSecret()
+	panelCert, panelKey := panelCertFiles()
+	inbounds, err := s.inboundService.GetAllInbounds()
+	if err != nil {
+		logger.Warning("tunnel: gateway inbound list failed:", err)
+		return
+	}
+	var want []tunnel.Instance
+	for _, ib := range inbounds {
+		if ib == nil || ib.Protocol != model.Gateway || ib.NodeID != nil {
+			continue
+		}
+		inst, ok := tunnel.GatewayInstanceFromInbound(ib, inbounds, secret, panelCert, panelKey)
+		if !ok {
+			continue
+		}
+		want = append(want, inst)
+	}
+	tunnel.GetManager().ReconcileGateway(want)
 }
 
 // panelCertFiles reads the panel ACME certificate paths from settings (the
@@ -821,7 +1003,7 @@ func (s *TunnelService) downloadBinaryTo(dst, downloadURL, wantSHA256 string) er
 		return common.NewError("tunnel: empty download url")
 	}
 	wantSHA256 = strings.ToLower(strings.TrimSpace(wantSHA256))
-	if wantSHA256 != "" && !isSHA256Hex(wantSHA256) {
+	if wantSHA256 == "" || !isSHA256Hex(wantSHA256) {
 		return common.NewError("tunnel: sha256 must be 64 hex characters")
 	}
 	if err := checkDownloadURL(downloadURL); err != nil {
@@ -835,6 +1017,9 @@ func (s *TunnelService) downloadBinaryTo(dst, downloadURL, wantSHA256 string) er
 		return err
 	}
 	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: publicOnlyDialContext,
+		},
 		CheckRedirect: func(r *http.Request, via []*http.Request) error {
 			if len(via) >= maxTunnelDownloadRedirects {
 				return common.NewErrorf("tunnel: too many redirects (>%d)", maxTunnelDownloadRedirects)
@@ -927,6 +1112,40 @@ func checkDownloadURL(raw string) error {
 // isPublicUnicast reports whether ip is a routable public address — anything
 // loopback, link-local (which covers the 169.254.169.254 metadata service),
 // private, multicast or unspecified is refused.
+func publicOnlyDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	if ip := net.ParseIP(host); ip != nil {
+		if !isPublicUnicast(ip) {
+			return nil, common.NewErrorf("tunnel: refused non-public address %s", host)
+		}
+		return dialer.DialContext(ctx, network, addr)
+	}
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	var last error
+	for _, a := range addrs {
+		if !isPublicUnicast(a.IP) {
+			last = common.NewErrorf("tunnel: %s resolved to a non-public address", host)
+			continue
+		}
+		c, err := dialer.DialContext(ctx, network, net.JoinHostPort(a.IP.String(), port))
+		if err == nil {
+			return c, nil
+		}
+		last = err
+	}
+	if last == nil {
+		last = common.NewErrorf("tunnel: no public address for %s", host)
+	}
+	return nil, last
+}
+
 func isPublicUnicast(ip net.IP) bool {
 	if ip == nil || ip.IsUnspecified() || ip.IsLoopback() || ip.IsPrivate() ||
 		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
@@ -1072,7 +1291,7 @@ func (s *TunnelService) checkNaivePortConflict(cfg tunnel.NaiveConfig) error {
 			continue
 		}
 		switch ib.Protocol {
-		case model.WireGuard, model.AWG, model.Hysteria:
+		case model.WireGuard, model.AWG, model.AmneziaWG, model.Hysteria:
 			continue // UDP-only listeners never collide with naive's TCP port
 		}
 		if tunnelListenOverlap(cfg.Listen, ib.Listen) {
@@ -1291,6 +1510,53 @@ func (s *TunnelService) qwdttInstance(cfg tunnel.QwdttConfig) (tunnel.Instance, 
 	}, nil
 }
 
+// --- CSQTT core (inbound-only) ---------------------------------------------
+
+type CsqttStatus struct {
+	Core         string        `json:"core"`
+	DisplayName  string        `json:"displayName"`
+	BinaryExists bool          `json:"binaryExists"`
+	BinaryPath   string        `json:"binaryPath"`
+	Probe        tunnel.Status `json:"probe"`
+	LastLog      string        `json:"lastLog"`
+}
+
+func (s *TunnelService) CsqttStatus() (CsqttStatus, error) {
+	mgr := tunnel.GetManager()
+	bin := tunnel.Csqtt.BinaryPath()
+	info, statErr := os.Stat(bin)
+	inst := tunnel.Instance{Core: tunnel.Csqtt, Key: tunnel.CsqttKey}
+	return CsqttStatus{
+		Core:         string(tunnel.Csqtt),
+		DisplayName:  tunnel.Csqtt.DisplayName(),
+		BinaryExists: statErr == nil && !info.IsDir(),
+		BinaryPath:   bin,
+		Probe:        mgr.StatusOf(inst),
+		LastLog:      mgr.LastLog(tunnel.Csqtt),
+	}, nil
+}
+
+func (s *TunnelService) CsqttLogs(lines int) []string {
+	if lines <= 0 {
+		lines = 200
+	}
+	return tunnel.GetManager().Logs(tunnel.Csqtt, lines)
+}
+
+func (s *TunnelService) DeleteCsqttBinary() error {
+	if err := tunnel.GetManager().Stop(tunnel.Csqtt); err != nil {
+		logger.Warning("tunnel: stop before csqtt binary delete failed:", err)
+	}
+	if err := os.Remove(tunnel.Csqtt.BinaryPath()); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func (s *TunnelService) DownloadCsqttBinary(downloadURL, wantSHA256 string) error {
+	return s.downloadBinaryTo(tunnel.Csqtt.BinaryPath(), downloadURL, wantSHA256)
+}
+
 // --- mieru core (inbound-only, lucx.117) -----------------------------------
 
 // MieruStatus is the Cores-page payload of the mieru core: binary presence
@@ -1388,4 +1654,164 @@ func (s *TunnelService) DeleteTrustTunnelBinary() error {
 // DownloadTrustTunnelBinary fetches the endpoint binary from a URL into place.
 func (s *TunnelService) DownloadTrustTunnelBinary(downloadURL, wantSHA256 string) error {
 	return s.downloadBinaryTo(tunnel.TrustTunnel.BinaryPath(), downloadURL, wantSHA256)
+}
+
+// --- AnyTLS core (inbound-only) ---------------------------------------------
+
+// AnytlsStatus is the Cores-page payload of the AnyTLS core: binary presence
+// plus the aggregate process state across all anytls-{id} instances.
+type AnytlsStatus struct {
+	Core         string        `json:"core"`
+	DisplayName  string        `json:"displayName"`
+	BinaryExists bool          `json:"binaryExists"`
+	BinaryPath   string        `json:"binaryPath"`
+	Probe        tunnel.Status `json:"probe"`
+	LastLog      string        `json:"lastLog"`
+}
+
+// AnytlsStatus assembles the Cores-page payload from the live manager state.
+func (s *TunnelService) AnytlsStatus() (AnytlsStatus, error) {
+	mgr := tunnel.GetManager()
+	bin := tunnel.Anytls.BinaryPath()
+	info, statErr := os.Stat(bin)
+	return AnytlsStatus{
+		Core:         string(tunnel.Anytls),
+		DisplayName:  tunnel.Anytls.DisplayName(),
+		BinaryExists: statErr == nil && !info.IsDir(),
+		BinaryPath:   bin,
+		Probe:        tunnel.Status{Running: mgr.AnyRunning("anytls-")},
+		LastLog:      mgr.LastLogPrefixed("anytls-"),
+	}, nil
+}
+
+// AnytlsLogs returns the most recent output lines of all anytls instances.
+func (s *TunnelService) AnytlsLogs(lines int) []string {
+	if lines <= 0 {
+		lines = 200
+	}
+	return tunnel.GetManager().LogsPrefixed("anytls-", lines)
+}
+
+// DeleteAnytlsBinary stops every anytls instance and removes the binary.
+func (s *TunnelService) DeleteAnytlsBinary() error {
+	tunnel.GetManager().StopPrefixed("anytls-")
+	if err := os.Remove(tunnel.Anytls.BinaryPath()); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// DownloadAnytlsBinary fetches the anytls-server binary from a URL into place.
+func (s *TunnelService) DownloadAnytlsBinary(downloadURL, wantSHA256 string) error {
+	return s.downloadBinaryTo(tunnel.Anytls.BinaryPath(), downloadURL, wantSHA256)
+}
+
+type TproxyStatus struct {
+	Core         string        `json:"core"`
+	DisplayName  string        `json:"displayName"`
+	BinaryExists bool          `json:"binaryExists"`
+	BinaryPath   string        `json:"binaryPath"`
+	Probe        tunnel.Status `json:"probe"`
+	LastLog      string        `json:"lastLog"`
+}
+
+func (s *TunnelService) TproxyStatus() (TproxyStatus, error) {
+	mgr := tunnel.GetManager()
+	bin := tunnel.Tproxy.BinaryPath()
+	info, statErr := os.Stat(bin)
+	return TproxyStatus{
+		Core:         string(tunnel.Tproxy),
+		DisplayName:  tunnel.Tproxy.DisplayName(),
+		BinaryExists: statErr == nil && !info.IsDir(),
+		BinaryPath:   bin,
+		Probe:        tunnel.Status{Running: mgr.AnyRunning("tproxy-")},
+		LastLog:      mgr.LastLogPrefixed("tproxy-"),
+	}, nil
+}
+
+func (s *TunnelService) TproxyLogs(lines int) []string {
+	if lines <= 0 {
+		lines = 200
+	}
+	return tunnel.GetManager().LogsPrefixed("tproxy-", lines)
+}
+
+func (s *TunnelService) DeleteTproxyBinary() error {
+	tunnel.GetManager().StopPrefixed("tproxy-")
+	tunnel.GetManager().StopPrefixed("tproxycaddy-")
+	if err := os.Remove(tunnel.Tproxy.BinaryPath()); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func (s *TunnelService) DownloadTproxyBinary(downloadURL, wantSHA256 string) error {
+	return s.downloadBinaryTo(tunnel.Tproxy.BinaryPath(), downloadURL, wantSHA256)
+}
+
+func (s *TunnelService) MtproxyStatus() (TproxyStatus, error) {
+	mgr := tunnel.GetManager()
+	bin := tunnel.Mtproxy.BinaryPath()
+	info, statErr := os.Stat(bin)
+	return TproxyStatus{
+		Core:         string(tunnel.Mtproxy),
+		DisplayName:  tunnel.Mtproxy.DisplayName(),
+		BinaryExists: statErr == nil && !info.IsDir(),
+		BinaryPath:   bin,
+		Probe:        tunnel.Status{Running: mgr.AnyRunning("mtproxy-")},
+		LastLog:      mgr.LastLogPrefixed("mtproxy-"),
+	}, nil
+}
+
+func (s *TunnelService) MtproxyLogs(lines int) []string {
+	if lines <= 0 {
+		lines = 200
+	}
+	return tunnel.GetManager().LogsPrefixed("mtproxy-", lines)
+}
+
+func (s *TunnelService) DeleteMtproxyBinary() error {
+	tunnel.GetManager().StopPrefixed("mtproxy-")
+	if err := os.Remove(tunnel.Mtproxy.BinaryPath()); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func (s *TunnelService) DownloadMtproxyBinary(downloadURL, wantSHA256 string) error {
+	return s.downloadBinaryTo(tunnel.Mtproxy.BinaryPath(), downloadURL, wantSHA256)
+}
+
+func (s *TunnelService) UploadTproxySite(inboundID int, zipBytes []byte) error {
+	ib, err := s.inboundService.GetInbound(inboundID)
+	if err != nil {
+		return err
+	}
+	if ib == nil || (ib.Protocol != model.Tproxy && ib.Protocol != model.Cover) {
+		return common.NewError("inbound is not tproxy or cover")
+	}
+	dir := tunnel.TproxySiteDir(inboundID)
+	if ib.Protocol == model.Cover {
+		dir = tunnel.CoverSiteDir(inboundID)
+	}
+	if err := tunnel.ExtractTproxySiteZip(dir, zipBytes); err != nil {
+		return err
+	}
+	s.reconcileTproxyInbounds()
+	s.reconcileCoverInbounds()
+	return nil
+}
+
+func (s *TunnelService) TproxySiteFiles(inboundID int) ([]string, error) {
+	ib, err := s.inboundService.GetInbound(inboundID)
+	if err != nil {
+		return nil, err
+	}
+	if ib == nil || (ib.Protocol != model.Tproxy && ib.Protocol != model.Cover) {
+		return nil, common.NewError("inbound is not tproxy or cover")
+	}
+	if ib.Protocol == model.Cover {
+		return tunnel.ListCoverSite(inboundID), nil
+	}
+	return tunnel.ListTproxySite(inboundID), nil
 }

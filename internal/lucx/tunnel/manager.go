@@ -154,6 +154,8 @@ type Manager struct {
 	naiveTraffic       map[string]*naiveLogCursor
 	mieruTraffic       map[string]map[string]*mieruUserCursor
 	trustTunnelTraffic map[string]*trustTunnelCursor
+	anytlsTraffic      map[string]*anytlsCursor
+	sidecarDelta       map[string]*deltaCursor
 }
 
 func newManager() *Manager {
@@ -161,6 +163,8 @@ func newManager() *Manager {
 		cores:              make(map[string]*managed),
 		mieruTraffic:       make(map[string]map[string]*mieruUserCursor),
 		trustTunnelTraffic: make(map[string]*trustTunnelCursor),
+		anytlsTraffic:      make(map[string]*anytlsCursor),
+		sidecarDelta:       make(map[string]*deltaCursor),
 	}
 }
 
@@ -247,6 +251,7 @@ func (m *Manager) Ensure(inst Instance) error {
 			}
 		}
 		mc.fp = ""
+		clearQwdttRoutingForKey(key)
 		return nil
 	}
 
@@ -271,6 +276,8 @@ func (m *Manager) Ensure(inst Instance) error {
 	// with policy routing once the process (and wdtt0) is up.
 	if inst.RouteThroughXray {
 		go ensureQwdttXrayRouting(inst)
+	} else if inst.Core == Csqtt {
+		EnsureCsqttDirect()
 	}
 	return nil
 }
@@ -290,7 +297,9 @@ func (m *Manager) EnsureQwdttRouting(inst Instance) {
 // Remove stops and forgets a managed key (inbound delete). For multi-instance
 // inbound cores (trusttunnel-N, mieru-N, naive-N) companion config files and
 // the data dir are removed so a re-created inbound does not leave orphans
-// (tester bravn, lucx.122). Legacy single-key cores keep files on disk.
+// (tester bravn, lucx.122). CSQTT is a singleton key but its SQLite
+// (main_device_id) must die with the inbound. Other legacy single-key cores
+// keep files on disk.
 func (m *Manager) Remove(key string) {
 	key = strings.TrimSpace(key)
 	if key == "" {
@@ -311,14 +320,23 @@ func (m *Manager) Remove(key string) {
 			}
 		}
 		mc.fp = ""
+		removeManagedFiles(key)
 		mc.opMu.Unlock()
 	}
-	removeManagedFiles(key)
+	clearQwdttRoutingForKey(key)
 }
 
 // removeManagedFiles deletes on-disk configs/data for multi-instance keys.
 // No-op for legacy single-core keys (naive / olcrtc / qwdtt without suffix).
+// CSQTT is the exception: csqtt.db.main_device_id survives a delete otherwise.
 func removeManagedFiles(key string) {
+	if key == CsqttKey {
+		p := dataDirFor(CsqttKey, Csqtt)
+		if err := os.RemoveAll(p); err != nil && !os.IsNotExist(err) {
+			logger.Warningf("tunnel: remove %s: %v", p, err)
+		}
+		return
+	}
 	if !isMultiInstanceKey(key) {
 		return
 	}
@@ -330,6 +348,16 @@ func removeManagedFiles(key string) {
 		core = MieruClient
 	case strings.HasPrefix(key, "mieru-"):
 		core = Mieru
+	case strings.HasPrefix(key, "anytls-"):
+		core = Anytls
+	case strings.HasPrefix(key, "tproxycaddy-"):
+		core = TproxyCaddy
+	case strings.HasPrefix(key, "cover-"):
+		core = Cover
+	case strings.HasPrefix(key, "tproxy-"):
+		core = Tproxy
+	case strings.HasPrefix(key, "mtproxy-"):
+		core = Mtproxy
 	case strings.HasPrefix(key, "naiveout-"):
 		core = NaiveClient
 	case strings.HasPrefix(key, "naive-"):
@@ -349,6 +377,9 @@ func removeManagedFiles(key string) {
 			filepath.Join(workDir(), key+"-rules.toml"),
 		)
 	}
+	if core == Tproxy {
+		paths = append(paths, filepath.Join(workDir(), key+"-profiles.json"))
+	}
 	paths = append(paths, dataDirFor(key, core))
 	for _, p := range paths {
 		if err := os.RemoveAll(p); err != nil && !os.IsNotExist(err) {
@@ -358,7 +389,7 @@ func removeManagedFiles(key string) {
 }
 
 func isMultiInstanceKey(key string) bool {
-	for _, p := range []string{"trusttunnel-", "mieru-", "naive-", "olcrtc-", "naiveout-", "mieruout-", "ttout-"} {
+	for _, p := range []string{"trusttunnel-", "mieru-", "naive-", "olcrtc-", "anytls-", "tproxycaddy-", "cover-", "tproxy-", "mtproxy-", "naiveout-", "mieruout-", "ttout-"} {
 		if strings.HasPrefix(key, p) && len(key) > len(p) {
 			return true
 		}
@@ -476,6 +507,16 @@ func (m *Manager) IsRunningKey(key string) bool {
 	defer m.mu.Unlock()
 	mc, ok := m.cores[key]
 	return ok && mc.proc != nil && mc.proc.IsRunning()
+}
+
+func (m *Manager) PidOf(key string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mc, ok := m.cores[key]
+	if !ok || mc.proc == nil {
+		return 0
+	}
+	return mc.proc.Pid()
 }
 
 // AnyRunning reports whether any managed key carrying the prefix is alive
@@ -622,6 +663,31 @@ func (m *Manager) ReconcileTrustTunnel(want []Instance) {
 	m.ReconcileWanted(TrustTunnel, "trusttunnel-", string(TrustTunnel), want)
 }
 
+// ReconcileAnytls drives every desired AnyTls inbound instance.
+func (m *Manager) ReconcileAnytls(want []Instance) {
+	m.ReconcileWanted(Anytls, "anytls-", string(Anytls), want)
+}
+
+func (m *Manager) ReconcileTproxy(want []Instance) {
+	m.ReconcileWanted(Tproxy, "tproxy-", string(Tproxy), want)
+}
+
+func (m *Manager) ReconcileMtproxy(want []Instance) {
+	m.ReconcileWanted(Mtproxy, "mtproxy-", string(Mtproxy), want)
+}
+
+func (m *Manager) ReconcileTproxyCaddy(want []Instance) {
+	m.ReconcileWanted(TproxyCaddy, "tproxycaddy-", string(TproxyCaddy), want)
+}
+
+func (m *Manager) ReconcileCover(want []Instance) {
+	m.ReconcileWanted(Cover, "cover-", string(Cover), want)
+}
+
+func (m *Manager) ReconcileGateway(want []Instance) {
+	m.ReconcileWanted(Gateway, "gateway-", string(Gateway), want)
+}
+
 // ReconcileWanted Ensures each wanted instance of core and Removes orphan
 // keys that match prefix or legacyKey but are not in want.
 func (m *Manager) ReconcileWanted(core Name, prefix, legacyKey string, want []Instance) {
@@ -732,7 +798,11 @@ func (m *Manager) start(inst Instance, mc *managed) error {
 	case inst.Core == Naive:
 		args = []string{"run", "--config", cfgPath, "--adapter", "caddyfile"}
 		if extra := strings.TrimSpace(inst.ExtraArgs); extra != "" {
-			args = append(args, strings.Fields(extra)...)
+			more, err := extraArgsSafe(extra)
+			if err != nil {
+				return err
+			}
+			args = append(args, more...)
 		}
 	case inst.Core == Olcrtc:
 		args = []string{cfgPath}
@@ -767,4 +837,21 @@ func (m *Manager) start(inst Instance, mc *managed) error {
 		return fmt.Errorf("tunnel: start %s: %w", key, err)
 	}
 	return nil
+}
+
+func extraArgsSafe(extra string) ([]string, error) {
+	fields := strings.Fields(extra)
+	blocked := map[string]struct{}{
+		"-c": {}, "--config": {}, "--adapter": {},
+	}
+	for _, f := range fields {
+		if strings.ContainsAny(f, "\n\r") {
+			return nil, fmt.Errorf("tunnel: ExtraArgs contains invalid characters")
+		}
+		name, _, _ := strings.Cut(f, "=")
+		if _, ok := blocked[name]; ok {
+			return nil, fmt.Errorf("tunnel: ExtraArgs cannot override %s", name)
+		}
+	}
+	return fields, nil
 }

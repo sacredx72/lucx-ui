@@ -39,6 +39,7 @@ func run(root, outDir string) error {
 				"ClientInbound",
 				"InboundFallback",
 				"Host",
+				"SubBalancer",
 			),
 			AliasAllow: setOf("Protocol", "KeepAliveValue"),
 			Overrides: map[string][]walkOverride{
@@ -72,6 +73,7 @@ func run(root, outDir string) error {
 			Path: resolveRel(root, "internal/xray"),
 			StructAllow: setOf(
 				"ClientTraffic",
+				"Traffic",
 			),
 		},
 		{
@@ -89,16 +91,42 @@ func run(root, outDir string) error {
 			Path: resolveRel(root, "internal/web/service"),
 			StructAllow: setOf(
 				"InboundOption",
+				"HappLinkResult",
+				"ClientSlim",
+				"ClientRenewalPreviewRequest",
+				"ClientRenewalPreview",
+				"ClientPageResponse",
+				"ClientsSummary",
+				"InboundTrafficSummary",
+				"LogEntry",
+				"NewUUIDResponse",
+				"MLDSA65Response",
+				"MLKEM768Response",
 				"NodeMutationRequest",
 				"NodeView",
 				"ProbeResultUI",
 				"RealityScanResult",
 				"GeodataTokenIssue",
+				"AmneziaWGLogs",
+				"PeerActivity",
+				"HwidSlotStatus",
 			),
 		},
 		{
 			Path:        resolveRel(root, "internal/web/service/panel"),
-			StructAllow: setOf("ApiTokenView", "PanelUpdateStatus", "PanelReleaseNote", "PanelReleaseNotes"),
+			StructAllow: setOf("ApiTokenView", "PanelUpdateStatus", "PanelReleaseNote", "PanelReleaseNotes", "Sponsor", "SponsorList"),
+		},
+		{
+			Path:        resolveRel(root, "internal/amneziawg"),
+			StructAllow: setOf("ServerSettings"),
+		},
+		{
+			Path:        resolveRel(root, "internal/tuic"),
+			StructAllow: setOf("TuicServerSettings", "TuicClientSettings"),
+		},
+		{
+			Path:        resolveRel(root, "internal/awg"),
+			StructAllow: setOf("HostStatus"),
 		},
 	}
 

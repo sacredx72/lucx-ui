@@ -63,7 +63,9 @@ export const MieruNoncePatternSchema = z.object({
   minLen: z.number().int().min(0).max(12).optional(),
   maxLen: z.number().int().min(0).max(12).optional(),
   customHexStrings: z
-    .array(z.string().regex(/^([0-9a-fA-F]{2}){1,12}$/, 'pages.inbounds.form.mieruTpNonceHexInvalid'))
+    .array(
+      z.string().regex(/^([0-9a-fA-F]{2}){1,12}$/, 'pages.inbounds.form.mieruTpNonceHexInvalid'),
+    )
     .optional(),
 });
 
@@ -97,6 +99,7 @@ export const MieruInboundSettingsSchema = z.object({
   multiplexing: MieruMultiplexingSchema.optional(),
   handshakeMode: MieruHandshakeModeSchema.optional(),
   trafficPattern: MieruTrafficPatternSchema.optional(),
+  authSeed: z.string().optional(),
   clients: z.array(NaiveClientSchema).default([]),
 });
 export type MieruInboundSettings = z.infer<typeof MieruInboundSettingsSchema>;

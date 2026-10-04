@@ -15,6 +15,7 @@ import { buildRemarkByTag, formatInboundTag, isApiRule } from './helpers';
 
 export interface RoutingRule {
   enabled?: boolean;
+  comment?: string;
   type?: string;
   domain?: string | string[];
   ip?: string | string[];
@@ -44,6 +45,7 @@ interface RuleFormModalProps {
 
 const initialForm = (): RuleFormValues => ({
   enabled: true,
+  comment: '',
   domain: '',
   ip: '',
   port: '',
@@ -64,14 +66,20 @@ const PROTOCOLS = ['http', 'tls', 'bittorrent', 'quic'];
 
 function csv(value: string): string[] {
   if (!value) return [];
-  return value.split(',').map((s) => s.trim()).filter(Boolean);
+  return value
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 /** Single-host tunnel IPs from AWG/WG allowedIPs CSV (skip 0.0.0.0/0 etc.). */
 function singleHostIps(allowedIPs: string | undefined): string[] {
   if (!allowedIPs) return [];
   const out: string[] = [];
-  for (const raw of allowedIPs.split(',').map((s) => s.trim()).filter(Boolean)) {
+  for (const raw of allowedIPs
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)) {
     if (raw === '0.0.0.0/0' || raw === '::/0') continue;
     const bare = raw.includes('/') ? raw.split('/')[0] : raw;
     const bits = raw.includes('/') ? Number(raw.split('/')[1]) : NaN;
@@ -94,7 +102,12 @@ function clientProtocols(c: ClientRecord, byId: Map<number, InboundOption>): Set
   return s;
 }
 
-type ClientOpt = { value: string; label: string; kind: 'user' | 'source' | 'inbound'; token: string };
+type ClientOpt = {
+  value: string;
+  label: string;
+  kind: 'user' | 'source' | 'inbound';
+  token: string;
+};
 
 function buildClientOptions(clients: ClientRecord[], inbounds: InboundOption[]): ClientOpt[] {
   const byId = new Map(inbounds.map((i) => [i.id, i]));
@@ -136,11 +149,36 @@ function buildClientOptions(clients: ClientRecord[], inbounds: InboundOption[]):
     // Xray-auth protocols keep email → routing.user
     if (!isAwg || protos.size > 1) {
       const hasXrayUser = [...protos].some(
-        (p) => p !== 'awg' && p !== 'wireguard' && p !== 'tun' && p !== 'tunnel' && p !== 'naive' && p !== 'mtproto' && p !== 'mieru' && p !== 'trusttunnel',
+        (p) =>
+          p !== 'awg' &&
+          p !== 'wireguard' &&
+          p !== 'tun' &&
+          p !== 'tunnel' &&
+          p !== 'naive' &&
+          p !== 'mtproto' &&
+          p !== 'mieru' &&
+          p !== 'trusttunnel',
       );
-      if (hasXrayUser || (!isAwg && !isWg && !isNaive && !protos.has('mtproto') && !protos.has('mieru') && !protos.has('trusttunnel'))) {
+      if (
+        hasXrayUser ||
+        (!isAwg &&
+          !isWg &&
+          !isNaive &&
+          !protos.has('mtproto') &&
+          !protos.has('mieru') &&
+          !protos.has('trusttunnel'))
+      ) {
         const protoLabel =
-          [...protos].filter((p) => p !== 'awg' && p !== 'wireguard' && p !== 'naive' && p !== 'mieru' && p !== 'trusttunnel').join('/') || 'xray';
+          [...protos]
+            .filter(
+              (p) =>
+                p !== 'awg' &&
+                p !== 'wireguard' &&
+                p !== 'naive' &&
+                p !== 'mieru' &&
+                p !== 'trusttunnel',
+            )
+            .join('/') || 'xray';
         opts.push({
           value: `user:${c.email}`,
           kind: 'user',
@@ -175,7 +213,9 @@ export default function RuleFormModal({
   const { data: clients = [] } = useQuery({
     queryKey: ['routing', 'clientPickList'],
     queryFn: async () => {
-      const msg = await HttpUtil.get<ClientRecord[]>('/panel/api/clients/list', undefined, { silent: true });
+      const msg = await HttpUtil.get<ClientRecord[]>('/panel/api/clients/list', undefined, {
+        silent: true,
+      });
       return (msg?.success && Array.isArray(msg.obj) ? msg.obj : []) as ClientRecord[];
     },
     enabled: open,
@@ -200,6 +240,7 @@ export default function RuleFormModal({
       const user = Array.isArray(rule.user) ? rule.user.join(',') : rule.user || '';
       methods.reset({
         enabled: rule.enabled !== false,
+        comment: rule.comment || '',
         domain: Array.isArray(rule.domain) ? rule.domain.join(',') : rule.domain || '',
         ip: Array.isArray(rule.ip) ? rule.ip.join(',') : rule.ip || '',
         port: rule.port || '',
@@ -278,6 +319,7 @@ export default function RuleFormModal({
     const built: Record<string, unknown> = {
       type: 'field',
       enabled: v.enabled,
+      comment: v.comment,
       domain: csv(v.domain),
       ip: csv(v.ip),
       port: v.port,
@@ -313,7 +355,19 @@ export default function RuleFormModal({
     // balancerTag targets nothing. Guard here so the user never saves an
     // invalid rule (matches AGENTS.md Debug Pattern 5).
     // "vlessRoute" alone is also a matcher (Xray accepts it), so include it.
-    const matchers = ['domain', 'ip', 'port', 'sourcePort', 'network', 'sourceIP', 'user', 'inboundTag', 'protocol', 'attrs', 'vlessRoute'];
+    const matchers = [
+      'domain',
+      'ip',
+      'port',
+      'sourcePort',
+      'network',
+      'sourceIP',
+      'user',
+      'inboundTag',
+      'protocol',
+      'attrs',
+      'vlessRoute',
+    ];
     const hasMatcher = matchers.some((k) => {
       const val = (out as Record<string, unknown>)[k];
       if (val == null || val === '') return false;
@@ -374,6 +428,9 @@ export default function RuleFormModal({
             <Switch disabled={isApiRule(rule ?? {})} />
           </FormField>
 
+          <FormField name="comment" label={t('comment')}>
+            <Input maxLength={200} showCount placeholder={t('comment')} />
+          </FormField>
           {/* LUCX-HOOK: AWG outbound — routing-rule validation UX.
               Xray rejects a field rule with no effective matchers and fails to
               start (AGENTS.md Pattern 5). A common footgun was creating a rule
@@ -453,7 +510,9 @@ export default function RuleFormModal({
                   aria-label={t('pages.nodes.name')}
                   placeholder={t('pages.nodes.name')}
                   onChange={(e) => {
-                    const next = attrs.map((a, i) => (i === idx ? ([e.target.value, a[1]] as [string, string]) : a));
+                    const next = attrs.map((a, i) =>
+                      i === idx ? ([e.target.value, a[1]] as [string, string]) : a,
+                    );
                     methods.setValue('attrs', next);
                   }}
                 />
@@ -462,14 +521,21 @@ export default function RuleFormModal({
                   aria-label={t('pages.xray.ruleForm.value')}
                   placeholder={t('pages.xray.ruleForm.value')}
                   onChange={(e) => {
-                    const next = attrs.map((a, i) => (i === idx ? ([a[0], e.target.value] as [string, string]) : a));
+                    const next = attrs.map((a, i) =>
+                      i === idx ? ([a[0], e.target.value] as [string, string]) : a,
+                    );
                     methods.setValue('attrs', next);
                   }}
                 />
                 <Button
                   aria-label={t('remove')}
                   icon={<MinusOutlined />}
-                  onClick={() => methods.setValue('attrs', attrs.filter((_, i) => i !== idx))}
+                  onClick={() =>
+                    methods.setValue(
+                      'attrs',
+                      attrs.filter((_, i) => i !== idx),
+                    )
+                  }
                 />
               </Space.Compact>
             ))}
@@ -505,16 +571,21 @@ export default function RuleFormModal({
             }
           >
             <Select
+              id="clientPick"
               mode="tags"
               showSearch
               allowClear
+              // rc-virtual-list reuses rows by value; scrolling paints one client over the rest.
+              virtual={false}
               value={clientPick}
               onChange={applyClientPick}
               optionFilterProp="label"
               placeholder={t('pages.xray.ruleForm.clientPickPlaceholder')}
-              options={clientOptions.map((o) => ({ value: o.value, label: o.label }))}
+              options={clientOptions}
               filterOption={(input, option) =>
-                String(option?.label ?? '').toLowerCase().includes(input.toLowerCase())
+                String(option?.label ?? '')
+                  .toLowerCase()
+                  .includes(input.toLowerCase())
               }
             />
           </Form.Item>
@@ -543,7 +614,10 @@ export default function RuleFormModal({
           <FormField name="inboundTag" label={t('pages.xray.ruleForm.inboundTags')}>
             <Select
               mode="multiple"
-              options={inboundTags.map((tag) => ({ value: tag, label: formatInboundTag(tag, remarkByTag) }))}
+              options={inboundTags.map((tag) => ({
+                value: tag,
+                label: formatInboundTag(tag, remarkByTag),
+              }))}
             />
           </FormField>
 

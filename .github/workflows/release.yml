@@ -2,9 +2,11 @@ name: Release LucX-UI
 
 on:
   workflow_dispatch:
+  # Only main (dev channel) and version tags ship binaries; build any other
+  # branch on demand via workflow_dispatch.
   push:
     branches:
-      - "**"
+      - main
     tags:
       - "v*.*.*"
     paths:
@@ -18,27 +20,20 @@ on:
       - "x-ui.service.rhel"
       - ".github/workflows/release.yml"
   pull_request:
-    paths:
-      - "**.go"
-      - "go.mod"
-      - "go.sum"
-      - "**.sh"
-      - "frontend/**"
-      - "x-ui.service.debian"
-      - "x-ui.service.arch"
-      - "x-ui.service.rhel"
-      - ".github/workflows/release.yml"
 
 jobs:
   build:
     permissions:
       contents: write
     strategy:
-      # One platform hitting a transient outage must not cancel the other six.
+      # One platform hitting a transient outage must not cancel the other.
       fail-fast: false
       matrix:
         platform:
           - amd64
+          # LUCX-HOOK: linux/arm64 tarball (Oracle/Hetzner/RPi). Not armv7/v6.
+          - arm64
+          # END LUCX-HOOK
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -77,6 +72,8 @@ jobs:
           # Use Bootlin prebuilt cross-toolchains (musl 1.2.5 in stable series)
           case "${{ matrix.platform }}" in
             amd64) BOOTLIN_ARCH="x86-64" ;;
+            arm64) BOOTLIN_ARCH="aarch64" ;;
+            *) echo "unsupported platform ${{ matrix.platform }}" >&2; exit 1 ;;
           esac
           echo "Resolving Bootlin musl toolchain for arch=$BOOTLIN_ARCH (platform=${{ matrix.platform }})"
           TARBALL_BASE="https://toolchains.bootlin.com/downloads/releases/toolchains/$BOOTLIN_ARCH/tarballs/"
@@ -110,7 +107,7 @@ jobs:
             fi
             LDFLAGS="$LDFLAGS -X github.com/mhsanaei/3x-ui/v3/internal/config.lucxVersion=${TAG_LUCX}"
           fi
-          go build -ldflags "$LDFLAGS" -o xui-release -v main.go
+          go build -buildvcs=true -ldflags "$LDFLAGS" -o xui-release -v .
           file xui-release
           ldd xui-release || echo "Static binary confirmed"
 
@@ -127,7 +124,7 @@ jobs:
           cd x-ui/bin
 
           # Download dependencies
-          Xray_URL="https://github.com/XTLS/Xray-core/releases/download/v26.7.28/"
+          Xray_URL="https://github.com/XTLS/Xray-core/releases/download/v26.9.30/"
           if [ "${{ matrix.platform }}" == "amd64" ]; then
             fetch ${Xray_URL}Xray-linux-64.zip
             unzip Xray-linux-64.zip
@@ -158,15 +155,7 @@ jobs:
             rm -f Xray-linux-s390x.zip
           fi
           rm -f geoip.dat geosite.dat
-          fetch https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
-          fetch https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
-          fetch -O geoip_IR.dat https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geoip.dat
-          fetch -O geosite_IR.dat https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geosite.dat
-          fetch -O geoip_RU.dat https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat
-          fetch -O geosite_RU.dat https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat
-          # LUCX-HOOK: RoscomVPN custom geo (RKN geoblock lists)
-          fetch -O geoip_ROSCOM.dat https://github.com/hydraponique/roscomvpn-geoip/releases/latest/download/geoip.dat
-          fetch -O geosite_ROSCOM.dat https://github.com/hydraponique/roscomvpn-geosite/releases/latest/download/geosite.dat
+          # LUCX-HOOK: slim tarball — geo is fetched by install.sh / update.sh
           # END LUCX-HOOK
           mv xray xray-linux-${{ matrix.platform }}
           # mtg-multi (MTProto sidecar) ships prebuilt release binaries whose
@@ -187,134 +176,119 @@ jobs:
               rm -rf "${MTG_PKG}" "${MTG_PKG}.tar.gz"
               ;;
           esac
-          # LUCX-HOOK: NaiveProxy tunnel sidecar — Caddy with klzgrad's
-          # forward_proxy plugin (naive branch, HTTP/2 padding). amd64 ships
-          # the upstream prebuilt binary (pinned tag); arm64 cross-compiles
-          # the same plugin set via xcaddy (caddy is pure Go). Other matrix
-          # platforms get no binary — the Tunnels page shows "not installed"
-          # and offers upload/download there.
-          CADDY_NAIVE_TAG="v2.11.2-naive"
-          if [ "${{ matrix.platform }}" == "amd64" ]; then
-            fetch -O caddy-naive.tar.xz "https://github.com/klzgrad/forwardproxy/releases/download/${CADDY_NAIVE_TAG}/caddy-forwardproxy-naive.tar.xz"
-            tar -xJf caddy-naive.tar.xz
-            mv caddy-forwardproxy-naive/caddy caddy-naive-linux-amd64
-            rm -rf caddy-forwardproxy-naive caddy-naive.tar.xz
-          elif [ "${{ matrix.platform }}" == "arm64" ]; then
-            go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
-            CGO_ENABLED=0 "$(go env GOPATH)/bin/xcaddy" build \
-              --with github.com/caddyserver/forwardproxy=github.com/klzgrad/forwardproxy@naive \
-              --output caddy-naive-linux-arm64
-          fi
-          # NaiveProxy CLIENT (klzgrad/naiveproxy Chromium) for sidecar
-          # outbounds. Distinct from caddy-naive (server). ~3.3 MB xz.
-          if [ "${{ matrix.platform }}" == "amd64" ] || [ "${{ matrix.platform }}" == "arm64" ]; then
-            NAIVE_CLIENT_TAG="v150.0.7871.63-1"
-            case "${{ matrix.platform }}" in
-              amd64) NAIVE_CLIENT_ARCH="linux-x64" ;;
-              arm64) NAIVE_CLIENT_ARCH="linux-arm64" ;;
-            esac
-            NAIVE_CLIENT_XZ="naiveproxy-${NAIVE_CLIENT_TAG}-${NAIVE_CLIENT_ARCH}.tar.xz"
-            fetch -O "${NAIVE_CLIENT_XZ}" "https://github.com/klzgrad/naiveproxy/releases/download/${NAIVE_CLIENT_TAG}/${NAIVE_CLIENT_XZ}"
-            mkdir -p /tmp/naiveclient
-            tar -xJf "${NAIVE_CLIENT_XZ}" -C /tmp/naiveclient
-            NAIVE_CLIENT_BIN=$(find /tmp/naiveclient -type f -name naive | head -n1)
-            if [ -z "$NAIVE_CLIENT_BIN" ]; then echo "naive missing from ${NAIVE_CLIENT_XZ}"; exit 1; fi
-            mv "$NAIVE_CLIENT_BIN" "naive-client-linux-${{ matrix.platform }}"
-            chmod +x "naive-client-linux-${{ matrix.platform }}"
-            rm -rf /tmp/naiveclient "${NAIVE_CLIENT_XZ}"
-          fi
-          # olcRTC (openlibrecommunity/olcrtc, WTFPL) — TCP-over-WebRTC
-          # tunnel. Built from source with GOTOOLCHAIN=auto so the module's
-          # required Go version is pulled automatically. amd64/arm64 only;
-          # other arches use the Tunnels page upload/download path.
-          # PINNED, never unpinned master: upstream PR #140 (merged
-          # 2026-08-13) replaced the crypto wire format with the OLC2
-          # record layer (HKDF directional keys, "OLC2" framing, replay
-          # window) with NO fallback, breaking every existing client app
-          # (owenclave/olcbox builds predating it). 3339cd36 is the last
-          # master commit before that merge; lucx.112-118 shipped it and
-          # Telemost was verified working. Move the pin only when client
-          # apps ship OLC2 builds (and test a real room end-to-end first).
-          if [ "${{ matrix.platform }}" == "amd64" ] || [ "${{ matrix.platform }}" == "arm64" ]; then
-            OLCRTC_REF="3339cd36716885e583429f97e73462cde4984e2e"
-            git init -q /tmp/olcrtc
-            git -C /tmp/olcrtc remote add origin https://github.com/openlibrecommunity/olcrtc.git
-            git -C /tmp/olcrtc fetch -q --depth 1 origin "${OLCRTC_REF}"
-            git -C /tmp/olcrtc checkout -q FETCH_HEAD
-            ( cd /tmp/olcrtc && GOTOOLCHAIN=auto CGO_ENABLED=0 GOOS=linux GOARCH="${{ matrix.platform }}" \
-                go build -trimpath -ldflags="-s -w" -o "/tmp/olcrtc-linux-${{ matrix.platform }}" ./cmd/olcrtc )
-            mv "/tmp/olcrtc-linux-${{ matrix.platform }}" "olcrtc-linux-${{ matrix.platform }}"
-            rm -rf /tmp/olcrtc
-          fi
-          # qWDTT (SpaceNeuroX/proxy-turn-vk-android server.go, GPL-3.0) —
-          # WireGuard over VK TURN. Single-file server with many deps; we
-          # ship the prebuilt from Bebrik2283555/Ex3-ui (same binary, renamed
-          # extra-qwdtt → qwdtt-linux-{arch}) so CI does not have to pin a
-          # fragile go.mod. amd64/arm64 only.
-          if [ "${{ matrix.platform }}" == "amd64" ] || [ "${{ matrix.platform }}" == "arm64" ]; then
-            EX3_TAG="v1.0"
-            EX3_TGZ="x-ui-linux-${{ matrix.platform }}.tar.gz"
-            fetch -O "${EX3_TGZ}" "https://github.com/Bebrik2283555/Ex3-ui/releases/download/${EX3_TAG}/${EX3_TGZ}"
-            tar -xzf "${EX3_TGZ}" "x-ui/bin/extra-qwdtt"
-            mv x-ui/bin/extra-qwdtt "qwdtt-linux-${{ matrix.platform }}"
-            chmod +x "qwdtt-linux-${{ matrix.platform }}"
-            rm -rf x-ui "${EX3_TGZ}"
-          fi
-          # mieru (enfein/mieru, GPL-3.0) — mita server. Built from a pinned
-          # tag; BinaryName() is mieru-linux-{arch}. amd64/arm64 only.
-          if [ "${{ matrix.platform }}" == "amd64" ] || [ "${{ matrix.platform }}" == "arm64" ]; then
-            MIERU_REF="v3.35.0"
-            git clone --depth 1 --branch "${MIERU_REF}" https://github.com/enfein/mieru.git /tmp/mieru
-            ( cd /tmp/mieru && GOTOOLCHAIN=auto CGO_ENABLED=0 GOOS=linux GOARCH="${{ matrix.platform }}" \
-                go build -trimpath -ldflags="-s -w" -o "/tmp/mieru-linux-${{ matrix.platform }}" ./cmd/mita )
-            mv "/tmp/mieru-linux-${{ matrix.platform }}" "mieru-linux-${{ matrix.platform }}"
-            chmod +x "mieru-linux-${{ matrix.platform }}"
-            ( cd /tmp/mieru && GOTOOLCHAIN=auto CGO_ENABLED=0 GOOS=linux GOARCH="${{ matrix.platform }}" \
-                go build -trimpath -ldflags="-s -w" -o "/tmp/mieru-client-linux-${{ matrix.platform }}" ./cmd/mieru )
-            mv "/tmp/mieru-client-linux-${{ matrix.platform }}" "mieru-client-linux-${{ matrix.platform }}"
-            chmod +x "mieru-client-linux-${{ matrix.platform }}"
-            rm -rf /tmp/mieru
-          fi
-          # TrustTunnel (TrustTunnel/TrustTunnel, Apache-2.0) — prebuilt
-          # trusttunnel_endpoint from the official tarball. amd64=x86_64,
-          # arm64=aarch64. Other arches use Cores-tab upload.
-          if [ "${{ matrix.platform }}" == "amd64" ] || [ "${{ matrix.platform }}" == "arm64" ]; then
-            TT_VER="v1.0.33"
-            case "${{ matrix.platform }}" in
-              amd64) TT_ARCH="x86_64" ;;
-              arm64) TT_ARCH="aarch64" ;;
-            esac
-            TT_TGZ="trusttunnel-${TT_VER}-linux-${TT_ARCH}.tar.gz"
-            fetch -O "${TT_TGZ}" "https://github.com/TrustTunnel/TrustTunnel/releases/download/${TT_VER}/${TT_TGZ}"
-            mkdir -p /tmp/trusttunnel
-            tar -xzf "${TT_TGZ}" -C /tmp/trusttunnel
-            TT_BIN=$(find /tmp/trusttunnel -type f -name trusttunnel_endpoint | head -n1)
-            if [ -z "$TT_BIN" ]; then echo "trusttunnel_endpoint missing from ${TT_TGZ}"; exit 1; fi
-            mv "$TT_BIN" "trusttunnel-linux-${{ matrix.platform }}"
-            chmod +x "trusttunnel-linux-${{ matrix.platform }}"
-            rm -rf /tmp/trusttunnel "${TT_TGZ}"
-            TT_CLIENT_VER="v1.0.49"
-            TT_CLIENT_TGZ="trusttunnel_client-${TT_CLIENT_VER}-linux-${TT_ARCH}.tar.gz"
-            fetch -O "${TT_CLIENT_TGZ}" "https://github.com/TrustTunnel/TrustTunnelClient/releases/download/${TT_CLIENT_VER}/${TT_CLIENT_TGZ}"
-            mkdir -p /tmp/ttclient
-            tar -xzf "${TT_CLIENT_TGZ}" -C /tmp/ttclient
-            TT_CLIENT_BIN=$(find /tmp/ttclient -type f -name trusttunnel_client | head -n1)
-            if [ -z "$TT_CLIENT_BIN" ]; then echo "trusttunnel_client missing from ${TT_CLIENT_TGZ}"; exit 1; fi
-            mv "$TT_CLIENT_BIN" "trusttunnel-client-linux-${{ matrix.platform }}"
-            chmod +x "trusttunnel-client-linux-${{ matrix.platform }}"
-            rm -rf /tmp/ttclient "${TT_CLIENT_TGZ}"
+          # LUCX-HOOK: unpack third_party sidecars into the GitHub tarball so
+          # first install has cores without a second GitHub-raw fetch.
+          # SourceCraft stays SLIM (100 MB) and ships a separate sidecar tar.
+          sidecar_dir="../../third_party/sidecars/linux-${{ matrix.platform }}"
+          if [ -d "$sidecar_dir" ]; then
+            for gz in "$sidecar_dir"/*.gz; do
+              [ -f "$gz" ] || continue
+              name=$(basename "$gz" .gz)
+              gzip -dc "$gz" > "$name"
+              chmod +x "$name"
+            done
           fi
           # END LUCX-HOOK
           cd ../..
 
+      - name: Setup Rust (CSQTT musl)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.97.1'
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
+
+      - name: Setup Zig (CSQTT)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Pack tunnel sidecars
+        run: bash bin/pack-sidecars.sh ${{ matrix.platform }} "$PWD/x-ui/bin"
+
+      - name: Build Telegram WEB proxy sidecars
+        run: |
+          set -euo pipefail
+          DEST="$PWD/x-ui/bin"
+          mkdir -p "$DEST"
+          P="${{ matrix.platform }}"
+          TPROXY_SHA=acc252ece3a25c29e9b83f608499a5567a33ab2a
+          rm -rf /tmp/tproxy-src
+          mkdir /tmp/tproxy-src
+          git -C /tmp/tproxy-src init
+          git -C /tmp/tproxy-src fetch --depth 1 https://github.com/telegramdesktop/tproxy-server.git "$TPROXY_SHA"
+          git -C /tmp/tproxy-src checkout FETCH_HEAD
+          (cd /tmp/tproxy-src && CGO_ENABLED=0 GOOS=linux GOARCH="$P" go build -trimpath -ldflags='-s -w' -o "$DEST/tproxy-linux-${P}" ./cmd/tproxy-server)
+          chmod +x "$DEST/tproxy-linux-${P}"
+          if [ "$P" != amd64 ]; then
+            exit 0
+          fi
+          MTPROXY_SHA=f36d8af769ffaeac36978d38c2c0f6d1104c2137
+          MTPROXY_SUM=919795c416b870670841a21d1930ad97a24c7b84b9eb8c6f9e3de32f2fdf4655
+          curl -fsSL -o /tmp/MTProxy.tar.gz "https://github.com/TelegramMessenger/MTProxy/archive/${MTPROXY_SHA}.tar.gz"
+          echo "${MTPROXY_SUM}  /tmp/MTProxy.tar.gz" | sha256sum -c
+          rm -rf /tmp/MTProxy
+          mkdir /tmp/MTProxy
+          tar -C /tmp/MTProxy --strip-components=1 -xzf /tmp/MTProxy.tar.gz
+          docker run --rm --user 0 -v /tmp/MTProxy:/src -w /src ubuntu:22.04 bash -lc \
+            'apt-get update -qq && apt-get install -y -qq --no-install-recommends gcc make libssl-dev zlib1g-dev >/dev/null && make -j"$(nproc)"'
+          cp /tmp/MTProxy/objs/bin/mtproto-proxy "$DEST/mtproxy-linux-${P}"
+          chmod +x "$DEST/mtproxy-linux-${P}"
+          if readelf -V "$DEST/mtproxy-linux-${P}" | grep -E 'GLIBC_2\.(3[6-9]|[4-9][0-9])'; then
+            echo "mtproxy linked against glibc newer than 2.35 (breaks Debian 12)" >&2
+            exit 1
+          fi
+
+      - name: Pin sidecar hashes
+        run: |
+          set -euo pipefail
+          P="${{ matrix.platform }}"
+          : > x-ui/bin/lucx-pins.txt
+          for c in caddy-naive naive-client olcrtc qwdtt csqtt mieru mieru-client trusttunnel trusttunnel-client anytls tproxy caddy-layer4; do
+            f="x-ui/bin/${c}-linux-${P}"
+            [ -x "$f" ] || continue
+            echo "${c}-linux-${P} $(sha256sum "$f" | awk '{print $1}')" >> x-ui/bin/lucx-pins.txt
+          done
+          if [ "$P" = amd64 ] && [ -x x-ui/bin/mtproxy-linux-amd64 ]; then
+            echo "mtproxy-linux-amd64 $(sha256sum x-ui/bin/mtproxy-linux-amd64 | awk '{print $1}')" >> x-ui/bin/lucx-pins.txt
+          fi
+          test -s x-ui/bin/lucx-pins.txt
+
       - name: Package
-        run: tar -zcvf x-ui-linux-${{ matrix.platform }}.tar.gz x-ui
+        run: |
+          tar -zcvf x-ui-linux-${{ matrix.platform }}.tar.gz x-ui
+          sha256sum x-ui-linux-${{ matrix.platform }}.tar.gz > x-ui-linux-${{ matrix.platform }}.tar.gz.sha256
+
+      - name: Check tarball layout
+        run: |
+          set -euo pipefail
+          P="${{ matrix.platform }}"
+          tar -tzf "x-ui-linux-${P}.tar.gz" | tee /tmp/list
+          for f in x-ui/x-ui x-ui/x-ui.sh "x-ui/bin/xray-linux-${P}" "x-ui/bin/mtg-linux-${P}" x-ui/bin/install-awg-module.sh x-ui/bin/lucx-pins.txt; do
+            grep -Fxq "$f" /tmp/list || { echo "missing $f"; exit 1; }
+          done
+          for c in caddy-naive naive-client olcrtc qwdtt csqtt mieru mieru-client trusttunnel trusttunnel-client anytls tproxy caddy-layer4; do
+            grep -Fxq "x-ui/bin/${c}-linux-${P}" /tmp/list || { echo "missing ${c}-linux-${P}"; exit 1; }
+          done
+          if [ "$P" = amd64 ]; then
+            grep -Fxq "x-ui/bin/mtproxy-linux-amd64" /tmp/list || { echo "missing mtproxy-linux-amd64"; exit 1; }
+          fi
+          if [ "$P" != amd64 ] && grep -E 'linux-amd64' /tmp/list; then
+            echo "arm64 tarball contains amd64 binaries" >&2
+            exit 1
+          fi
 
       - name: Upload files to Artifacts
         uses: actions/upload-artifact@v7
         with:
           name: x-ui-linux-${{ matrix.platform }}
-          path: ./x-ui-linux-${{ matrix.platform }}.tar.gz
+          path: |
+            ./x-ui-linux-${{ matrix.platform }}.tar.gz
+            ./x-ui-linux-${{ matrix.platform }}.tar.gz.sha256
 
       - name: Upload files to GH release
         uses: svenstaro/upload-release-action@v2
@@ -322,16 +296,150 @@ jobs:
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           tag: ${{ github.ref_name }}
-          file: x-ui-linux-${{ matrix.platform }}.tar.gz
-          asset_name: x-ui-linux-${{ matrix.platform }}.tar.gz
+          file: x-ui-linux-${{ matrix.platform }}.tar.gz*
+          file_glob: true
           overwrite: true
           # LUCX-HOOK: publish tagged builds as stable, not pre-release, so
           # /releases/latest resolves to our newest lucx tag — install.sh and
           # the panel's stable update channel both read that endpoint.
-          # Upstream's Windows build job is intentionally not ported: AWG needs
-          # the amneziawg Linux kernel module.
           prerelease: false
           # END LUCX-HOOK
+
+  # =================================
+  #  Windows Build
+  # =================================
+  build-windows:
+    name: Build for Windows
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        platform:
+          - amd64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      # Frontend dist must be built BEFORE go build — see comment on the
+      # Linux job above. This step is identical except npm runs on the
+      # Windows runner here.
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend bundle
+        shell: pwsh
+        run: |
+          npm ci
+          npm run build
+        working-directory: frontend
+
+      - name: Install MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-sqlite3
+            mingw-w64-x86_64-pkg-config
+
+      - name: Build 3X-UI for Windows (CGO)
+        shell: msys2 {0}
+        run: |
+          export PATH="/c/hostedtoolcache/windows/go/$(ls /c/hostedtoolcache/windows/go | sort -V | tail -n1)/x64/bin:$PATH"
+
+          export CGO_ENABLED=1
+          export GOOS=windows
+          export GOARCH=amd64
+          export CC=x86_64-w64-mingw32-gcc
+
+          which go
+          go version
+          gcc --version
+
+          # Stamp the commit into per-commit (dev channel) builds only.
+          LDFLAGS="-w -s"
+          if [[ "$GITHUB_REF" != refs/tags/* ]]; then
+            LDFLAGS="$LDFLAGS -X github.com/mhsanaei/3x-ui/v3/internal/config.buildCommit=${GITHUB_SHA:0:8} -X github.com/mhsanaei/3x-ui/v3/internal/config.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          fi
+          go build -buildvcs=true -ldflags "$LDFLAGS" -o xui-release.exe -v .
+
+      - name: Copy and download resources
+        shell: pwsh
+        run: |
+          $retry = @{ MaximumRetryCount = 5; RetryIntervalSec = 10 }
+          mkdir x-ui
+          Copy-Item xui-release.exe x-ui\x-ui.exe
+          mkdir x-ui\bin
+          cd x-ui\bin
+
+          # Download Xray for Windows
+          $Xray_URL = "https://github.com/XTLS/Xray-core/releases/download/v26.9.30/"
+          Invoke-WebRequest @retry -Uri "${Xray_URL}Xray-windows-64.zip" -OutFile "Xray-windows-64.zip"
+          Expand-Archive -Path "Xray-windows-64.zip" -DestinationPath .
+          Remove-Item "Xray-windows-64.zip"
+          Remove-Item geoip.dat, geosite.dat -ErrorAction SilentlyContinue
+          Invoke-WebRequest @retry -Uri "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" -OutFile "geoip.dat"
+          Invoke-WebRequest @retry -Uri "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" -OutFile "geosite.dat"
+          Invoke-WebRequest @retry -Uri "https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geoip.dat" -OutFile "geoip_IR.dat"
+          Invoke-WebRequest @retry -Uri "https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geosite.dat" -OutFile "geosite_IR.dat"
+          Invoke-WebRequest @retry -Uri "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat" -OutFile "geoip_RU.dat"
+          Invoke-WebRequest @retry -Uri "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat" -OutFile "geosite_RU.dat"
+          Rename-Item xray.exe xray-windows-amd64.exe
+
+          # mtg-multi (MTProto sidecar) publishes a prebuilt Windows binary, so
+          # download and unpack it instead of compiling. The tag comes from the
+          # release-page redirect on github.com — not api.github.com, whose
+          # outages have failed release runs while asset downloads kept working.
+          $MTG_MULTI_VER = (curl.exe -sf --retry 5 --retry-all-errors --retry-delay 3 -o NUL -w '%{redirect_url}' "https://github.com/mhsanaei/mtg-multi/releases/latest") -replace '^.*/releases/tag/', ''
+          if (-not $MTG_MULTI_VER -or $MTG_MULTI_VER -notmatch '^v[\d.]+$') { throw "could not resolve the latest mtg-multi release tag" }
+          $MTG_PKG = "mtg-multi-$($MTG_MULTI_VER.TrimStart('v'))-windows-amd64"
+          curl.exe -sfLRO --retry 5 --retry-all-errors --retry-delay 3 "https://github.com/mhsanaei/mtg-multi/releases/download/$MTG_MULTI_VER/$MTG_PKG.zip"
+          Expand-Archive -Path "$MTG_PKG.zip" -DestinationPath "mtg-tmp" -Force
+          Move-Item "mtg-tmp/$MTG_PKG/mtg-multi.exe" "mtg-windows-amd64.exe"
+          Remove-Item -Recurse -Force "mtg-tmp", "$MTG_PKG.zip"
+
+          cd ..
+          Copy-Item -Path ..\windows_files\* -Destination . -Recurse
+          cd ..
+
+      - name: Package to Zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path .\x-ui -DestinationPath "x-ui-windows-amd64.zip"
+          $hash = (Get-FileHash x-ui-windows-amd64.zip -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText("$PWD\x-ui-windows-amd64.zip.sha256", "$hash  x-ui-windows-amd64.zip`n")
+
+      - name: Upload files to Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: x-ui-windows-amd64
+          path: |
+            ./x-ui-windows-amd64.zip
+            ./x-ui-windows-amd64.zip.sha256
+
+      - name: Upload files to GH release
+        uses: svenstaro/upload-release-action@v2
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ github.ref_name }}
+          file: x-ui-windows-amd64.zip*
+          file_glob: true
+          overwrite: true
+          prerelease: false
 
   # =================================
   #  Rolling dev channel (per-commit)
@@ -397,9 +505,6 @@ jobs:
               --target "${COMMIT}" --title "Dev build ${short}" --notes "${notes}"
           fi
 
-          # LUCX-HOOK: only Linux tarballs — the fork does not publish the
-          # upstream Windows build (AWG is a Linux kernel module, so a Windows
-          # panel cannot run the sidecar at all). Upstream's glob also lists
-          # dev-artifacts/*.zip, which would fail here with no zip artifact.
-          retry gh release upload dev-latest dev-artifacts/*.tar.gz --clobber
+          # LUCX-HOOK: Linux tarballs only (amd64+arm64).
+          retry gh release upload dev-latest dev-artifacts/*.tar.gz dev-artifacts/*.sha256 --clobber
           # END LUCX-HOOK

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/json"
 	"net/netip"
 	"path/filepath"
 	"strings"
@@ -12,9 +13,92 @@ import (
 	"github.com/mhsanaei/3x-ui/v3/internal/web/runtime"
 )
 
+func TestInboundAwgHints_HIndexesStayAligned(t *testing.T) {
+	settings := `{"address":"10.200.0.1/24","jc":4,"jmin":10,"jmax":50,"s1":40,"s2":60,"h1":"1-10","h3":"30-40","h4":"50-60","awgVersion":"2"}`
+	_, obf, _ := inboundAwgHints(settings, true)
+	if !strings.Contains(obf, "H1 = 1-10") || !strings.Contains(obf, "H3 = 30-40") || !strings.Contains(obf, "H4 = 50-60") {
+		t.Fatalf("H labels misaligned:\n%s", obf)
+	}
+	if strings.Contains(obf, "H2 =") {
+		t.Fatalf("empty H2 must stay omitted:\n%s", obf)
+	}
+}
+
 func TestInboundHasSidecar(t *testing.T) {
-	if !inboundHasSidecar(model.Naive) || !inboundHasSidecar(model.AWG) || inboundHasSidecar(model.VLESS) {
+	if !inboundHasSidecar(model.Naive) || !inboundHasSidecar(model.AWG) || !inboundHasSidecar(model.Csqtt) || inboundHasSidecar(model.VLESS) {
 		t.Fatal("sidecar protocols must teardown on delete even when disabled")
+	}
+}
+
+func TestLucxRuntimeSidecar_NotXrayProtocols(t *testing.T) {
+	for _, p := range []model.Protocol{
+		model.AWG, model.Naive, model.Olcrtc, model.Qwdtt, model.Csqtt,
+		model.Mieru, model.TrustTunnel, model.Anytls, model.Tproxy, model.Cover, model.Gateway,
+	} {
+		if !lucxRuntimeSidecar(p) {
+			t.Fatalf("%s must not be emitted as an xray inbound", p)
+		}
+	}
+	if lucxRuntimeSidecar(model.VLESS) {
+		t.Fatal("vless must reach xray")
+	}
+}
+
+func TestStripAwgRouteSettings(t *testing.T) {
+	// Routing off → mode/port/tag are removed, nothing else changes.
+	ib := &model.Inbound{Protocol: model.AWG, Settings: `{"privateKey":"k","routeThroughXray":false,"xrayRoutingMode":"tproxy","tproxyPort":51453,"outboundTag":"warp"}`}
+	stripAwgRouteSettings(ib)
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(ib.Settings), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"xrayRoutingMode", "tproxyPort", "outboundTag"} {
+		if _, ok := parsed[key]; ok {
+			t.Fatalf("routing off must drop %s: %s", key, ib.Settings)
+		}
+	}
+	if parsed["privateKey"] != "k" || parsed["routeThroughXray"] != false {
+		t.Fatalf("other fields must survive: %s", ib.Settings)
+	}
+
+	// Routing on → untouched.
+	const routed = `{"routeThroughXray":true,"xrayRoutingMode":"tproxy","tproxyPort":51453}`
+	ib = &model.Inbound{Protocol: model.AWG, Settings: routed}
+	stripAwgRouteSettings(ib)
+	if ib.Settings != routed {
+		t.Fatalf("routed settings must pass through: %s", ib.Settings)
+	}
+
+	// No stale keys and routing off → untouched (no churn on legacy rows).
+	const plain = `{"privateKey":"k","routeThroughXray":false}`
+	ib = &model.Inbound{Protocol: model.AWG, Settings: plain}
+	stripAwgRouteSettings(ib)
+	if ib.Settings != plain {
+		t.Fatalf("plain settings must pass through: %s", ib.Settings)
+	}
+
+	// Non-AWG → no-op.
+	ib = &model.Inbound{Protocol: model.VLESS, Settings: plain}
+	stripAwgRouteSettings(ib)
+	if ib.Settings != plain {
+		t.Fatal("vless must not be touched")
+	}
+}
+
+func TestAddInbound_ToggledOffAwgDropsRouteKeys(t *testing.T) {
+	initAwgServiceTest(t)
+	svc := &InboundService{}
+	ib := routedAwgTestInbound(40196)
+	ib.Settings = `{"privateKey":"test-priv","address":"10.8.0.1/24","routeThroughXray":false,"xrayRoutingMode":"tproxy","tproxyPort":51453,"outboundTag":"warp","clients":[]}`
+	if _, _, err := svc.AddInbound(ib); err != nil {
+		t.Fatalf("AddInbound: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(ib.Settings), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := parsed["xrayRoutingMode"]; ok {
+		t.Fatalf("create must strip stale routing keys, got %s", ib.Settings)
 	}
 }
 
@@ -168,7 +252,7 @@ func TestInboundAwgHints_HeaderProtectionKeyVersionGated(t *testing.T) {
 		{"no version", base + `,"headerProtectionKey":"aBcD...base64hpk=="}`, false, "2"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, obf, ver := inboundAwgHints(tc.settings)
+			_, obf, ver := inboundAwgHints(tc.settings, true)
 			if strings.Contains(obf, "HeaderProtectionKey") != tc.wantHPK {
 				t.Errorf("HeaderProtectionKey in block = %v, want %v, got:\n%s", !tc.wantHPK, tc.wantHPK, obf)
 			}
@@ -209,7 +293,7 @@ func TestInboundAwgHints_DeviceFieldsEmission(t *testing.T) {
 		{"no version all set", base + `,` + fields + `}`, []bool{false, false, false, false, false, false}, "2"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, obf, ver := inboundAwgHints(tc.settings)
+			_, obf, ver := inboundAwgHints(tc.settings, true)
 			for i, line := range deviceLines {
 				got := strings.Contains(obf, line)
 				if got != tc.want[i] {
@@ -255,5 +339,162 @@ func TestAwgOutboundSubnetConflict(t *testing.T) {
 				t.Errorf("awgOutboundSubnetConflict(%v, %q) = %v, want %v", tc.newNet, tc.outAddr, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestInboundAwgHints_DropsOversizedIFields pins the same all-or-nothing gate
+// renderServerConf already has: an oversized set must vanish whole.
+func TestInboundAwgHints_DropsOversizedIFields(t *testing.T) {
+	huge := strings.Repeat("x", 712) // 5 fields x 712 chars = 3600 IBytes, over the worst-case budget
+	settings := `{"address":"10.8.0.1/24","awgVersion":"2",` +
+		`"i1":"` + huge + `","i2":"` + huge + `","i3":"` + huge + `","i4":"` + huge + `","i5":"` + huge + `"}`
+	_, obf, _ := inboundAwgHints(settings, true)
+	for _, key := range []string{"I1 = ", "I2 = ", "I3 = ", "I4 = ", "I5 = "} {
+		if strings.Contains(obf, key) {
+			t.Errorf("oversized I-set must be dropped whole, found %q in block", key)
+		}
+	}
+}
+
+// TestInboundAwgHints_NodeInboundKeepsAwg3Fields pins localInbound as the only
+// switch gating 3.x fields on this host's own tools-support probe.
+func TestInboundAwgHints_NodeInboundKeepsAwg3Fields(t *testing.T) {
+	unsupported := false
+	awg.SetModuleSupportsAwg3(&unsupported)
+	awg.SetModuleSupportsAwg31(&unsupported)
+	t.Cleanup(func() {
+		awg.SetModuleSupportsAwg3(nil)
+		awg.SetModuleSupportsAwg31(nil)
+	})
+	const settings = `{"address":"10.8.0.1/24","jc":8,"jmin":50,"jmax":200,"s1":30,"s2":40,"s3":20,"s4":15,` +
+		`"awgVersion":"3.1","headerProtectionKey":"aBcD...base64hpk==","randomTrailers":true}`
+
+	for _, tc := range []struct {
+		name         string
+		localInbound bool
+		wantPresent  bool
+	}{
+		{"node inbound keeps fields the host cannot itself confirm", false, true},
+		{"local inbound is still gated on this host's own probe", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, obf, _ := inboundAwgHints(settings, tc.localInbound)
+			if strings.Contains(obf, "HeaderProtectionKey") != tc.wantPresent {
+				t.Errorf("HeaderProtectionKey present = %v, want %v, got:\n%s", !tc.wantPresent, tc.wantPresent, obf)
+			}
+			if strings.Contains(obf, "RandomTrailers") != tc.wantPresent {
+				t.Errorf("RandomTrailers present = %v, want %v, got:\n%s", !tc.wantPresent, tc.wantPresent, obf)
+			}
+		})
+	}
+}
+
+// A field of blanks is not a value: "H1 =  " or a blank key makes awg setconf
+// reject the whole file, exactly as the empty ones the .conf renderers skip.
+func TestInboundAwgHints_BlankFieldsAreNotValues(t *testing.T) {
+	awg3 := true
+	awg.SetModuleSupportsAwg3(&awg3)
+	t.Cleanup(func() { awg.SetModuleSupportsAwg3(nil) })
+	const base = `{"address":"10.8.0.1/24","jc":8,"jmin":50,"jmax":200,"s1":30,"s2":40`
+	for _, tc := range []struct {
+		name, settings, absent, present string
+	}{
+		{"blank header", base + `,"awgVersion":"2","h1":"   ","h2":"600-900"}`, "H1 =", "H2 = 600-900"},
+		{"blank key", base + `,"awgVersion":"3","headerProtectionKey":"   "}`, "HeaderProtectionKey", "Jc = 8"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, obf, _ := inboundAwgHints(tc.settings, true)
+			if strings.Contains(obf, tc.absent) {
+				t.Errorf("%q must not reach the export, got:\n%q", tc.absent, obf)
+			}
+			if !strings.Contains(obf, tc.present) {
+				t.Errorf("the rest of the block must survive, %q missing from:\n%q", tc.present, obf)
+			}
+		})
+	}
+}
+
+// A blank I-field is not a value: this block is pasted verbatim into the client
+// card and the vpn:// line, where "I1 =" makes awg setconf refuse the file.
+func TestInboundAwgHints_BlankIFieldIsNotAValue(t *testing.T) {
+	const base = `{"address":"10.8.0.1/24","awgVersion":"2","jc":8,"jmin":50,"jmax":200,"s1":30,"s2":40`
+	for _, tc := range []struct{ name, i1, want string }{
+		{"blanks only", "   ", ""},
+		// Padding around a value reaches no tag parser, so it is not part of
+		// the value and the export carries the trimmed form.
+		{"whitespace edges are trimmed off", " <b 0x00> ", "I1 = <b 0x00>\n"},
+		{"plain descriptor", "<b 0x00>", "I1 = <b 0x00>\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, obf, _ := inboundAwgHints(base+`,"i1":"`+tc.i1+`","i2":"<b 0xff>"}`, true)
+			switch {
+			case tc.want == "" && strings.Contains(obf, "I1"):
+				t.Errorf("blank I1 %q must not reach the export, got:\n%s", tc.i1, obf)
+			case tc.want != "" && !strings.Contains(obf, tc.want):
+				t.Errorf("missing %q, got:\n%s", tc.want, obf)
+			}
+			if !strings.Contains(obf, "I2 = <b 0xff>\n") {
+				t.Errorf("the rest of the I-set must survive, got:\n%s", obf)
+			}
+		})
+	}
+}
+
+// S1-S4 = 0 means "do not pad", not "unset": a client that finds no line
+// substitutes its own non-zero default and the handshake sizes diverge.
+func TestInboundAwgHints_ZeroPaddingSizesStayInBlock(t *testing.T) {
+	cases := []struct {
+		name     string
+		settings string
+		want     []string
+		absent   []string
+	}{
+		{
+			name:     "v2 keeps all four zeros",
+			settings: `{"address":"10.200.0.1/24","s1":0,"s2":0,"s3":0,"s4":0,"awgVersion":"2"}`,
+			want:     []string{"S1 = 0", "S2 = 0", "S3 = 0", "S4 = 0"},
+		},
+		{
+			name:     "v1.5 keeps the zeros it owns and still drops S3/S4",
+			settings: `{"address":"10.200.0.1/24","s1":0,"s2":0,"s3":0,"s4":0,"awgVersion":"1.5"}`,
+			want:     []string{"S1 = 0", "S2 = 0"},
+			absent:   []string{"S3 =", "S4 ="},
+		},
+		{
+			name:     "v2 mixed set keeps the zero member",
+			settings: `{"address":"10.200.0.1/24","s1":30,"s2":0,"s3":0,"s4":80,"awgVersion":"2"}`,
+			want:     []string{"S1 = 30", "S2 = 0", "S3 = 0", "S4 = 80"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, obf, _ := inboundAwgHints(tc.settings, true)
+			for _, w := range tc.want {
+				if !strings.Contains(obf, w) {
+					t.Fatalf("missing %q in block:\n%s", w, obf)
+				}
+			}
+			for _, a := range tc.absent {
+				if strings.Contains(obf, a) {
+					t.Fatalf("unexpected %q in block:\n%s", a, obf)
+				}
+			}
+		})
+	}
+}
+
+// <c> exists in the kernel module and not in the embedded engine, which aborts
+// its config merge on it after it has already dropped every peer. Whichever
+// engine the client runs, one bad field must not cost it the other four.
+func TestInboundAwgHints_UnportableIFieldIsDroppedAlone(t *testing.T) {
+	const base = `{"address":"10.8.0.1/24","awgVersion":"2","jc":8,"jmin":50,"jmax":200,"s1":30,"s2":40`
+	_, obf, _ := inboundAwgHints(base+`,"i1":"<b 0x01>","i2":"<t>","i3":"<c>","i4":"<r 8>","i5":"<rc 4>"}`, true)
+	if strings.Contains(obf, "I3") {
+		t.Errorf("<c> must not reach the export, got:\n%s", obf)
+	}
+	for _, want := range []string{"I1 = <b 0x01>\n", "I2 = <t>\n", "I4 = <r 8>\n", "I5 = <rc 4>\n"} {
+		if !strings.Contains(obf, want) {
+			t.Errorf("missing %q — grammar is a property of one field, not of the set, got:\n%s", want, obf)
+		}
 	}
 }

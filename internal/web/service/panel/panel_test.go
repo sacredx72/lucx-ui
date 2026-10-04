@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/config"
+	"github.com/mhsanaei/3x-ui/v3/internal/util/version"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service"
 )
 
@@ -84,10 +85,10 @@ func TestFilterReleasePage_EmptyNilSafe(t *testing.T) {
 }
 
 func TestCompareVersionStringsRejectsUnexpectedFormats(t *testing.T) {
-	if _, ok := compareVersionStrings("latest", "2.9.3"); ok {
+	if _, ok := version.Compare("latest", "2.9.3"); ok {
 		t.Fatal("expected non-semver latest tag to be rejected")
 	}
-	if _, ok := compareVersionStrings("v2.9", "2.9.3"); ok {
+	if _, ok := version.Compare("v2.9", "2.9.3"); ok {
 		t.Fatal("expected short version to be rejected")
 	}
 }
@@ -99,6 +100,50 @@ func TestShellQuote(t *testing.T) {
 	if got := shellQuote("/tmp/a'b"); got != "'/tmp/a'\\''b'" {
 		t.Fatalf("unexpected quote result with single quote: %s", got)
 	}
+}
+
+// TestUpdateProxyEnvVars covers the bug this function fixes: ambient proxy
+// vars must reach update.sh's systemd-run child, which inherits nothing.
+func TestUpdateProxyEnvVars(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows env var names are case-insensitive, so both spellings resolve; the updater runs only on Linux")
+	}
+	allKeys := []string{"https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY", "http_proxy", "HTTP_PROXY", "no_proxy", "NO_PROXY"}
+	clearAll := func(t *testing.T) {
+		t.Helper()
+		for _, key := range allKeys {
+			t.Setenv(key, "")
+		}
+	}
+
+	t.Run("nothing set returns nil", func(t *testing.T) {
+		clearAll(t)
+		if got := updateProxyEnvVars(); got != nil {
+			t.Fatalf("updateProxyEnvVars() = %v, want nil", got)
+		}
+	})
+
+	t.Run("forwards each set var under its own name", func(t *testing.T) {
+		clearAll(t)
+		t.Setenv("https_proxy", "socks5://127.0.0.1:10808")
+		t.Setenv("no_proxy", "10.0.0.0/8,localhost")
+		got := updateProxyEnvVars()
+		want := []string{"https_proxy=socks5://127.0.0.1:10808", "no_proxy=10.0.0.0/8,localhost"}
+		if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+			t.Fatalf("updateProxyEnvVars() = %v, want %v", got, want)
+		}
+	})
+
+	// A deliberately HTTP-only proxy config must not silently gain HTTPS traffic.
+	t.Run("http_proxy is not promoted to https_proxy", func(t *testing.T) {
+		clearAll(t)
+		t.Setenv("http_proxy", "http://127.0.0.1:8080")
+		got := updateProxyEnvVars()
+		want := []string{"http_proxy=http://127.0.0.1:8080"}
+		if len(got) != len(want) || got[0] != want[0] {
+			t.Fatalf("updateProxyEnvVars() = %v, want %v", got, want)
+		}
+	})
 }
 
 func TestExtractReleaseCommit(t *testing.T) {

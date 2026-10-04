@@ -7,16 +7,70 @@
 package controller
 
 import (
+	"io"
 	"os"
-	"runtime"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/mhsanaei/3x-ui/v3/internal/util/common"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
 	"github.com/mhsanaei/3x-ui/v3/internal/lucx/tunnel"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service"
 )
+
+const coreUploadMax = 200 << 20
+
+func saveCoreUpload(c *gin.Context, dst string) error {
+	file, err := c.FormFile("file")
+	if err != nil {
+		return err
+	}
+	if file.Size > coreUploadMax {
+		return common.NewError("upload exceeds 200 MB")
+	}
+	src, err := file.Open()
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	var magic [4]byte
+	if _, err := io.ReadFull(src, magic[:]); err != nil {
+		return common.NewError("upload is not an ELF binary")
+	}
+	if string(magic[:]) != "\x7fELF" {
+		return common.NewError("upload is not an ELF binary")
+	}
+	tmp := dst + ".upload"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	if err != nil {
+		return err
+	}
+	if _, err := out.Write(magic[:]); err != nil {
+		_ = out.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	n, err := io.Copy(out, io.LimitReader(src, coreUploadMax+1-4))
+	if closeErr := out.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if n > coreUploadMax {
+		_ = os.Remove(tmp)
+		return common.NewError("upload exceeds 200 MB")
+	}
+	_ = os.Remove(dst)
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
 
 // TunnelController exposes the external tunnel sidecars (NaiveProxy caddy):
 // config CRUD, lifecycle, logs, Caddyfile preview/validation and binary
@@ -92,6 +146,13 @@ func (a *TunnelController) initRouter(g *gin.RouterGroup) {
 	qwdtt.POST("/download", a.qwdttDownloadBinary)
 	qwdtt.POST("/deleteBinary", a.qwdttDeleteBinary)
 
+	csqtt := g.Group("/csqtt")
+	csqtt.GET("/status", a.csqttStatus)
+	csqtt.GET("/logs", a.csqttLogs)
+	csqtt.POST("/upload", a.csqttUploadBinary)
+	csqtt.POST("/download", a.csqttDownloadBinary)
+	csqtt.POST("/deleteBinary", a.csqttDeleteBinary)
+
 	// mieru is inbound-only (no legacy config/lifecycle): status, logs and
 	// binary management for the Settings → Cores page.
 	mieru := g.Group("/mieru")
@@ -107,6 +168,31 @@ func (a *TunnelController) initRouter(g *gin.RouterGroup) {
 	trusttunnel.POST("/upload", a.trustTunnelUploadBinary)
 	trusttunnel.POST("/download", a.trustTunnelDownloadBinary)
 	trusttunnel.POST("/deleteBinary", a.trustTunnelDeleteBinary)
+
+	// anytls is inbound-only (no legacy config/lifecycle): status, logs and
+	// binary management for the Settings → Cores page.
+	anytls := g.Group("/anytls")
+	anytls.GET("/status", a.anytlsStatus)
+	anytls.GET("/logs", a.anytlsLogs)
+	anytls.POST("/upload", a.anytlsUploadBinary)
+	anytls.POST("/download", a.anytlsDownloadBinary)
+	anytls.POST("/deleteBinary", a.anytlsDeleteBinary)
+
+	tproxy := g.Group("/tproxy")
+	tproxy.GET("/status", a.tproxyStatus)
+	tproxy.GET("/logs", a.tproxyLogs)
+	tproxy.POST("/upload", a.tproxyUploadBinary)
+	tproxy.POST("/download", a.tproxyDownloadBinary)
+	tproxy.POST("/deleteBinary", a.tproxyDeleteBinary)
+	tproxy.POST("/uploadSite", a.tproxyUploadSite)
+	tproxy.GET("/site", a.tproxySiteFiles)
+
+	mtproxy := g.Group("/mtproxy")
+	mtproxy.GET("/status", a.mtproxyStatus)
+	mtproxy.GET("/logs", a.mtproxyLogs)
+	mtproxy.POST("/upload", a.mtproxyUploadBinary)
+	mtproxy.POST("/download", a.mtproxyDownloadBinary)
+	mtproxy.POST("/deleteBinary", a.mtproxyDeleteBinary)
 }
 
 func (a *TunnelController) status(c *gin.Context) {
@@ -214,21 +300,11 @@ func (a *TunnelController) validate(c *gin.Context) {
 // The route is exempt from the global body limit in web.go because caddy
 // builds are ~50 MB.
 func (a *TunnelController) uploadBinary(c *gin.Context) {
-	file, err := c.FormFile("file")
-	if err != nil {
-		jsonMsg(c, "tunnel: upload failed", err)
-		return
-	}
 	dst := tunnel.Naive.BinaryPath()
-	if err := c.SaveUploadedFile(file, dst); err != nil {
+	if err := saveCoreUpload(c, dst); err != nil {
 		logger.Warning("tunnel: save uploaded binary failed:", err)
 		jsonMsg(c, "tunnel: upload failed", err)
 		return
-	}
-	if runtime.GOOS != "windows" {
-		if err := os.Chmod(dst, 0o755); err != nil {
-			logger.Warning("tunnel: chmod uploaded binary failed:", err)
-		}
 	}
 	jsonMsg(c, I18nWeb(c, "pages.tunnels.naive.toasts.uploaded"), nil)
 }
@@ -341,21 +417,11 @@ func (a *TunnelController) olcrtcPreview(c *gin.Context) {
 }
 
 func (a *TunnelController) olcrtcUploadBinary(c *gin.Context) {
-	file, err := c.FormFile("file")
-	if err != nil {
-		jsonMsg(c, "tunnel: olcrtc upload failed", err)
-		return
-	}
 	dst := tunnel.Olcrtc.BinaryPath()
-	if err := c.SaveUploadedFile(file, dst); err != nil {
+	if err := saveCoreUpload(c, dst); err != nil {
 		logger.Warning("tunnel: save uploaded olcrtc binary failed:", err)
 		jsonMsg(c, "tunnel: olcrtc upload failed", err)
 		return
-	}
-	if runtime.GOOS != "windows" {
-		if err := os.Chmod(dst, 0o755); err != nil {
-			logger.Warning("tunnel: chmod uploaded olcrtc binary failed:", err)
-		}
 	}
 	jsonMsg(c, I18nWeb(c, "pages.tunnels.olcrtc.toasts.uploaded"), nil)
 }
@@ -445,21 +511,11 @@ func (a *TunnelController) qwdttLogs(c *gin.Context) {
 }
 
 func (a *TunnelController) qwdttUploadBinary(c *gin.Context) {
-	file, err := c.FormFile("file")
-	if err != nil {
-		jsonMsg(c, "tunnel: qwdtt upload failed", err)
-		return
-	}
 	dst := tunnel.Qwdtt.BinaryPath()
-	if err := c.SaveUploadedFile(file, dst); err != nil {
+	if err := saveCoreUpload(c, dst); err != nil {
 		logger.Warning("tunnel: save uploaded qwdtt binary failed:", err)
 		jsonMsg(c, "tunnel: qwdtt upload failed", err)
 		return
-	}
-	if runtime.GOOS != "windows" {
-		if err := os.Chmod(dst, 0o755); err != nil {
-			logger.Warning("tunnel: chmod uploaded qwdtt binary failed:", err)
-		}
 	}
 	jsonMsg(c, I18nWeb(c, "pages.tunnels.qwdtt.toasts.uploaded"), nil)
 }
@@ -485,6 +541,56 @@ func (a *TunnelController) qwdttDeleteBinary(c *gin.Context) {
 	jsonMsg(c, I18nWeb(c, "pages.tunnels.qwdtt.toasts.deleted"), nil)
 }
 
+func (a *TunnelController) csqttStatus(c *gin.Context) {
+	st, err := a.svc.CsqttStatus()
+	if err != nil {
+		jsonMsg(c, "tunnel: csqtt status failed", err)
+		return
+	}
+	jsonObj(c, st, nil)
+}
+
+func (a *TunnelController) csqttLogs(c *gin.Context) {
+	lines := 200
+	if n := c.Query("lines"); n != "" {
+		if parsed, err := strconv.Atoi(n); err == nil && parsed > 0 {
+			lines = parsed
+		}
+	}
+	jsonObj(c, a.svc.CsqttLogs(lines), nil)
+}
+
+func (a *TunnelController) csqttUploadBinary(c *gin.Context) {
+	dst := tunnel.Csqtt.BinaryPath()
+	if err := saveCoreUpload(c, dst); err != nil {
+		logger.Warning("tunnel: save uploaded csqtt binary failed:", err)
+		jsonMsg(c, "tunnel: csqtt upload failed", err)
+		return
+	}
+	jsonMsg(c, I18nWeb(c, "pages.tunnels.csqtt.toasts.uploaded"), nil)
+}
+
+func (a *TunnelController) csqttDownloadBinary(c *gin.Context) {
+	var body tunnelDownloadRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		jsonMsg(c, "tunnel: invalid csqtt download body", err)
+		return
+	}
+	if err := a.svc.DownloadCsqttBinary(body.URL, body.SHA256); err != nil {
+		jsonMsg(c, "tunnel: csqtt download failed", err)
+		return
+	}
+	jsonMsg(c, I18nWeb(c, "pages.tunnels.csqtt.toasts.downloaded"), nil)
+}
+
+func (a *TunnelController) csqttDeleteBinary(c *gin.Context) {
+	if err := a.svc.DeleteCsqttBinary(); err != nil {
+		jsonMsg(c, "tunnel: csqtt binary delete failed", err)
+		return
+	}
+	jsonMsg(c, I18nWeb(c, "pages.tunnels.csqtt.toasts.deleted"), nil)
+}
+
 // --- mieru (inbound-only: status/logs/binary for the Cores page) ----------
 
 func (a *TunnelController) mieruStatus(c *gin.Context) {
@@ -507,21 +613,11 @@ func (a *TunnelController) mieruLogs(c *gin.Context) {
 }
 
 func (a *TunnelController) mieruUploadBinary(c *gin.Context) {
-	file, err := c.FormFile("file")
-	if err != nil {
-		jsonMsg(c, "tunnel: mieru upload failed", err)
-		return
-	}
 	dst := tunnel.Mieru.BinaryPath()
-	if err := c.SaveUploadedFile(file, dst); err != nil {
+	if err := saveCoreUpload(c, dst); err != nil {
 		logger.Warning("tunnel: save uploaded mieru binary failed:", err)
 		jsonMsg(c, "tunnel: mieru upload failed", err)
 		return
-	}
-	if runtime.GOOS != "windows" {
-		if err := os.Chmod(dst, 0o755); err != nil {
-			logger.Warning("tunnel: chmod uploaded mieru binary failed:", err)
-		}
 	}
 	jsonMsg(c, I18nWeb(c, "pages.tunnels.mieru.toasts.uploaded"), nil)
 }
@@ -569,21 +665,11 @@ func (a *TunnelController) trustTunnelLogs(c *gin.Context) {
 }
 
 func (a *TunnelController) trustTunnelUploadBinary(c *gin.Context) {
-	file, err := c.FormFile("file")
-	if err != nil {
-		jsonMsg(c, "tunnel: trusttunnel upload failed", err)
-		return
-	}
 	dst := tunnel.TrustTunnel.BinaryPath()
-	if err := c.SaveUploadedFile(file, dst); err != nil {
+	if err := saveCoreUpload(c, dst); err != nil {
 		logger.Warning("tunnel: save uploaded trusttunnel binary failed:", err)
 		jsonMsg(c, "tunnel: trusttunnel upload failed", err)
 		return
-	}
-	if runtime.GOOS != "windows" {
-		if err := os.Chmod(dst, 0o755); err != nil {
-			logger.Warning("tunnel: chmod uploaded trusttunnel binary failed:", err)
-		}
 	}
 	jsonMsg(c, I18nWeb(c, "pages.tunnels.trusttunnel.toasts.uploaded"), nil)
 }
@@ -607,4 +693,197 @@ func (a *TunnelController) trustTunnelDeleteBinary(c *gin.Context) {
 		return
 	}
 	jsonMsg(c, I18nWeb(c, "pages.tunnels.trusttunnel.toasts.deleted"), nil)
+}
+
+// --- AnyTLS (inbound-only: status/logs/binary for the Cores page) ----------
+
+func (a *TunnelController) anytlsStatus(c *gin.Context) {
+	st, err := a.svc.AnytlsStatus()
+	if err != nil {
+		jsonMsg(c, "tunnel: anytls status failed", err)
+		return
+	}
+	jsonObj(c, st, nil)
+}
+
+func (a *TunnelController) anytlsLogs(c *gin.Context) {
+	lines := 200
+	if n := c.Query("lines"); n != "" {
+		if parsed, err := strconv.Atoi(n); err == nil && parsed > 0 {
+			lines = parsed
+		}
+	}
+	jsonObj(c, a.svc.AnytlsLogs(lines), nil)
+}
+
+func (a *TunnelController) anytlsUploadBinary(c *gin.Context) {
+	dst := tunnel.Anytls.BinaryPath()
+	if err := saveCoreUpload(c, dst); err != nil {
+		logger.Warning("tunnel: save uploaded anytls binary failed:", err)
+		jsonMsg(c, "tunnel: anytls upload failed", err)
+		return
+	}
+	jsonMsg(c, I18nWeb(c, "pages.tunnels.anytls.toasts.uploaded"), nil)
+}
+
+func (a *TunnelController) anytlsDownloadBinary(c *gin.Context) {
+	var body tunnelDownloadRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		jsonMsg(c, "tunnel: invalid anytls download body", err)
+		return
+	}
+	if err := a.svc.DownloadAnytlsBinary(body.URL, body.SHA256); err != nil {
+		jsonMsg(c, "tunnel: anytls download failed", err)
+		return
+	}
+	jsonMsg(c, I18nWeb(c, "pages.tunnels.anytls.toasts.downloaded"), nil)
+}
+
+func (a *TunnelController) anytlsDeleteBinary(c *gin.Context) {
+	if err := a.svc.DeleteAnytlsBinary(); err != nil {
+		jsonMsg(c, "tunnel: anytls binary delete failed", err)
+		return
+	}
+	jsonMsg(c, I18nWeb(c, "pages.tunnels.anytls.toasts.deleted"), nil)
+}
+
+func (a *TunnelController) tproxyStatus(c *gin.Context) {
+	st, err := a.svc.TproxyStatus()
+	if err != nil {
+		jsonMsg(c, "tunnel: tproxy status failed", err)
+		return
+	}
+	jsonObj(c, st, nil)
+}
+
+func (a *TunnelController) tproxyLogs(c *gin.Context) {
+	jsonObj(c, a.svc.TproxyLogs(tproxyLogLines(c)), nil)
+}
+
+func (a *TunnelController) tproxyUploadBinary(c *gin.Context) {
+	if err := saveCoreUpload(c, tunnel.Tproxy.BinaryPath()); err != nil {
+		jsonMsg(c, "tunnel: tproxy upload failed", err)
+		return
+	}
+	jsonMsg(c, I18nWeb(c, "pages.tunnels.tproxy.toasts.uploaded"), nil)
+}
+
+func (a *TunnelController) tproxyDownloadBinary(c *gin.Context) {
+	var body tunnelDownloadRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		jsonMsg(c, "tunnel: invalid tproxy download body", err)
+		return
+	}
+	if err := a.svc.DownloadTproxyBinary(body.URL, body.SHA256); err != nil {
+		jsonMsg(c, "tunnel: tproxy download failed", err)
+		return
+	}
+	jsonMsg(c, I18nWeb(c, "pages.tunnels.tproxy.toasts.downloaded"), nil)
+}
+
+func (a *TunnelController) tproxyDeleteBinary(c *gin.Context) {
+	if err := a.svc.DeleteTproxyBinary(); err != nil {
+		jsonMsg(c, "tunnel: tproxy binary delete failed", err)
+		return
+	}
+	jsonMsg(c, I18nWeb(c, "pages.tunnels.tproxy.toasts.deleted"), nil)
+}
+
+func (a *TunnelController) tproxyUploadSite(c *gin.Context) {
+	id, err := strconv.Atoi(c.Query("id"))
+	if err != nil || id <= 0 {
+		jsonMsg(c, "tunnel: tproxy site needs inbound id", err)
+		return
+	}
+	file, err := c.FormFile("file")
+	if err != nil {
+		jsonMsg(c, "tunnel: tproxy site upload failed", err)
+		return
+	}
+	if file.Size > 20<<20 {
+		jsonMsg(c, "tunnel: tproxy site zip exceeds 20 MB", common.NewError("zip too large"))
+		return
+	}
+	src, err := file.Open()
+	if err != nil {
+		jsonMsg(c, "tunnel: tproxy site upload failed", err)
+		return
+	}
+	defer src.Close()
+	body, err := io.ReadAll(io.LimitReader(src, 20<<20+1))
+	if err != nil {
+		jsonMsg(c, "tunnel: tproxy site upload failed", err)
+		return
+	}
+	if err := a.svc.UploadTproxySite(id, body); err != nil {
+		jsonMsg(c, "tunnel: tproxy site extract failed", err)
+		return
+	}
+	jsonMsg(c, I18nWeb(c, "pages.tunnels.tproxy.toasts.siteUploaded"), nil)
+}
+
+func (a *TunnelController) tproxySiteFiles(c *gin.Context) {
+	id, err := strconv.Atoi(c.Query("id"))
+	if err != nil || id <= 0 {
+		jsonMsg(c, "tunnel: tproxy site needs inbound id", err)
+		return
+	}
+	files, err := a.svc.TproxySiteFiles(id)
+	if err != nil {
+		jsonMsg(c, "tunnel: tproxy site list failed", err)
+		return
+	}
+	jsonObj(c, files, nil)
+}
+
+func (a *TunnelController) mtproxyStatus(c *gin.Context) {
+	st, err := a.svc.MtproxyStatus()
+	if err != nil {
+		jsonMsg(c, "tunnel: mtproxy status failed", err)
+		return
+	}
+	jsonObj(c, st, nil)
+}
+
+func (a *TunnelController) mtproxyLogs(c *gin.Context) {
+	jsonObj(c, a.svc.MtproxyLogs(tproxyLogLines(c)), nil)
+}
+
+func (a *TunnelController) mtproxyUploadBinary(c *gin.Context) {
+	if err := saveCoreUpload(c, tunnel.Mtproxy.BinaryPath()); err != nil {
+		jsonMsg(c, "tunnel: mtproxy upload failed", err)
+		return
+	}
+	jsonMsg(c, I18nWeb(c, "pages.tunnels.mtproxy.toasts.uploaded"), nil)
+}
+
+func (a *TunnelController) mtproxyDownloadBinary(c *gin.Context) {
+	var body tunnelDownloadRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		jsonMsg(c, "tunnel: invalid mtproxy download body", err)
+		return
+	}
+	if err := a.svc.DownloadMtproxyBinary(body.URL, body.SHA256); err != nil {
+		jsonMsg(c, "tunnel: mtproxy download failed", err)
+		return
+	}
+	jsonMsg(c, I18nWeb(c, "pages.tunnels.mtproxy.toasts.downloaded"), nil)
+}
+
+func (a *TunnelController) mtproxyDeleteBinary(c *gin.Context) {
+	if err := a.svc.DeleteMtproxyBinary(); err != nil {
+		jsonMsg(c, "tunnel: mtproxy binary delete failed", err)
+		return
+	}
+	jsonMsg(c, I18nWeb(c, "pages.tunnels.mtproxy.toasts.deleted"), nil)
+}
+
+func tproxyLogLines(c *gin.Context) int {
+	lines := 200
+	if n := c.Query("lines"); n != "" {
+		if parsed, err := strconv.Atoi(n); err == nil && parsed > 0 {
+			lines = parsed
+		}
+	}
+	return lines
 }

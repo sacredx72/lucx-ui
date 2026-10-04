@@ -244,37 +244,41 @@ func (c TrustTunnelConfig) ResolveCertPaths(panelCert, panelKey string) (cert, k
 // ValidateCertFiles verifies the cert/key pair exists, parses, covers the
 // hostname in its SANs and is not expired.
 func ValidateCertFiles(certFile, keyFile, hostname string) error {
+	return validatePEMCert("trusttunnel", certFile, keyFile, hostname)
+}
+
+func validatePEMCert(label, certFile, keyFile, hostname string) error {
 	if certFile == "" || keyFile == "" {
-		return fmt.Errorf("trusttunnel: no TLS certificate — issue a domain certificate (x-ui console menu → SSL) or provide cert/key paths")
+		return fmt.Errorf("%s: no TLS certificate — issue a domain certificate (x-ui console menu → SSL) or provide cert/key paths", label)
 	}
 	certPEM, err := os.ReadFile(certFile)
 	if err != nil {
-		return fmt.Errorf("trusttunnel: read certificate %s: %w", certFile, err)
+		return fmt.Errorf("%s: read certificate %s: %w", label, certFile, err)
 	}
 	if _, err := os.Stat(keyFile); err != nil {
-		return fmt.Errorf("trusttunnel: read key %s: %w", keyFile, err)
+		return fmt.Errorf("%s: read key %s: %w", label, keyFile, err)
 	}
 	if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
-		return fmt.Errorf("trusttunnel: certificate/key pair invalid: %w", err)
+		return fmt.Errorf("%s: certificate/key pair invalid: %w", label, err)
 	}
 	block, _ := pem.Decode(certPEM)
 	if block == nil {
-		return fmt.Errorf("trusttunnel: certificate %s has no PEM block", certFile)
+		return fmt.Errorf("%s: certificate %s has no PEM block", label, certFile)
 	}
 	x, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return fmt.Errorf("trusttunnel: parse certificate: %w", err)
+		return fmt.Errorf("%s: parse certificate: %w", label, err)
 	}
 	now := time.Now()
 	if now.After(x.NotAfter) {
-		return fmt.Errorf("trusttunnel: certificate expired %s — renew it (x-ui console menu → SSL)", x.NotAfter.Format(time.RFC3339))
+		return fmt.Errorf("%s: certificate expired %s — renew it (x-ui console menu → SSL)", label, x.NotAfter.Format(time.RFC3339))
 	}
 	if now.Before(x.NotBefore) {
-		return fmt.Errorf("trusttunnel: certificate not valid until %s", x.NotBefore.Format(time.RFC3339))
+		return fmt.Errorf("%s: certificate not valid until %s", label, x.NotBefore.Format(time.RFC3339))
 	}
 	host := strings.TrimSpace(hostname)
 	if !certCoversHost(x, host) {
-		return fmt.Errorf("trusttunnel: certificate does not cover domain %q (SAN: %s)", host, strings.Join(x.DNSNames, ", "))
+		return fmt.Errorf("%s: certificate does not cover domain %q (SAN: %s)", label, host, strings.Join(x.DNSNames, ", "))
 	}
 	return nil
 }
@@ -328,7 +332,11 @@ func (c TrustTunnelConfig) RenderVpnToml(credsPath, rulesPath, socksAddr, metric
 	b.WriteString("max_concurrent_streams = " + strconv.Itoa(defaultHTTP2MaxStreams) + "\n")
 	b.WriteString("max_frame_size = " + strconv.Itoa(defaultHTTP2MaxFrame) + "\n")
 	b.WriteString("header_table_size = " + strconv.Itoa(defaultHTTP2HeaderTable) + "\n")
-	b.WriteString("\n[listen_protocols.quic]\n")
+	// HTTP/2 is TCP only. QUIC (UDP) only when the operator picked HTTP/3;
+	// that mode still accepts HTTPS on the same port.
+	if c.quicEnabled() {
+		b.WriteString("\n[listen_protocols.quic]\n")
+	}
 	b.WriteString("\n[forward_protocol]\n")
 	if socksAddr != "" {
 		b.WriteString("[forward_protocol.socks5]\n")
@@ -387,6 +395,44 @@ func tlsVarint(v uint64) []byte {
 	}
 }
 
+const (
+	ttProtoHTTP2 = 1
+	ttProtoHTTP3 = 2
+)
+
+func (c TrustTunnelConfig) quicEnabled() bool {
+	return strings.EqualFold(strings.TrimSpace(c.UpstreamProtocol), "http3")
+}
+
+func (c TrustTunnelConfig) shareProto() int {
+	if c.quicEnabled() {
+		return ttProtoHTTP3
+	}
+	return ttProtoHTTP2
+}
+
+// ShareLines is the subscription set for one client.
+// Only spec TLV deep links go out: every current client (official app,
+// Exclave, husi, Throne) parses tt://?TLV, while the Throne authority URI is
+// parsed only by Throne and throws inside the sing-based Android parsers
+// (they base64url-decode the whole body after tt://). HTTP/2: one HTTPS
+// listener, one link. HTTP/3: TCP accepts HTTPS plus QUIC — two links.
+func (c TrustTunnelConfig) ShareLines(address string, pair AuthPair, remark string) []string {
+	var lines []string
+	add := func(proto string) {
+		cp := c
+		cp.UpstreamProtocol = proto
+		if dl := cp.ClientDeepLink(address, pair, remark); dl != "" {
+			lines = append(lines, dl)
+		}
+	}
+	add("http2")
+	if c.quicEnabled() {
+		add("http3")
+	}
+	return lines
+}
+
 func ttTLV(tag byte, value []byte) []byte {
 	out := make([]byte, 0, 1+2+len(value))
 	out = append(out, tag)
@@ -414,9 +460,9 @@ func (c TrustTunnelConfig) ClientDeepLink(address string, pair AuthPair, remark 
 	if p := strings.TrimSpace(c.ClientRandomPrefix); ValidClientRandomPrefix(p) {
 		payload = append(payload, ttTLV(0x0B, []byte(p))...)
 	}
-	if strings.EqualFold(strings.TrimSpace(c.UpstreamProtocol), "http3") { // default http2 — omit
-		payload = append(payload, ttTLV(0x09, tlsVarint(2))...)
-	}
+	// Always write upstream_protocol. Omitting it is spec-default HTTP/2, but
+	// NekoBox treats a missing tag on tt://? as QUIC.
+	payload = append(payload, ttTLV(0x09, tlsVarint(uint64(c.shareProto())))...)
 	if r := strings.TrimSpace(remark); r != "" {
 		payload = append(payload, ttTLV(0x0C, []byte(r))...)
 	}
@@ -450,7 +496,7 @@ func (c TrustTunnelConfig) ClientURI(address string, pair AuthPair, remark strin
 		return ""
 	}
 	alpn := "h2"
-	if strings.EqualFold(strings.TrimSpace(c.UpstreamProtocol), "http3") {
+	if c.quicEnabled() {
 		alpn = "h3"
 	}
 	sni := strings.TrimSpace(c.Hostname)

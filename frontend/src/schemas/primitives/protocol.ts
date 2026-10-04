@@ -12,12 +12,19 @@ export const ProtocolSchema = z.enum([
   'tunnel',
   'tun',
   'mtproto',
+  'amneziawg',
+  'tuic',
   'awg', // LUCX-HOOK: AmneziaWG sidecar protocol
   'naive', // LUCX-HOOK: NaiveProxy sidecar (inbound model)
   'olcrtc', // LUCX-HOOK: olcRTC sidecar
   'qwdtt', // LUCX-HOOK: qWDTT sidecar
+  'csqtt', // LUCX-HOOK: CSQTT sidecar
   'mieru', // LUCX-HOOK: mieru sidecar
   'trusttunnel', // LUCX-HOOK: TrustTunnel sidecar
+  'anytls', // LUCX-HOOK: AnyTLS sidecar
+  'tproxy', // LUCX-HOOK: Telegram WEB proxy
+  'cover', // LUCX-HOOK: camouflage site on :80/:443
+  'gateway', // LUCX-HOOK: nginx SNI mux
 ]);
 export type Protocol = z.infer<typeof ProtocolSchema>;
 
@@ -39,10 +46,17 @@ export const Protocols = Object.freeze({
   TUNNEL: 'tunnel',
   TUN: 'tun',
   MTPROTO: 'mtproto',
+  AMNEZIAWG: 'amneziawg',
+  TUIC: 'tuic',
   AWG: 'awg', // LUCX-HOOK: AmneziaWG
   NAIVE: 'naive', // LUCX-HOOK: NaiveProxy
   OLCRTC: 'olcrtc', // LUCX-HOOK: olcRTC
   QWDTT: 'qwdtt', // LUCX-HOOK: qWDTT
+  CSQTT: 'csqtt', // LUCX-HOOK: CSQTT
   MIERU: 'mieru', // LUCX-HOOK: mieru
   TRUSTTUNNEL: 'trusttunnel', // LUCX-HOOK: TrustTunnel
+  ANYTLS: 'anytls', // LUCX-HOOK: AnyTLS
+  TPROXY: 'tproxy', // LUCX-HOOK: Telegram WEB proxy
+  COVER: 'cover', // LUCX-HOOK: camouflage site
+  GATEWAY: 'gateway', // LUCX-HOOK: nginx SNI mux
 });

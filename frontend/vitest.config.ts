@@ -1,12 +1,11 @@
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import react from '@vitejs/plugin-react';
 import { storybookTest } from '@storybook/addon-vitest/vitest-plugin';
 import { playwright } from '@vitest/browser-playwright';
 import { defineConfig } from 'vitest/config';
 
-const dirname = typeof __dirname !== 'undefined' ? __dirname : path.dirname(fileURLToPath(import.meta.url));
+const dirname = import.meta.dirname;
 
 export default defineConfig({
   plugins: [react()],
@@ -17,6 +16,8 @@ export default defineConfig({
   },
   test: {
     globals: false,
+    // Keep jsdom-heavy form tests within the memory budget of local and CI runners.
+    maxWorkers: 2,
     projects: [
       {
         extends: true,
@@ -24,6 +25,8 @@ export default defineConfig({
           name: 'unit',
           include: ['src/test/**/*.test.ts'],
           environment: 'node',
+          // msw probes localStorage on load; Node 25+'s file-less one warns per worker.
+          execArgv: ['--no-experimental-webstorage'],
           setupFiles: ['./src/test/setup.ts', './src/test/setup.msw.ts'],
         },
       },

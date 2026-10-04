@@ -1,3 +1,9 @@
+// Copyright (c) 2025 LucX-UI Project.
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// LucX-UI Component. Free for personal and educational use.
+// Commercial use (including VPN resale) requires explicit written permission from the author.
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
 import { useTranslation } from 'react-i18next';
 import { Input, InputNumber, Select, Switch } from 'antd';
 
@@ -8,13 +14,19 @@ export default function TunnelFields() {
   const { t } = useTranslation();
   return (
     <>
-      <FormField name={['settings', 'rewriteAddress']} label={t('pages.inbounds.form.rewriteAddress')}>
+      <FormField
+        name={['settings', 'rewriteAddress']}
+        label={t('pages.inbounds.form.rewriteAddress')}
+      >
         <Input />
       </FormField>
       <FormField name={['settings', 'rewritePort']} label={t('pages.inbounds.form.rewritePort')}>
         <InputNumber min={0} max={65535} />
       </FormField>
-      <FormField name={['settings', 'allowedNetwork']} label={t('pages.inbounds.form.allowedNetwork')}>
+      <FormField
+        name={['settings', 'allowedNetwork']}
+        label={t('pages.inbounds.form.allowedNetwork')}
+      >
         <Select
           options={[
             { value: 'tcp,udp', label: 'TCP, UDP' },

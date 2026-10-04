@@ -8,6 +8,7 @@ package awg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
@@ -25,11 +27,14 @@ type managed struct {
 	proc        *Process
 	tag         string
 	fingerprint string
+	peerFP      string
 	ifname      string
+	onlineTTL   int64
 	// Traffic baselines per peer public key, so CollectTraffic returns deltas.
 	lastRx   map[string]int64
 	lastTx   map[string]int64
 	haveLast bool
+	peers    []PeerSpec
 }
 
 // Manager owns the set of running AWG interfaces keyed by inbound id, exactly
@@ -45,9 +50,14 @@ type Manager struct {
 }
 
 var (
-	managerOnce sync.Once
-	manager     *Manager
+	managerOnce   sync.Once
+	manager       *Manager
+	rebuildPaused atomic.Bool
 )
+
+func SetRebuildPause(v bool) {
+	rebuildPaused.Store(v)
+}
 
 // GetManager returns the process-wide AWG manager singleton.
 func GetManager() *Manager {
@@ -63,12 +73,17 @@ func GetManager() *Manager {
 func (m *Manager) Ensure(inst Instance) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if rebuildPaused.Load() {
+		return fmt.Errorf("awg: module rebuild in progress")
+	}
 	m.sweepOrphansLocked()
 	if err := m.ensureLocked(inst); err != nil {
 		return err
 	}
 	m.ensureXrayRouting(inst)
 	m.ensureNatRules(inst)
+	m.ensureP2PRules(inst)
+	m.ensurePortForwards(inst)
 	return nil
 }
 
@@ -88,17 +103,36 @@ func (m *Manager) sweepOrphansLocked() {
 }
 
 func (m *Manager) ensureLocked(inst Instance) error {
-	fp := inst.fingerprint()
+	if inst.UsesTproxy() {
+		if err := inst.validateTproxy(); err != nil {
+			return err
+		}
+	}
+	conf := renderServerConf(inst)
+	fp := deviceFingerprint(conf)
+	peerFP := inst.peerFingerprint()
+	ttl := onlineTTLSeconds(inst)
 	if cur, ok := m.procs[inst.Id]; ok {
 		if cur.fingerprint == fp && cur.proc.IsRunning() {
 			cur.tag = inst.Tag
+			cur.onlineTTL = ttl
+			cur.peers = inst.Peers
+			if cur.peerFP != peerFP {
+				if err := m.syncPeersLocked(inst, conf); err != nil {
+					return err
+				}
+				cur.peerFP = peerFP
+				cur.lastRx = map[string]int64{}
+				cur.lastTx = map[string]int64{}
+				cur.haveLast = false
+			}
 			return nil
 		}
 		_ = cur.proc.Stop()
 		delete(m.procs, inst.Id)
 	}
-	// Write the .conf the sidecar will bring up.
-	if err := writeServerConfigFile(inst); err != nil {
+	cleanupTproxyConfig(configPathForID(inst.Id))
+	if err := writeServerConfig(inst.Id, conf); err != nil {
 		return err
 	}
 	proc := newProcess(inst.Ifname, configPathForID(inst.Id), fmt.Sprintf("inbound %d", inst.Id))
@@ -109,9 +143,12 @@ func (m *Manager) ensureLocked(inst Instance) error {
 		proc:        proc,
 		tag:         inst.Tag,
 		fingerprint: fp,
+		peerFP:      peerFP,
 		ifname:      inst.Ifname,
+		onlineTTL:   ttl,
 		lastRx:      map[string]int64{},
 		lastTx:      map[string]int64{},
+		peers:       inst.Peers,
 	}
 	logger.Infof("awg: started interface %s for inbound %d on port %d", inst.Ifname, inst.Id, inst.Port)
 	return nil
@@ -133,6 +170,9 @@ func (m *Manager) Remove(id int) {
 		delete(m.procs, id)
 		logger.Infof("awg: stopped interface %s for inbound %d", cur.ifname, id)
 	}
+	cleanupTproxyConfig(configPathForID(id))
+	m.flushPortForwards(id)
+	m.flushP2PRules(id)
 	path := configPathForID(id)
 	if _, err := os.Stat(path); err == nil {
 		if berr := backupConfigFile(path); berr != nil {
@@ -150,6 +190,9 @@ func (m *Manager) Remove(id int) {
 func (m *Manager) Reconcile(desired []Instance) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if rebuildPaused.Load() {
+		return
+	}
 	m.sweepOrphansLocked()
 	want := make(map[int]struct{}, len(desired))
 	for _, inst := range desired {
@@ -159,6 +202,8 @@ func (m *Manager) Reconcile(desired []Instance) {
 		if _, ok := want[id]; !ok {
 			_ = cur.proc.Stop()
 			delete(m.procs, id)
+			m.flushPortForwards(id)
+			m.flushP2PRules(id)
 			// lucx.67: back up rather than delete (see Remove).
 			path := configPathForID(id)
 			if _, err := os.Stat(path); err == nil {
@@ -192,6 +237,8 @@ func (m *Manager) Reconcile(desired []Instance) {
 		}
 		m.ensureXrayRouting(inst)
 		m.ensureNatRules(inst)
+		m.ensureP2PRules(inst)
+		m.ensurePortForwards(inst)
 	}
 }
 
@@ -223,6 +270,7 @@ func sweepOrphanInboundConfigs(want map[int]struct{}) {
 		if !configIsManaged(path) {
 			continue
 		}
+		cleanupTproxyConfig(path)
 		if err := backupConfigFile(path); err != nil {
 			logger.Warningf("awg: sweep: could not back up orphan %s (leaving in place): %v", path, err)
 		} else {
@@ -240,6 +288,67 @@ func configIsManaged(path string) bool {
 		return false
 	}
 	return strings.HasPrefix(string(data), xuiManagedMarker)
+}
+
+// strayInterfaceIsOurs reports whether a live awgN interface belongs to LucX.
+// No .conf or an unmarked file (toolza / docker / WGDashboard) is foreign.
+func strayInterfaceIsOurs(ifname string) bool {
+	return configIsManaged(filepath.Join(awgConfigDir, ifname+".conf"))
+}
+
+// ConfigPathIsManaged is the exported form of configIsManaged for the importer.
+func ConfigPathIsManaged(path string) bool {
+	return configIsManaged(path)
+}
+
+// BackupForeignConf moves a foreign .conf into x-ui-backup after a successful import.
+func BackupForeignConf(path string) error {
+	return backupConfigFile(path)
+}
+
+// Adopt takes over a live foreign interface for a newly created inbound:
+// rename it to awg{id} when needed (admin-down → rename → up; the netdev
+// stays, unlike awg-quick down/up), write the managed .conf, and register it.
+// startIfDown is false for userspace/docker: the inbound is already in the DB
+// and reconcile will bring the kernel iface up after the operator stops the
+// old manager. Calling Start while the old process still holds the UDP port
+// would fail the whole import after a successful AddInbound.
+func (m *Manager) Adopt(inst Instance, currentIfname string, startIfDown bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if currentIfname != "" && currentIfname != inst.Ifname {
+		if !isImportIfname(currentIfname) {
+			return fmt.Errorf("awg: refuse to rename interface %s", currentIfname)
+		}
+		if currentIfname == defaultRouteInterface() {
+			return fmt.Errorf("awg: refuse to rename default-route interface %s", currentIfname)
+		}
+		if err := renameAwgInterface(currentIfname, inst.Ifname); err != nil {
+			return err
+		}
+	}
+	conf := renderServerConf(inst)
+	if err := writeServerConfig(inst.Id, conf); err != nil {
+		return err
+	}
+	proc := newProcess(inst.Ifname, configPathForID(inst.Id), fmt.Sprintf("inbound %d", inst.Id))
+	if !proc.IsRunning() && startIfDown {
+		if err := proc.Start(); err != nil {
+			return err
+		}
+	}
+	m.procs[inst.Id] = &managed{
+		proc:        proc,
+		tag:         inst.Tag,
+		fingerprint: deviceFingerprint(conf),
+		peerFP:      inst.peerFingerprint(),
+		ifname:      inst.Ifname,
+		onlineTTL:   onlineTTLSeconds(inst),
+		lastRx:      map[string]int64{},
+		lastTx:      map[string]int64{},
+	}
+	logger.Infof("awg: adopted interface %s as %s for inbound %d", currentIfname, inst.Ifname, inst.Id)
+	return nil
 }
 
 // backupConfigFile moves the .conf at path into awgBackupDir with a unix-time
@@ -283,7 +392,12 @@ func (m *Manager) StopAll() {
 	defer m.mu.Unlock()
 	for id, cur := range m.procs {
 		_ = cur.proc.Stop()
-		_ = os.Remove(configPathForID(id))
+		path := configPathForID(id)
+		if _, err := os.Stat(path); err == nil {
+			if berr := backupConfigFile(path); berr != nil {
+				_ = os.Remove(path)
+			}
+		}
 		delete(m.procs, id)
 	}
 }
@@ -312,12 +426,13 @@ const handshakeOnlineTTL = 180
 // Xray's stats API.
 func (m *Manager) CollectTraffic() ([]Traffic, []PeerTraffic, map[string][]string) {
 	type snap struct {
-		id       int
-		ifname   string
-		tag      string
-		haveLast bool
-		lastRx   map[string]int64
-		lastTx   map[string]int64
+		id        int
+		ifname    string
+		tag       string
+		haveLast  bool
+		onlineTTL int64
+		lastRx    map[string]int64
+		lastTx    map[string]int64
 	}
 	m.mu.Lock()
 	snaps := make([]snap, 0, len(m.procs))
@@ -325,13 +440,18 @@ func (m *Manager) CollectTraffic() ([]Traffic, []PeerTraffic, map[string][]strin
 		if cur.proc == nil || !cur.proc.IsRunning() {
 			continue
 		}
+		ttl := cur.onlineTTL
+		if ttl <= 0 {
+			ttl = handshakeOnlineTTL
+		}
 		snaps = append(snaps, snap{
-			id:       id,
-			ifname:   cur.ifname,
-			tag:      cur.tag,
-			haveLast: cur.haveLast,
-			lastRx:   cur.lastRx,
-			lastTx:   cur.lastTx,
+			id:        id,
+			ifname:    cur.ifname,
+			tag:       cur.tag,
+			haveLast:  cur.haveLast,
+			onlineTTL: ttl,
+			lastRx:    cur.lastRx,
+			lastTx:    cur.lastTx,
 		})
 	}
 	m.mu.Unlock()
@@ -352,7 +472,7 @@ func (m *Manager) CollectTraffic() ([]Traffic, []PeerTraffic, map[string][]strin
 		for _, peer := range peers {
 			newRx[peer.PublicKey] = peer.Rx
 			newTx[peer.PublicKey] = peer.Tx
-			if peer.LastHandshake > 0 && now-peer.LastHandshake <= handshakeOnlineTTL {
+			if peer.LastHandshake > 0 && now-peer.LastHandshake <= s.onlineTTL {
 				onlinePeers = append(onlinePeers, peer.PublicKey)
 			}
 			if !s.haveLast {
@@ -401,11 +521,16 @@ func (m *Manager) CollectTraffic() ([]Traffic, []PeerTraffic, map[string][]strin
 // writeServerConfigFile renders the .conf for an instance and writes it to
 // the conventional AWG config path. Mirrors mtproto's writeConfig.
 func writeServerConfigFile(inst Instance) error {
+	return writeServerConfig(inst.Id, renderServerConf(inst))
+}
+
+// writeServerConfig takes already-rendered text so a caller that also needs it
+// for the fingerprint does not pay a second render (and second module probe).
+func writeServerConfig(id int, conf string) error {
 	if err := os.MkdirAll(awgConfigDir, 0o750); err != nil {
 		return err
 	}
-	conf := renderServerConf(inst)
-	return os.WriteFile(configPathForID(inst.Id), []byte(conf), 0o600)
+	return os.WriteFile(configPathForID(id), []byte(conf), 0o600)
 }
 
 // tunNameFor returns the name of the Xray TUN inbound device paired with an
@@ -452,6 +577,10 @@ func ruleMissing(ruleOutput string, table int) bool {
 // cannot install it because tunN does not exist yet when awg-quick runs. A
 // no-op (and silent) while tunN is absent — Xray may be down or restarting.
 func (m *Manager) ensureXrayRouting(inst Instance) {
+	if inst.UsesTproxy() {
+		m.ensureTproxyRouting(inst)
+		return
+	}
 	if !inst.RouteThroughXray {
 		return
 	}
@@ -474,6 +603,19 @@ func (m *Manager) ensureXrayRouting(inst Instance) {
 	}
 }
 
+var lastDefaultRouteIface atomic.Value
+
+// stickyDefaultRoute keeps the last interface seen. `ip route show default`
+// exits 0 with no output between DHCP leases, and "" erases PostUp — the fingerprint.
+func stickyDefaultRoute(probed string) string {
+	if probed != "" {
+		lastDefaultRouteIface.Store(probed)
+		return probed
+	}
+	last, _ := lastDefaultRouteIface.Load().(string)
+	return last
+}
+
 // clientSubnet extracts the network prefix (e.g. "10.8.0.0/24") from the
 // server's tunnel Address (e.g. "10.8.0.1/24"). Returns empty when Address is
 // unset or unparseable, in which case NAT rules are skipped.
@@ -483,7 +625,7 @@ func clientSubnet(address string) string {
 		return ""
 	}
 	prefix, err := netip.ParsePrefix(address)
-	if err != nil {
+	if err != nil || prefix.Bits() < 8 {
 		return ""
 	}
 	return prefix.Masked().String()
@@ -510,6 +652,9 @@ func clientSubnet(address string) string {
 // reconcile loop) owns it. No MASQUERADE here — Xray terminates the flows in
 // its TUN netstack and dials out with the server's own address.
 func natPostUpPostDown(inst Instance) (postUp, postDown string) {
+	if inst.UsesTproxy() {
+		return tproxyPostUpPostDown(inst)
+	}
 	subnet := clientSubnet(inst.Address)
 	if subnet == "" {
 		return "", ""
@@ -573,18 +718,20 @@ func natPostUpPostDown(inst Instance) (postUp, postDown string) {
 	}
 
 	extIface := defaultRouteInterface()
-	if extIface == "" {
+	if extIface == "" || !validIptablesIface(extIface) {
 		return "", ""
 	}
-	// Mark packets arriving on awgN, then MASQUERADE by mark (not by the
-	// server Address/24). Peer AllowedIPs may sit outside the server subnet
-	// (preserved across Address edits so clients need no re-export); -s
-	// <subnet> would silently drop NAT for those peers.
+	// Subnet MASQUERADE is the reliable path (mark-only NAT silently fails
+	// when mangle PREROUTING is missing after a routeThroughXray toggle).
+	// MARK+MASQUERADE-by-mark still covers peers whose AllowedIPs sit outside
+	// the server Address/24.
 	mark := awgNatMark(inst.Id)
 	postUp = fmt.Sprintf(
 		"echo 1 > /proc/sys/net/ipv4/ip_forward; "+
 			"iptables -t mangle -C PREROUTING -i %s -j MARK --set-mark %d 2>/dev/null || "+
 			"iptables -t mangle -A PREROUTING -i %s -j MARK --set-mark %d; "+
+			"iptables -t nat -C POSTROUTING -s %s -o %s -j MASQUERADE 2>/dev/null || "+
+			"iptables -t nat -A POSTROUTING -s %s -o %s -j MASQUERADE; "+
 			"iptables -t nat -C POSTROUTING -m mark --mark %d -o %s -j MASQUERADE 2>/dev/null || "+
 			"iptables -t nat -A POSTROUTING -m mark --mark %d -o %s -j MASQUERADE; "+
 			"iptables -C FORWARD -i %s -j ACCEPT 2>/dev/null || "+
@@ -596,17 +743,20 @@ func natPostUpPostDown(inst Instance) (postUp, postDown string) {
 			"iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -i %s -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || "+
 			"iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -i %s -j TCPMSS --clamp-mss-to-pmtu",
 		iface, mark, iface, mark,
+		subnet, extIface, subnet, extIface,
 		mark, extIface, mark, extIface,
 		iface, iface, iface, iface,
 		iface, iface, iface, iface,
 	)
 	postDown = fmt.Sprintf(
-		"iptables -t nat -D POSTROUTING -m mark --mark %d -o %s -j MASQUERADE 2>/dev/null || true; "+
+		"iptables -t nat -D POSTROUTING -s %s -o %s -j MASQUERADE 2>/dev/null || true; "+
+			"iptables -t nat -D POSTROUTING -m mark --mark %d -o %s -j MASQUERADE 2>/dev/null || true; "+
 			"iptables -t mangle -D PREROUTING -i %s -j MARK --set-mark %d 2>/dev/null || true; "+
 			"iptables -D FORWARD -i %s -j ACCEPT 2>/dev/null || true; "+
 			"iptables -D FORWARD -o %s -j ACCEPT 2>/dev/null || true; "+
 			"iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -o %s -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; "+
 			"iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -i %s -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true",
+		subnet, extIface,
 		mark, extIface,
 		iface, mark,
 		iface, iface,
@@ -642,8 +792,10 @@ func natRulesFor(inst Instance, extIface string) []natRule {
 		return nil
 	}
 	mark := strconv.Itoa(awgNatMark(inst.Id))
+	subnet := clientSubnet(inst.Address)
 	return []natRule{
 		{"mangle", "PREROUTING", []string{"-i", inst.Ifname, "-j", "MARK", "--set-mark", mark}},
+		{"nat", "POSTROUTING", []string{"-s", subnet, "-o", extIface, "-j", "MASQUERADE"}},
 		{"nat", "POSTROUTING", []string{"-m", "mark", "--mark", mark, "-o", extIface, "-j", "MASQUERADE"}},
 		{"filter", "FORWARD", []string{"-i", inst.Ifname, "-j", "ACCEPT"}},
 		{"filter", "FORWARD", []string{"-o", inst.Ifname, "-j", "ACCEPT"}},
@@ -663,6 +815,7 @@ func (m *Manager) ensureNatRules(inst Instance) {
 	if err := exec.CommandContext(context.Background(), "ip", "link", "show", inst.Ifname).Run(); err != nil {
 		return
 	}
+	_ = exec.CommandContext(context.Background(), "ip", "rule", "del", "iif", inst.Ifname, "lookup", strconv.Itoa(awgRouteTable(inst.Id))).Run()
 	rules := natRulesFor(inst, defaultRouteInterface())
 	if len(rules) == 0 {
 		return
@@ -682,6 +835,80 @@ func (m *Manager) ensureNatRules(inst Instance) {
 	}
 }
 
+func p2pDropSpec(ifname string) []string {
+	return []string{"-i", ifname, "-o", ifname, "-j", "DROP"}
+}
+
+func awgP2PRulePref(id int) int {
+	if id < 0 {
+		id = 0
+	}
+	return 200 + id
+}
+
+func p2pHairpinRulePresent(ruleOutput, subnet string) bool {
+	if subnet == "" {
+		return false
+	}
+	needle := "to " + subnet
+	for _, line := range strings.Split(ruleOutput, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, needle) && strings.HasSuffix(line, "lookup main") {
+			return true
+		}
+	}
+	return false
+}
+
+// ensureP2PRules converges client-to-client isolation vs hairpin.
+// Not in PostUp: toggling must not rewrite the .conf / bounce the iface.
+func (m *Manager) ensureP2PRules(inst Instance) {
+	if inst.Ifname == "" || !validIptablesIface(inst.Ifname) {
+		return
+	}
+	if err := exec.CommandContext(context.Background(), "ip", "link", "show", inst.Ifname).Run(); err != nil {
+		return
+	}
+	drop := p2pDropSpec(inst.Ifname)
+	del := append([]string{"-D", "FORWARD"}, drop...)
+	_ = exec.CommandContext(context.Background(), "iptables", del...).Run()
+	if !inst.P2P {
+		ins := append([]string{"-I", "FORWARD", "1"}, drop...)
+		if out, err := exec.CommandContext(context.Background(), "iptables", ins...).CombinedOutput(); err != nil {
+			logger.Warningf("awg: ensure p2p isolation (iptables %s): %v\n%s", strings.Join(ins, " "), err, string(out))
+		}
+	} else if err := exec.CommandContext(context.Background(), "sysctl", "-qw", "net.ipv4.conf."+inst.Ifname+".rp_filter=2").Run(); err != nil {
+		logger.Warningf("awg: ensure p2p rp_filter: %v", err)
+	}
+	m.ensureP2PHairpinRule(inst)
+}
+
+func (m *Manager) ensureP2PHairpinRule(inst Instance) {
+	subnet := clientSubnet(inst.Address)
+	pref := strconv.Itoa(awgP2PRulePref(inst.Id))
+	if inst.P2P && inst.RouteThroughXray && !inst.UsesTproxy() && subnet != "" {
+		out, err := exec.CommandContext(context.Background(), "ip", "rule", "show", "pref", pref).Output()
+		if err == nil && p2pHairpinRulePresent(string(out), subnet) {
+			return
+		}
+		args := []string{"rule", "add", "pref", pref, "iif", inst.Ifname, "to", subnet, "lookup", "main"}
+		if out2, err2 := exec.CommandContext(context.Background(), "ip", args...).CombinedOutput(); err2 != nil {
+			logger.Warningf("awg: ensure p2p hairpin rule: %v\n%s", err2, string(out2))
+		}
+		return
+	}
+	_ = exec.CommandContext(context.Background(), "ip", "rule", "del", "pref", pref).Run()
+}
+
+func (m *Manager) flushP2PRules(id int) {
+	ifname := ifnameFor(id)
+	if validIptablesIface(ifname) {
+		del := append([]string{"-D", "FORWARD"}, p2pDropSpec(ifname)...)
+		_ = exec.CommandContext(context.Background(), "iptables", del...).Run()
+	}
+	_ = exec.CommandContext(context.Background(), "ip", "rule", "del", "pref", strconv.Itoa(awgP2PRulePref(id))).Run()
+}
+
 // renderServerConf builds the awg-quick .conf for an instance, reading from
 // the Instance struct (desired runtime state) rather than the inbound's
 // stored JSON.
@@ -692,12 +919,13 @@ func renderServerConf(inst Instance) string {
 	// a '#' comment, invisible to awg-quick.
 	b.WriteString(xuiManagedMarker + "\n")
 	fmt.Fprintf(&b, "[Interface]\n")
-	fmt.Fprintf(&b, "PrivateKey = %s\n", inst.PrivateKey)
+	fmt.Fprintf(&b, "PrivateKey = %s\n", confValue(inst.PrivateKey))
 	fmt.Fprintf(&b, "ListenPort = %d\n", inst.Port)
 	if inst.Address != "" {
-		fmt.Fprintf(&b, "Address = %s\n", inst.Address)
+		fmt.Fprintf(&b, "Address = %s\n", confValue(inst.Address))
 	}
 	fmt.Fprintf(&b, "MTU = %d\n", inst.MTU)
+	b.WriteString("Table = off\n")
 	// DNS is CLIENT-ONLY — the server does not resolve through the tunnel.
 	// Writing DNS to the server .conf makes awg-quick call resolvconf/openresolv
 	// and overwrite the server's system DNS (e.g. with "1.1.1.1, 1.0.0.1"),
@@ -715,10 +943,14 @@ func renderServerConf(inst Instance) string {
 		fmt.Fprintf(&b, "S3 = %d\n", inst.S3)
 		fmt.Fprintf(&b, "S4 = %d\n", inst.S4)
 	}
-	fmt.Fprintf(&b, "H1 = %s\n", inst.H1)
-	fmt.Fprintf(&b, "H2 = %s\n", inst.H2)
-	fmt.Fprintf(&b, "H3 = %s\n", inst.H3)
-	fmt.Fprintf(&b, "H4 = %s\n", inst.H4)
+	// Per field, like the client export: only a blank one is skipped, because
+	// "H1 = " alone makes setconf reject the whole file.
+	for i, h := range []string{inst.H1, inst.H2, inst.H3, inst.H4} {
+		if strings.TrimSpace(h) != "" {
+			fmt.Fprintf(&b, "H%d = %s\n", i+1, confValue(h))
+		}
+	}
+	awg3ok := IsAwg3Plus(inst.AwgVersion) && ModuleSupportsAwg3()
 	// HeaderProtectionKey (AWG3) is written ONLY when AwgVersion == "3" and the
 	// key is non-empty. The upstream kernel module (v3.0.20260731) + tools
 	// (v3.0.20260730) now parse the field; older builds reject it with "Line
@@ -728,8 +960,8 @@ func renderServerConf(inst Instance) string {
 	// working on any kernel, and lets a v3 inbound opt in once the operator has
 	// installed the AWG3 module. The S1-S4 >= 12 invariant (enforced by the
 	// generator) is required for the kernel to accept the key.
-	if IsAwg3Plus(inst.AwgVersion) && inst.HeaderProtectionKey != "" && ModuleSupportsAwg3() {
-		fmt.Fprintf(&b, "HeaderProtectionKey = %s\n", inst.HeaderProtectionKey)
+	if awg3ok && strings.TrimSpace(inst.HeaderProtectionKey) != "" {
+		fmt.Fprintf(&b, "HeaderProtectionKey = %s\n", confValue(inst.HeaderProtectionKey))
 	}
 	// AWG3 device-level timers/padding — all optional (0 = kernel uses the
 	// built-in WireGuard constant). Written only when > 0 and IsAwg3Plus;
@@ -739,29 +971,28 @@ func renderServerConf(inst Instance) string {
 	// kernel rejects "Line unrecognized" and awg-quick deletes the interface,
 	// producing "Device <awgN> does not exist". Blocks the regression seen
 	// when an operator picks v3 on a host still running the v1.x module.
-	awg3ok := IsAwg3Plus(inst.AwgVersion) && ModuleSupportsAwg3()
 	if awg3ok {
 		// Values are written verbatim: each is a single integer ("150") or an
 		// inclusive range ("100-500"). The kernel u16_range_t parses both and
 		// randomizes within a range at rekey (same semantics as H1-H4), so a
 		// range must reach the .conf intact — never collapsed to one value.
 		if !inst.ContentPaddingAddition.IsZero() {
-			fmt.Fprintf(&b, "ContentPaddingAddition = %s\n", inst.ContentPaddingAddition)
+			fmt.Fprintf(&b, "ContentPaddingAddition = %s\n", confValue(string(inst.ContentPaddingAddition)))
 		}
 		if !inst.RekeyAfterTime.IsZero() {
-			fmt.Fprintf(&b, "RekeyAfterTime = %s\n", inst.RekeyAfterTime)
+			fmt.Fprintf(&b, "RekeyAfterTime = %s\n", confValue(string(inst.RekeyAfterTime)))
 		}
 		if !inst.RekeyTimeout.IsZero() {
-			fmt.Fprintf(&b, "RekeyTimeout = %s\n", inst.RekeyTimeout)
+			fmt.Fprintf(&b, "RekeyTimeout = %s\n", confValue(string(inst.RekeyTimeout)))
 		}
 		if !inst.RejectAfterTime.IsZero() {
-			fmt.Fprintf(&b, "RejectAfterTime = %s\n", inst.RejectAfterTime)
+			fmt.Fprintf(&b, "RejectAfterTime = %s\n", confValue(string(inst.RejectAfterTime)))
 		}
 		if !inst.KeepaliveTimeout.IsZero() {
-			fmt.Fprintf(&b, "KeepaliveTimeout = %s\n", inst.KeepaliveTimeout)
+			fmt.Fprintf(&b, "KeepaliveTimeout = %s\n", confValue(string(inst.KeepaliveTimeout)))
 		}
 		if !inst.MaxHandshakeAttempts.IsZero() {
-			fmt.Fprintf(&b, "MaxHandshakeAttempts = %s\n", inst.MaxHandshakeAttempts)
+			fmt.Fprintf(&b, "MaxHandshakeAttempts = %s\n", confValue(string(inst.MaxHandshakeAttempts)))
 		}
 	}
 	// AWG 3.1 device flags — omitted when false so v3.0 tools keep accepting
@@ -776,19 +1007,25 @@ func renderServerConf(inst Instance) string {
 			b.WriteString("DisableCookies = on\n")
 		}
 	}
-	// I1-I5 (CPS packets) are CLIENT-ONLY — the server does not use them.
-	// Writing I1-I5 to the server .conf crashes awg setconf ("Invalid
-	// argument") because the kernel amneziawg module does not accept CPS
-	// tags in setconf input. The client sends CPS packets before the
-	// handshake for DPI evasion; the server ignores them. (Matches
-	// pumbaX/awg-multi-script: server .conf has Jc/S/H only, never I1-I5.)
+	// Worst-case, not this ifname: the exported client .conf and the share link
+	// budget that way, and a set only one side writes is one-way mimicry.
+	if NormalizeAWGVersion(inst.AwgVersion) != "1.5" &&
+		IBytes(inst.I1, inst.I2, inst.I3, inst.I4, inst.I5) <= WorstCaseIBytesBudget(strings.TrimSpace(inst.HeaderProtectionKey) != "") {
+		for _, kv := range []struct{ k, v string }{
+			{"I1", inst.I1}, {"I2", inst.I2}, {"I3", inst.I3}, {"I4", inst.I4}, {"I5", inst.I5},
+		} {
+			if strings.TrimSpace(kv.v) != "" {
+				fmt.Fprintf(&b, "%s = %s\n", kv.k, confValue(kv.v))
+			}
+		}
+	}
 	if postUp, postDown := natPostUpPostDown(inst); postUp != "" {
 		fmt.Fprintf(&b, "PostUp = %s\n", postUp)
 		fmt.Fprintf(&b, "PostDown = %s\n", postDown)
 	}
 	for _, p := range inst.Peers {
 		b.WriteString("\n[Peer]\n")
-		fmt.Fprintf(&b, "PublicKey = %s\n", p.PublicKey)
+		fmt.Fprintf(&b, "PublicKey = %s\n", confValue(p.PublicKey))
 		// PresharedKey is written ONLY when non-empty. An empty value renders as
 		// "PresharedKey = " which awg setconf rejects ("invalid key"), awg-quick
 		// rolls back the half-built interface, and reconcile reports "Device
@@ -798,77 +1035,80 @@ func renderServerConf(inst Instance) string {
 		// Absent PresharedKey is the WireGuard convention for "no PSK" and
 		// matches renderClientConf + SyncPeers, which already omit it.
 		if psk := strings.TrimSpace(p.PSK); psk != "" {
-			fmt.Fprintf(&b, "PresharedKey = %s\n", psk)
+			fmt.Fprintf(&b, "PresharedKey = %s\n", confValue(psk))
 		}
-		allowed := p.AllowedIPs
-		if allowed == "" {
-			allowed = "0.0.0.0/0, ::/0"
+		if allowed := strings.TrimSpace(p.AllowedIPs); allowed != "" {
+			fmt.Fprintf(&b, "AllowedIPs = %s\n", confValue(allowed))
 		}
-		fmt.Fprintf(&b, "AllowedIPs = %s\n", allowed)
 	}
 	return b.String()
 }
 
-// SyncPeers re-syncs the kernel peer set for a running interface without a
-// full restart. Called by AddUser/RemoveUser so adding/removing a client does
-// not drop existing connections. Uses `awg set <iface> peer <pubkey> ...` /
-// `awg set <iface> peer <pubkey> remove`.
-func (m *Manager) SyncPeers(id int, peers []PeerSpec) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	cur, ok := m.procs[id]
-	if !ok || !cur.proc.IsRunning() {
-		return fmt.Errorf("awg: interface for inbound %d not running", id)
-	}
-	ifname := cur.ifname
-	for _, p := range peers {
-		args := []string{"set", ifname, "peer", p.PublicKey}
-		if p.PSK != "" {
-			args = append(args, "preshared-key", p.PSK)
-		}
-		allowed := p.AllowedIPs
-		if allowed == "" {
-			allowed = "0.0.0.0/0, ::/0"
-		}
-		args = append(args, "allowed-ips", allowed)
-		if out, err := exec.CommandContext(context.Background(), awgBin("awg"), args...).CombinedOutput(); err != nil {
-			logger.Warningf("awg: set peer %s on %s: %v\n%s", p.PublicKey[:8], ifname, err, string(out))
-		}
-	}
-	// Remove peers that are no longer desired: diff against kernel state.
-	current := kernelPeers(ifname)
-	desiredSet := make(map[string]bool, len(peers))
-	for _, p := range peers {
-		desiredSet[p.PublicKey] = true
-	}
-	for pub := range current {
-		if !desiredSet[pub] {
-			if out, err := exec.CommandContext(context.Background(), awgBin("awg"), "set", ifname, "peer", pub, "remove").CombinedOutput(); err != nil {
-				logger.Warningf("awg: remove peer %s on %s: %v\n%s", pub[:8], ifname, err, string(out))
-			}
-		}
-	}
-	// Reset the traffic baseline since the peer set changed.
-	cur.lastRx = map[string]int64{}
-	cur.lastTx = map[string]int64{}
-	cur.haveLast = false
-	return nil
+var awgQuickIfaceKeys = map[string]struct{}{
+	"address": {}, "mtu": {}, "dns": {}, "table": {},
+	"preup": {}, "predown": {}, "postup": {}, "postdown": {},
+	"saveconfig": {},
 }
 
-// kernelPeers returns the set of peer public keys currently on an interface.
-func kernelPeers(ifname string) map[string]bool {
-	out, err := exec.CommandContext(context.Background(), awgBin("awg"), "show", ifname, "peers").Output()
-	if err != nil {
+func stripAwgQuick(conf string) string {
+	var b strings.Builder
+	inInterface := false
+	for i, line := range strings.Split(conf, "\n") {
+		keyLine := line
+		if idx := strings.Index(keyLine, "#"); idx >= 0 {
+			keyLine = keyLine[:idx]
+		}
+		key := strings.TrimSpace(keyLine)
+		if eq := strings.Index(key, "="); eq >= 0 {
+			key = strings.TrimSpace(key[:eq])
+		}
+		if strings.HasPrefix(key, "[") {
+			inInterface = strings.EqualFold(key, "[Interface]")
+		} else if inInterface {
+			if _, drop := awgQuickIfaceKeys[strings.ToLower(key)]; drop {
+				continue
+			}
+		}
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(line)
+	}
+	return b.String()
+}
+
+func (m *Manager) syncPeersLocked(inst Instance, conf string) error {
+	// Full .conf stays on disk for awg-quick up; syncconf gets a stripped
+	// temp file — its parser rejects Address/MTU/PostUp (lucx.154).
+	if err := writeServerConfig(inst.Id, conf); err != nil {
+		return err
+	}
+	cur, ok := m.procs[inst.Id]
+	if !ok || cur.proc == nil || !cur.proc.IsRunning() {
 		return nil
 	}
-	peers := make(map[string]bool)
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			peers[line] = true
-		}
+	if err := os.MkdirAll(awgConfigDir, 0o750); err != nil {
+		return fmt.Errorf("awg syncconf temp: %w", err)
 	}
-	return peers
+	tmp, err := os.CreateTemp(awgConfigDir, "awg-sync-*.conf")
+	if err != nil {
+		return fmt.Errorf("awg syncconf temp: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.WriteString(stripAwgQuick(conf)); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("awg syncconf temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("awg syncconf temp: %w", err)
+	}
+	out, err := exec.CommandContext(context.Background(), awgBin("awg"), "syncconf", inst.Ifname, tmpPath).CombinedOutput()
+	if err != nil {
+		logger.Warningf("awg: syncconf %s: %v\n%s", inst.Ifname, err, string(out))
+		return fmt.Errorf("awg syncconf %s: %w\n%s", inst.Ifname, err, string(out))
+	}
+	return nil
 }
 
 // Traffic is a per-inbound traffic delta scraped from `awg show <iface> transfer`.
@@ -886,9 +1126,52 @@ type Traffic struct {
 // online status derive in a single scrape.
 type peerStat struct {
 	PublicKey     string
+	Endpoint      string
+	AllowedIPs    string
 	Rx            int64
 	Tx            int64
 	LastHandshake int64
+}
+
+// awgShowTimeout bounds one dump: a healthy read is a single netlink round trip
+// (~1 ms measured), while an oversized I-field set spins it for ~30 minutes.
+const awgShowTimeout = 5 * time.Second
+
+// awgStuckCooldown leaves a timed-out interface unread for this long: the read
+// itself leaks ~164 MB/s. A var (not a const) so tests can shorten it.
+var awgStuckCooldown = 10 * time.Minute
+
+// stuckShows maps an interface to when its read last ran out of time; three
+// readers share it, so one sick device is one warning and one read per cooldown.
+var stuckShows sync.Map
+
+// noteAwgRead turns the outcome of one bounded read of ifname into at most one
+// log line while the device is unreadable; answering again re-arms the warning.
+func noteAwgRead(ctx context.Context, ifname string, err error) {
+	if err == nil {
+		stuckShows.Delete(ifname)
+		return
+	}
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return
+	}
+	if _, warned := stuckShows.Swap(ifname, time.Now()); !warned {
+		logger.Warningf("awg: reading interface %s timed out after %s, leaving it unread for %s", ifname, awgShowTimeout, awgStuckCooldown)
+	}
+}
+
+// stuckReadErr answers for an interface still inside its cooldown, so a reader
+// reports it unreadable without spawning the read that wedges and leaks.
+func stuckReadErr(ifname string) error {
+	v, ok := stuckShows.Load(ifname)
+	if !ok {
+		return nil
+	}
+	stuck, _ := v.(time.Time)
+	if time.Since(stuck) >= awgStuckCooldown {
+		return nil
+	}
+	return fmt.Errorf("awg show %s: %w", ifname, context.DeadlineExceeded)
 }
 
 // scrapePeers runs `awg show <iface> dump` and parses the peer rows. The dump
@@ -902,7 +1185,13 @@ type peerStat struct {
 // peer (download). Returns ok=false when the interface is down or awg is
 // unavailable.
 func scrapePeers(ifname string) ([]peerStat, bool) {
-	out, err := exec.CommandContext(context.Background(), awgBin("awg"), "show", ifname, "dump").Output()
+	if stuckReadErr(ifname) != nil {
+		return nil, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), awgShowTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, awgBin("awg"), "show", ifname, "dump").Output()
+	noteAwgRead(ctx, ifname, err)
 	if err != nil {
 		return nil, false
 	}
@@ -931,7 +1220,14 @@ func parseAwgDump(out string) ([]peerStat, bool) {
 		if errHs != nil || errRx != nil || errTx != nil {
 			continue
 		}
-		peers = append(peers, peerStat{PublicKey: fields[0], Rx: rx, Tx: tx, LastHandshake: hs})
+		ep, allowed := fields[2], fields[3]
+		if ep == "(off)" {
+			ep = ""
+		}
+		peers = append(peers, peerStat{
+			PublicKey: fields[0], Endpoint: ep, AllowedIPs: allowed,
+			Rx: rx, Tx: tx, LastHandshake: hs,
+		})
 	}
 	return peers, true
 }

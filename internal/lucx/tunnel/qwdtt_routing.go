@@ -22,8 +22,13 @@ const (
 	qwdttIfaceWG  = "wdtt0"
 	qwdttIfaceRaw = "wdttraw0"
 	// Subnets claimed by the binary for client addresses (server.go).
-	qwdttSubnetWG  = "10.66.0.0/16"
-	qwdttSubnetRaw = "10.70.0.0/16"
+	qwdttSubnetWG       = "10.68.0.0/16"
+	qwdttSubnetWGLegacy = "10.66.0.0/16"
+	qwdttSubnetRaw      = "10.70.0.0/16"
+
+	csqttIface      = "csqtt1"
+	csqttSubnet     = "10.66.67.0/24"
+	csqttRouteTable = 1910
 )
 
 // QwdttTunName returns the Xray TUN device name for a qWDTT inbound id
@@ -35,13 +40,16 @@ func QwdttTunName(inboundID int) string {
 // QwdttRouteTable is the policy-routing table for qWDTT → Xray TUN.
 // Offset 1900 keeps clear of AWG's 1000+N and common admin tables.
 func QwdttRouteTable(inboundID int) int {
-	return 1900 + inboundID%90
+	return 1900 + inboundID
 }
 
 // QwdttTunGateway is the /30 gateway on the Xray TUN (outside AWG 10.254.N and
 // qWDTT client subnets).
 func QwdttTunGateway(inboundID int) string {
-	return "10.253." + strconv.Itoa(inboundID%254) + ".1/30"
+	if inboundID >= 1 && inboundID < 254 {
+		return "10.253." + strconv.Itoa(inboundID) + ".1/30"
+	}
+	return "10.251." + strconv.Itoa((inboundID%253)+1) + ".1/30"
 }
 
 // ensureQwdttXrayRouting converges kernel state so traffic from wdtt0/wdttraw0
@@ -64,9 +72,12 @@ func ensureQwdttXrayRouting(inst Instance) {
 		ifaces = []string{qwdttIfaceWG, qwdttIfaceRaw}
 	}
 
-	// Wait briefly for wdtt0 after process start.
+	waitIface := qwdttIfaceWG
+	if len(ifaces) > 0 {
+		waitIface = ifaces[0]
+	}
 	deadline := time.Now().Add(3 * time.Second)
-	for exec.CommandContext(context.Background(), "ip", "link", "show", qwdttIfaceWG).Run() != nil && time.Now().Before(deadline) {
+	for exec.CommandContext(context.Background(), "ip", "link", "show", waitIface).Run() != nil && time.Now().Before(deadline) {
 		time.Sleep(200 * time.Millisecond)
 	}
 
@@ -90,20 +101,141 @@ func ensureQwdttXrayRouting(inst Instance) {
 		}
 	}
 
-	// Drop binary-installed MASQUERADE so replies are not double-NATed via eth0.
 	stripQwdttMasquerade()
+	if inst.Core == Csqtt {
+		stripMasqueradeSubnet(csqttSubnet)
+		applyCsqttFirewall(csqttXrayFirewall(tun))
+	}
+}
+
+// EnsureCsqttDirect is the routeThroughXray=off path. The binary creates
+// csqtt1 but does not install NAT (that lives in upstream deploy.sh, which
+// LucX does not run). Also drops a leftover iif rule so packets are not
+// sent into a tun we are no longer bridging.
+func EnsureCsqttDirect() {
+	if runtime.GOOS != "linux" {
+		return
+	}
+	clearQwdttXrayRouting(csqttRouteTable, []string{csqttIface})
+	applyCsqttFirewall(csqttDirectFirewall())
+}
+
+type csqttFirewallSpec struct {
+	table string
+	chain string
+	spec  []string
+}
+
+func csqttIfaceRules(iface string) []csqttFirewallSpec {
+	return []csqttFirewallSpec{
+		{"", "FORWARD", []string{"-i", iface, "-j", "ACCEPT"}},
+		{"", "FORWARD", []string{"-o", iface, "-j", "ACCEPT"}},
+		{"mangle", "FORWARD", []string{"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-i", iface, "-j", "TCPMSS", "--clamp-mss-to-pmtu"}},
+		{"mangle", "FORWARD", []string{"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-o", iface, "-j", "TCPMSS", "--clamp-mss-to-pmtu"}},
+	}
+}
+
+func csqttXrayFirewall(tun string) []csqttFirewallSpec {
+	rules := csqttIfaceRules(csqttIface)
+	if tun != "" {
+		rules = append(rules, csqttIfaceRules(tun)...)
+	}
+	return rules
+}
+
+func csqttDirectFirewall() []csqttFirewallSpec {
+	return append(csqttIfaceRules(csqttIface), csqttFirewallSpec{
+		table: "nat", chain: "POSTROUTING",
+		spec: []string{"-s", csqttSubnet, "-j", "MASQUERADE"},
+	})
+}
+
+func applyCsqttFirewall(rules []csqttFirewallSpec) {
+	if runtime.GOOS != "linux" {
+		return
+	}
+	runQuiet("sysctl", "-qw", "net.ipv4.ip_forward=1")
+	runQuiet("sysctl", "-qw", "net.ipv4.conf."+csqttIface+".rp_filter=2")
+	for _, r := range rules {
+		ensureIptables(r.table, r.chain, r.spec...)
+	}
+}
+
+func ensureIptables(table, chain string, spec ...string) {
+	if exec.CommandContext(context.Background(), "iptables", iptablesOp(table, "-C", chain, spec)...).Run() == nil {
+		return
+	}
+	// -I 1 so a UFW reject later in FORWARD cannot drop the new flow.
+	if chain == "FORWARD" {
+		runQuiet("iptables", iptablesOp(table, "-I", chain, append([]string{"1"}, spec...))...)
+		return
+	}
+	runQuiet("iptables", iptablesOp(table, "-A", chain, spec)...)
+}
+
+func iptablesOp(table, op, chain string, spec []string) []string {
+	args := make([]string, 0, 6+len(spec))
+	if table != "" && table != "filter" {
+		args = append(args, "-t", table)
+	}
+	args = append(args, op, chain)
+	return append(args, spec...)
+}
+
+func CsqttTunName(inboundID int) string {
+	return "tun" + strconv.Itoa(inboundID)
+}
+
+func CsqttTunGateway(inboundID int) string {
+	if inboundID >= 1 && inboundID < 254 {
+		return "10.252." + strconv.Itoa(inboundID) + ".1/30"
+	}
+	return "10.250." + strconv.Itoa((inboundID%253)+1) + ".1/30"
+}
+
+func clearQwdttRoutingForKey(key string) {
+	if key == CsqttKey {
+		clearQwdttXrayRouting(csqttRouteTable, []string{csqttIface})
+		return
+	}
+	const p = "qwdtt-"
+	if !strings.HasPrefix(key, p) {
+		return
+	}
+	id, err := strconv.Atoi(key[len(p):])
+	if err != nil || id <= 0 {
+		return
+	}
+	clearQwdttXrayRouting(QwdttRouteTable(id), nil)
+}
+
+func clearQwdttXrayRouting(table int, ifaces []string) {
+	if runtime.GOOS != "linux" || table <= 0 {
+		return
+	}
+	if len(ifaces) == 0 {
+		ifaces = []string{qwdttIfaceWG, qwdttIfaceRaw}
+	}
+	ts := strconv.Itoa(table)
+	for _, iface := range ifaces {
+		_ = exec.CommandContext(context.Background(), "ip", "rule", "del", "iif", iface, "lookup", ts).Run()
+	}
+	_ = exec.CommandContext(context.Background(), "ip", "route", "flush", "table", ts).Run()
 }
 
 func stripQwdttMasquerade() {
-	for _, subnet := range []string{qwdttSubnetWG, qwdttSubnetRaw} {
-		// Delete repeatedly until gone (binary may have added one rule).
-		for i := 0; i < 4; i++ {
-			out, err := exec.CommandContext(context.Background(), "iptables", "-t", "nat", "-D", "POSTROUTING",
-				"-s", subnet, "-j", "MASQUERADE").CombinedOutput()
-			if err != nil {
-				_ = out
-				break
-			}
+	for _, subnet := range []string{qwdttSubnetWG, qwdttSubnetWGLegacy, qwdttSubnetRaw} {
+		stripMasqueradeSubnet(subnet)
+	}
+}
+
+func stripMasqueradeSubnet(subnet string) {
+	for i := 0; i < 4; i++ {
+		out, err := exec.CommandContext(context.Background(), "iptables", "-t", "nat", "-D", "POSTROUTING",
+			"-s", subnet, "-j", "MASQUERADE").CombinedOutput()
+		if err != nil {
+			_ = out
+			return
 		}
 	}
 }

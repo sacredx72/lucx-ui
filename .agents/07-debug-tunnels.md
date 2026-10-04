@@ -4,6 +4,132 @@ Extracted from AGENTS.md. This file is project law.
 
 ---
 
+### Pattern 1aq: CSQTT connects, no traffic — Xray bridge incomplete — FIXED (lucx.277)
+
+- **Symptom (VladufQa, 01.10.2026):** CSQTT connects, traffic does not flow.
+- **Cause:** lucx.238 defaulted `routeThroughXray` on and stripped MASQUERADE, but only installed `iif csqtt1 lookup 1910`. AWG's bridge also has FORWARD accept, `rp_filter=2` on the source iface, and MSS clamp. The binary does not install those (upstream `deploy.sh` does; LucX does not run it). With UFW, FORWARD policy DROP eats `csqtt1 → tunN`. UDP connect is INPUT, so the session stays up.
+- **Fix:** default off. Off = host NAT (MASQUERADE + FORWARD) and the policy rule is removed. On = full bridge, FORWARD inserted at 1 so it beats UFW reject.
+- **Healing:** save the inbound (or wait one reconcile). Existing rows with `routeThroughXray: true` stay routed and get the bridge. Rows missing the key, and new inbounds, use host NAT.
+
+### Pattern 1ap: TrustTunnel sub has extra dead links — FIXED (lucx.276)
+
+- **Symptom (VladufQa, 01.10.2026):** TrustTunnel created, subscription has two links — the first works, the second does not. With HTTP/3 selected there are four (two of them dead).
+- **Cause:** `ShareLines` emitted every transport twice — spec TLV (`tt://?`) and the Throne authority URI (`tt://user:pass@host?...`). Audit of the parsers: official app / Exclave (`TrustTunnelFmt.kt` native TLV) / husi (`tturl.Parse`) accept TLV only and throw on the URI (`:` kills base64url) — the line is silently dropped by `runCatching`; Throne desktop parses the TLV too since 18.09.2026 (`trusttunnel.cpp ParseFromDeepLink`), so the URI form is dead weight everywhere and dupes the profile list.
+- **Fix:** `ShareLines` emits TLV only: http2 → 1 link, quic → 2 (https + quic, TLV 0x09 = 1/2).
+- **Healing:** refresh the subscription.
+- **Lesson:** before fanning out the same server in two URI dialects, check which client actually parses each dialect; one spec link beats a compatibility fallback no client needs.
+
+### Pattern 1ao: TrustTunnel HTTP/2 listens UDP; NekoBox shows the wrong pair — FIXED (lucx.267)
+
+- **Symptom (VladufQa, 24.09.2026):** HTTP/2 picker → NekoBox shows HTTP and QUIC, and the port listens UDP. HTTP/3 picker → QUIC and QUIC. Wanted: HTTP/2 = one HTTPS listener; HTTP/3 = HTTPS + QUIC.
+- **Cause:** `RenderVpnToml` always wrote `[listen_protocols.quic]`. TLV omitted `upstream_protocol` on HTTP/2; NekoBox treated `tt://?` without that tag as QUIC. HTTP/3 tagged both share lines as h3.
+- **Fix:** QUIC listen only when upstream is http3 (TCP stays). TLV always sets protocol 1 or 2. HTTP/3 share emits https and quic, each as TLV and Throne URI.
+- **Healing:** save the inbound (rewrites vpn.toml) and refresh the subscription.
+
+### Pattern 1an: Naive on the 443 mux times out — FIXED (lucx.266)
+
+- **Symptom:** Apply masking, Naive has no traffic, client timeout. Unticked, Apply says Naive still occupies :443.
+- **Cause:** naive-client SNI is the URL host and HTTP/3 does not survive a TCP-only mux. Default port is 443, so leaving it public also loses the bind to the gateway.
+- **Fix:** Classify Naive as public. Apply moves it off 443, opens that port, does not write a gateway Host. Reconcile releases a Naive already in the snapshot. Refresh the subscription.
+- **Lesson:** do not put a protocol on the SNI mux when the client cannot send a different SNI than the host it dials.
+
+### Pattern 1am: CSQTT hashes in the panel, no connect — FIXED (lucx.265)
+- **Symptom (VladufQa, 23.09.2026):** CSQTT inbound with VK hashes set does not connect. Same hashes on qWDTT connect.
+- **Cause:** Android `parseLinkHashes` splits the raw `hashes` query on `+` before percent-decode. Panel encoded the separator as `%2B`, so the list arrived as one hash. qWDTT wants commas and decodes first.
+- **Fix:** share and `/sub/` emit `hashes=h1+h2` (raw `+`). `%2B` stays only for a plus inside one hash.
+- **Healing without update:** delete the hashes field, re-import, or hand-edit the link: replace `%2B` between hashes with `+`.
+- **Lesson:** a client that splits before decode does not want `url.Values.Encode` on that separator.
+
+### Pattern 1al: Masking public host is a REALITY decoy; page resets while typing — FIXED (lucx.263)
+- **Symptom (VladufQa, 22.09.2026):** public host shows `wwwqa.microsoft.com` instead of the panel/Cover domain. VLESS link times out; manual panel SNI + port 443 works. Typing the host refreshes after each character. Naive listen stays on its old port, so UFW close kills it. Apply: `inbound "" still occupies TCP :443`.
+- **Cause:** empty public host fell through to the first classified SNI (REALITY dest). Preview query key included the field, so each keystroke unmounted the form. Client port (`Host :443`) was not shown; panel naive export used the loopback port. Empty remark made the occupy error useless.
+- **Fix:** resolve host as request → saved (unless it is that decoy) → panel domain → Cover hostname. Local input state. Listen shows `· :443`. Export uses the gateway Host port.
+- **Healing without update:** type is broken on this build — set the Cover hostname in the inbound, or edit the client to panel domain:443. Do not Apply while the field shows a decoy.
+
+### Pattern 1ak: naive behind Masking, share `?sni=` ignored — FIXED (lucx.258)
+- **Symptom (VladufQa):** openssl to naive SNI works; NekoBox/sub link times out. `naive-client` on the stand: Domain host → 200; publicHost and `?sni=` → fail.
+- **Cause:** lucx.253 wrote Masking Host (`vladnl.work.gd`) as URL host and `sni=inbound.domain`. klzgrad naiveproxy has no `?sni=`; SNI = publicHost → L4 to WEB proxy, not naive.
+- **Fix:** `ClientURLAt` URL host = inbound Domain, port from Host (443). No `?sni=`.
+- **Healing without update:** paste `naive+https://user:pass@<naive-domain>:443` (not the public cover host).
+- **Lesson:** do not invent query params the client binary does not implement.
+
+### Pattern 1aj: Masking L4 `aborted matching according to timeout` — FIXED (lucx.257)
+- **Symptom (VladufQa, 21.09.2026):** openssl/curl to naive SNI work; phone NekoBox → timeout. Log: `layer4 matching connection … aborted matching according to timeout`.
+- **Cause:** caddy-l4 waits for a TLS ClientHello before SNI routing. Default `matching_timeout` is 3s. Slow/mobile/fragmented hello never matches; catch-all never runs.
+- **Fix:** `matching_timeout 15s` in the gateway Caddyfile.
+- **Healing without update:** none — Caddyfile is rewritten on reconcile.
+- **Lesson:** an SNI mux that peeks TLS cannot use a LAN-sized match deadline on WAN clients.
+
+### Pattern 1ai: naive behind Masking, SNI → timeout — FIXED (lucx.256)
+- **Symptom (VladufQa, 21.09.2026):** naive up behind SNI gateway. No extra SNI → TCP CONNECT works. With SNI → client timeout.
+- **Cause:** Masking remaps naive to `127.0.0.1:54807`. `enableH3` (default) makes Caddy send `Alt-Svc: h3=":54807"`. L4 muxes TCP 443 only. NekoBox/Chromium QUIC to public `:54807` never falls back (same as Pattern 1ab).
+- **Fix:** `writeCaddyServers` pins `protocols h1 h2` whenever PROXY/loopback is on (naive, cover, tproxy).
+- **Healing without update:** turn off HTTP/3 on the naive inbound, save.
+- **Lesson:** a TCP-only front must not advertise HTTP/3 on the backend’s private port.
+
+### Pattern 1ah: CSQTT “password already assigned to another Device ID” after delete/recreate — FIXED (lucx.243)
+- **Symptom (zk0xch, 17.09.2026):** first inbound + iPhone import works. Delete inbound, create again, import — client says the password belongs to another device_id. New password in the card does not help. Restoring the *first* device_id on the phone works with any password.
+- **Cause:** CSQTT is a singleton key (`csqtt`). `Remove` stopped the process but `removeManagedFiles` skipped singleton data dirs. `csqtt.db` kept `main_device_id`. `--password` overwrites the password; empty `--device-id` does **not** clear the stored id. iOS re-import mints a new device_id.
+- **Fix:** wipe `csqtt-data` on inbound delete. Stamp the panel password; a change drops `csqtt.db`. Optional Device ID field → `csqtt --device-id`.
+- **Healing without update:** stop the inbound, `rm -rf /usr/local/x-ui/bin/tunnel/csqtt-data`, save/enable again, import once.
+- **Lesson:** a sidecar SQLite bind is part of inbound identity. Singleton key + “keep files” means delete is not delete.
+
+### Pattern 1af: CSQTT connected, no internet / no Xray outbound — FIXED (lucx.238)
+- **Symptom:** CSQTT inbound up, client connects, no traffic. No “Route through Xray” on the form.
+- **Cause:** lucx.233 skipped Xray on purpose. TUN `csqtt1` (`10.66.67.0/24`) never got policy routing into an Xray TUN (qWDTT has this). Direct MASQUERADE only if the binary installs it; operators expected the qWDTT-style outbound picker.
+- **Fix:** `routeThroughXray` default on. `iif csqtt1 lookup 1910` → Xray TUN. Optional outbound tag.
+- **Healing without update:** none in the panel. Host NAT `iptables -t nat -A POSTROUTING -s 10.66.67.0/24 -j MASQUERADE` + `sysctl net.ipv4.ip_forward=1` is a temporary direct path.
+- **Lesson:** a kernel TUN sidecar without the Xray TUN bridge is “connected, no internet” the first time someone picks an outbound.
+
+### Pattern 1ae: CSQTT enable kills Xray `unknown config id: csqtt` — FIXED (lucx.237)
+- **Symptom (Max, 16.09.2026):** start CSQTT inbound → `Failure in running xray-core: exit status 23` / `unknown config id: csqtt` (tag `in-46000-tcp`). Whole Xray down.
+- **Cause:** lucx.233 inbound was a sidecar, but `GetXrayConfig` and Local AddInbound still treated it as an Xray protocol. Xray has no `csqtt`.
+- **Fix:** skip via `lucxRuntimeSidecar`; Local Ensure/Remove `CsqttKey` like qWDTT.
+- **Healing without update:** disable the CSQTT inbound (or delete it) so Xray can start.
+- **Lesson:** a new sidecar protocol must be on every “not Xray” list in the same commit (`lucxRuntimeSidecar` / `isTunnelInboundProto` / Add/Del). One shared skip beats a copied if-chain.
+
+### Pattern 1ad: cover+naive white page — ZIP is fine (unreleased, after 221)
+- **Symptom (Max, 06.09.2026):** naive Behind cover works, browser gets a white page instead of the cover ZIP.
+- **Cause:** lucx.217 stripped `root`/`encode`/`file_server` next to `forward_proxy` (padding `None` on the stand). The real killer was `host:443` (lucx.220). Re-test with `:443, "host"`: ZIP + encode → site 200 and padding Variant1. `host:443` + ZIP → None.
+- **Fix:** cover emits the ZIP again when naive is attached. Listen stays `:443, "host"`.
+- **Healing without update:** none on 221 — wait for the next panel, or hand-edit the cover Caddyfile (will be overwritten on reconcile).
+- **Lesson:** after a listen-address fix, re-test the thing you deleted “because padding”. Do not keep a workaround whose cause moved.
+
+### Pattern 1ab: naive Behind cover, NekoBox “timeout” — FIXED (lucx.221)
+- **Symptom (Max, 06.09.2026):** naive and tproxy work alone; Behind cover + NekoBox+ → «Тайм-аут». Cover Caddyfile has `forward_proxy` and `:443, "host"`. Panel shows naive-N stopped (expected: cover fronts it).
+- **Cause:** cover always wrote `protocols h1 h2` when naive was attached. UI default `enableH3: true`. Standalone naive Caddy allows QUIC; NekoBox tries HTTP/3 and never falls back. Same host with h1/h2-only cover times out.
+- **Fix:** cover copies naive `enableH3`. Tproxy-in-front still pins h1/h2.
+- **Healing without update:** turn off HTTP/3 (QUIC) on the naive inbound, save, reconnect.
+- **Lesson:** a camouflage front must inherit the protocol flags of the thing it fronts. E2E with `naive-client` over TCP does not catch NekoBox QUIC.
+
+### Pattern 1ac: dead tproxy Behind cover kills naive — FIXED (lucx.221)
+- **Symptom:** tproxy Behind cover without its own `index.html` logs `tproxy-N disabled: site needs index.html`, but cover still `reverse_proxy` to the loopback relay. Naive on the same hostname is stopped (`NaiveFrontedByCover`) and has no `forward_proxy`.
+- **Cause:** `CoverInstanceFromInbound` attached tproxy on hostname match alone. `NaiveFrontedByCover` did not check that cover actually injected naive.
+- **Fix:** attach tproxy only if `Tproxy` core is Enabled. Naive is fronted only when cover `ConfigText` contains `forward_proxy`.
+- **Healing without update:** upload a site zip on the tproxy inbound (cover’s zip is not reused), or disable tproxy Behind cover.
+- **Lesson:** exclusive “tproxy owns the host” must not run when the tproxy stack is down.
+
+### Pattern 1aa: tproxy “token.key: no such file” on a fresh panel — FIXED (lucx.220)
+- **Symptom (Andrey, 06.09.2026):** new Telegram WEB proxy → `tproxy-N process exited: exit status 1` / `token_key_file: open /usr/local/x-ui/bin/tunnel/token.key: no such file or directory`. Pasting the panel 32-hex secret into that file does not help (wrong key, often 0644 or 33 bytes with newline).
+- **Cause:** tproxy-server `f7a6acc4` (lucx.218) requires a persistent 32-byte HMAC file, mode `0600`/`0400`. Default path is `token.key` next to the relay JSON. LucX never created it.
+- **Fix:** `ensureTproxyTokenKey` writes the file once and sets `token_key_file` in the rendered config. Existing bytes are never replaced.
+- **Healing without update:** `head -c 32 /dev/urandom | sudo tee /usr/local/x-ui/bin/tunnel/token.key >/dev/null; sudo chmod 600 /usr/local/x-ui/bin/tunnel/token.key` then wait one reconcile tick (or save the inbound).
+- **Lesson:** a sidecar pin bump that adds a required secret file is a panel provisioner change, not “the operator should mkdir”.
+
+### Pattern 1y: qWDTT from a managed node vanishes after attach — FIXED
+- **Symptom (xFilosofx, #59, 03.09.2026):** attach qWDTT (node inbound) to a client → success → refresh → gone from attached list and subscription.
+- **Cause:** qWDTT/olcRTC are share-only (`client_inbounds`, no `settings.clients[]`). Node heartbeat `setRemoteTraffic` did `GetClients(snapshot)` → empty → `SyncInbound(..., [])` pruned every attach.
+- **Fix:** skip `shareOnlySidecar` in that sync loop. Membership stays on the master.
+- **Healing:** update master; re-attach. Local (non-node) qWDTT was never wiped.
+- **Lesson:** never rebuild master membership from a node snapshot that cannot represent it.
+
+### Pattern 1x: naive / mieru / TrustTunnel sub from the master is dead — FIXED (lucx.202)
+- **Symptom (Alexandr_Sh / Илья, 01.09.2026):** standalone node links work; after adding the node to a master, master’s subscription for naive/mieru (and TrustTunnel) does not connect.
+- **Cause:** pairs were `HMAC(this panel’s secret, this row’s inbound.Id, email)`. `wireInbound` does not send `id`. Master sub used master secret+id; node sidecar used node secret+id.
+- **Fix:** `settings.authSeed` minted on the master when `NodeID != nil`, pushed with settings. `InboundAuthPair` uses the seed when present. Empty seed = old HMAC (local inbounds unchanged). Form strip: Zod `authSeed` optional + `PreserveAuthSeed` on update. qWDTT empty `subHost` uses `resolveInboundAddress` (node host), not the master’s outbound IP.
+- **Healing:** update master and node to lucx.202+. Next node reconcile writes the seed and pushes; clients must re-fetch the **master** subscription (node-issued links for that inbound rotate once).
+- **Lesson:** anything derived from panel-local secret/id cannot be the client password of a node-hosted sidecar. Put the HMAC key in the inbound JSON that already syncs.
+
 ### Pattern 1m: tunnel-sidecar lives on after inbound delete (“spams logs even though I deleted it”) — FIXED (lucx.115)
 - **Cause:** dual source of truth for tunnel cores. Besides inbounds (`olcrtc-{id}` / `naive-{id}`) the legacy path lives on: settings blob `lucxTunnel_{naive,olcrtc,qwdtt}` + Tunnels-page card (Start/Stop/Save) + manager key without prefix (`olcrtc`). `reconcile{Naive,Olcrtc}Inbounds` with NO inbounds fell back to the blob and `Ensure`’d the legacy core: a blob with `enabled:true` resurrected the process every tick (10 s). Deleting the inbound only tore down `{core}-{id}`. How the blob becomes `enabled:true` after lucx.102 migration: migration writes `migratedToInbound` and REMOVES `enabled`, but the legacy Start/Save button on the Tunnels page re-saves the blob as a struct without the marker and with `enabled:true`. Two adjacent gaps: with empty `want`, `Reconcile{Naive,Olcrtc}` wasn’t called → orphan `{core}-{id}` weren’t swept; a migrated blob was treated as legitimate desired-state. Same footgun on all three cores (naive/olcrtc/qwdtt).
 - **Symptom (VladufQa, 13.08.2026):** deleted olcRTC inbound — panel keeps spamming olcrtc `[ice] TRACE` logs, process holds the client (STUN from client IP).
@@ -16,9 +142,10 @@ Extracted from AGENTS.md. This file is project law.
 - **Symptom:** olcRTC tunnel (any provider — Telemost/Jitsi/WB) worked; after `x-ui update` / web update clients stop connecting though config/room/provider didn’t change. Report NoName (16.08.2026): “Friday it flew through Yandex, yesterday it stopped”.
 - **Cause:** `release.yml` built olcrtc from **unpinned `master`**. Upstream on 14.08.2026 merged PR #140 “Refactor/global overhaul” (252 files), fully rewriting the crypto layer: old format (raw key → XChaCha20-Poly1305, frame `[24B nonce][ct][tag]`) replaced by “OLC2” (HKDF-SHA256 directional keys, frame `magic "OLC2"|counter|16B prefix|ct|tag`, replay-window, AAD). **No fallback to the old format** — their readme: “no compatibility fallback… Upgrade both endpoints together”. Server after update speaks OLC2, client app (owenclave/olcbox) stays on old crypto → no packet passes auth → tunnel is dead. YAML/URI schemas are compatible — only the data plane breaks.
 - **Diagnostics:** binary version isn’t printed (`usage: olcrtc <config.yaml>` on any flag). Check the date of `/usr/local/x-ui/bin/olcrtc-linux-amd64` (matches last panel update) and sidecar logs `journalctl -u x-ui | grep -i olcrtc` (prefix `olcrtc: <label> |`). Key signal: server was updated, client app was not.
-- **Fix (lucx.132):** pin `OLCRTC_REF` in release.yml to `3339cd36716885e583429f97e73462cde4984e2e` (last master before PR #140 = lucx.112–118 binary, verified on Telemost). Clone via `git init + fetch --depth 1 <SHA> + checkout FETCH_HEAD`: `git clone --branch <SHA>` on GitHub does NOT work (“Remote branch … not found”), fetch by SHA does.
-- **Healing an already-hit host without lucx.132:** pull `olcrtc-linux-amd64` from tarball `v3.6.0-lucx.118`, replace `/usr/local/x-ui/bin/`, restart the inbound; or install an OLC2 build on the client (olcbox nightly from 16.08.2026+; owenclave has no OLC2 yet).
-- **Lesson:** external sidecar binaries built from someone else’s unpinned `master` are a bomb: any upstream wire-breaking merge silently rides into the next release. ALL cores are pinned (mieru/TrustTunnel/caddy-naive already were; olcrtc was the exception). Lift the olcrtc pin only when clients ship OLC2 builds AND e2e has been run on a real provider.
+- **Fix (lucx.132):** pin `OLCRTC_REF` to `3339cd36716885e583429f97e73462cde4984e2e` (last master before PR #140). Clone via `git init + fetch --depth 1 <SHA> + checkout FETCH_HEAD`.
+- **lucx.199:** pin moved to `ebe518a2af2d3c5da4d55c3872f8f3298a4d2f45` (OLC2). Server now speaks OLC2. Old owenclave / pre-16.08 olcbox → `muxconn: decrypt failed` / `chacha20poly1305: message authentication failed` (VladufQa, 01.09.2026). Client must be olcbox nightly 16.08.2026+. YAML/URI unchanged. **lucx.218:** pin moved to `54bd269b` (same OLC2 wire + KCP framing fix).
+- **Healing:** update panel to lucx.199+ and use an OLC2 client. To stay on old crypto: keep `olcrtc-linux-amd64` from lucx.118–198 (`3339cd36`).
+- **Lesson:** never unpin to `master`. Bump the SHA when both ends speak the new wire.
 
 ### Pattern 1p: TrustTunnel “listens, no traffic” + outbound AWG — FIXED (lucx.133)
 - **Symptom:** process `trusttunnel-N` UP, TCP/UDP :443 listening, client connects, no internet. Log: `trusttunnel egress : target tag [ SW ] not found, skipping injection`. `ss` shows no loopback SOCKS (`routeXrayPort`).
@@ -33,7 +160,62 @@ Extracted from AGENTS.md. This file is project law.
 - **Fix (lucx.144):** `UpdateInboundClient` no-op for share-only; `Update` skips those inbounds and still writes `ClientRecord` when nothing else is attached. Tests `TestUpdateAfterShareOnlyAttach`, `TestUpdateShareOnlyOnlyClient`.
 - **Lesson:** if attach/detach have a protocol-specific path, **update must too**. Walking “every inbound id” through the Xray-clients JSON path breaks share-only sidecars.
 
+### Pattern 1w: Throne mieru `traffic-pattern` shows `%2F` — FIXED (lucx.196)
+- **Symptom (Tuna, 30.08.2026):** Throne on PC gets `CO%2FD%2FvIF…==` instead of `CO/D/vIF…==`.
+- **Cause:** `ClientLink` used `url.QueryEscape` on std base64. `/` → `%2F`. Throne does not decode `%2F` (same as Pattern 1r).
+- **Fix:** write `traffic-pattern=` as-is. Test forbids `%2F`.
+- **Healing without update:** none — the link is generated live. Update the panel and re-copy `mierus://`.
+
 ### Pattern 1r: TrustTunnel `client_random_prefix=%2F` — NekoBox+ drops it — FIXED (lucx.145)
 - **Symptom (doc. bravn, lucx.144):** Throne/NekoBox+ link has `client_random_prefix=3eb5d634%2Fffffffff`; NekoBox+ does not write the prefix.
 - **Cause:** lucx.142 appended the prefix via `url.QueryEscape`, which encodes `/` as `%2F`. The value is only hex or hex/mask (`ValidClientRandomPrefix`) — `/` is safe raw in the query. NekoBox+ does not URL-decode that param.
 - **Fix:** `ClientURI` writes `client_random_prefix=` as-is. Test forbids `%2F`. TLV `tt://?` already carried `/` in binary (unchanged).
+
+### Pattern 1t: update `gunzip failed` / `Text file busy` on caddy-naive / trusttunnel — FIXED (lucx.164)
+- **Symptom:** `x-ui update` / web update prints `/dev/fd/63: line 126: bin/caddy-naive-linux-amd64: Text file busy` and `gunzip failed` (same for `trusttunnel-linux-*` or any live sidecar). Curl progress bars succeed. Panel comes up.
+- **Cause:** lucx.161 moved sidecar fetch AFTER `systemctl start x-ui`. Reconcile execs the old `bin/<core>-linux-*`. `gzip -dc > dest` opens that inode O_WRONLY → ETXTBSY. Non-running sidecars (clients, unused cores) unpack fine.
+- **Fix (lucx.164):** write `${name}.new`, `mv -f` onto dest (directory entry swaps; old process keeps old inode), `pkill -f ${name}` so the next reconcile tick execs the new file.
+- **Healing an already-hit host without lucx.164:** panel is already new. Only the binaries that printed `gunzip failed` stayed old. Either leave them (if that core did not change) or:
+  `pkill -f caddy-naive-linux-amd64; pkill -f trusttunnel-linux-amd64`
+  then re-run `x-ui update` once lucx.164 is on `main` (menu curls fresh `update.sh`).
+- **Lesson:** never write over an executable that may be running. Same rule the Go Cores download already follows (`dst+".download"` + `Rename`).
+
+### Pattern 1u: qWDTT paste of the full panel link hangs on DTLS — FIXED (lucx.167)
+- **Symptom (VladufQa, 24.08.2026):** SpaceNeuroX 1.4.2. Compact `wdtt://ip:dtls:wg:local:pass:hash` connects. A lone `qwdtt://config?…` connects. Pasting the panel's two-line block (modern + legacy) hangs on `[DTLS] Handshake…` / step DTLS 10s.
+- **Cause:** `genQwdttLink` (frontend + `/sub/`) concatenated `qwdtt://config?…\nwdtt://…`. Client `SubscriptionImport.parsePayload` does `startsWith("qwdtt://config")` then `Uri.parse` of the **whole** clipboard. The second line rides into `pass` → wrong password → DTLS timeout. Official APK export is a single `qwdtt://config?` line (`ExportProfileSheet`).
+- **Fix (lucx.167):** emit only `qwdtt://config?`. `LegacyURI` stays a separate copy on the Tunnels card. Tests forbid a newline / `wdtt://` in the share string.
+- **Healing without lucx.167:** paste only the first line, or only the `wdtt://` line, never both.
+- **Lesson:** one client, one clipboard URI. Two formats for two apps (TrustTunnel TLV + Throne) is fine; two formats for the same SpaceNeuroX importer is not.
+
+### Pattern 1s: qWDTT DTLS handshake timeout 10s — stale sidecar vs client 1.4.2 — FIXED (lucx.163)
+- **Symptom (VladufQa, 22.08.2026):** SpaceNeuroX client log: DNS/VK/WRAP/TURN green, then `[DTLS] Handshake…` and `step DTLS did not finish in 10s`. Operator asked whether listen should be `0.0.0.0:56000` or the server IP.
+- **Cause:** two independent footguns. (1) **Listen vs SubHost:** `-listen` is the server bind (`0.0.0.0:56000`); `subHost` is the advertised `peer` (`PUBLIC_IP:56000`). Putting `0.0.0.0` in `subHost` makes the client DTLS to itself. (2) **Wire skew:** we shipped Ex3-ui `v1.0` extra-qwdtt (~qWDTT 1.4.0, 09.08). Client `v1.4.2` (19.08) commit `Harden server authentication and transport` bumped pion/dtls 3.1.2→3.1.5 and changed WRAP/auth. Same timeout is also upstream issue #31 (even 1.4↔1.4 around 15.08).
+- **Fix (lucx.163):** pin `qwdtt-linux-*` to SpaceNeuroX SHA `6c2f7a627d9fc0b54240035818ff86b6d2b6c76f` (`v1.4.2` `./server`). Live binary is `third_party/sidecars/linux-amd64/qwdtt-linux-amd64.gz` (install/update fetch). `release.yml` / `sourcecraft-release.sh` build from that SHA, not Ex3-ui. CLI flags (`-listen/-password/-dns/…`) unchanged. **lucx.218:** `v1.4.3` (`fae121ef`). **lucx.232:** `v1.4.4` (`a296c57e`).
+- **Diagnostics:** `ps aux | grep qwdtt`; `ss -ulnp | grep 56000`; inbound `listenAddr=0.0.0.0:56000` and `subHost=<public>:56000`; client APK ≥ 1.4.2. Binary date under `/usr/local/x-ui/bin/qwdtt-linux-amd64` older than 19.08.2026 = this bug.
+- **Healing an already-hit host without lucx.163:** replace `/usr/local/x-ui/bin/qwdtt-linux-amd64` with a `v1.4.2` `./server` build (Cores upload or gunzip the third_party blob), restart the inbound. Confirm `subHost` is the public IP, re-issue the `qwdtt://` link.
+- **Lesson:** same as Pattern 1o. A sidecar taken from a third-party panel tarball ages in silence. Pin the upstream SHA of the protocol we claim to speak; bump only with a matching client.
+
+---
+
+### Pattern 1z: Telegram WEB proxy (tproxy) "connects, no traffic" + dies on save — FIXED (lucx.203)
+- **Symptom (VladufQa, 03.09.2026):** tproxy inbound: TCP to the port connects but no traffic; after saving the inbound the whole stack stops listening. mtproxy-18 log: `change_user_group: can't find the user mtproxy to switch to` / `fatal: cannot change user to (none)`, exit 1 loop. Zero panel-log lines explaining the teardown.
+- **Cause 1 (crash loop):** the pinned MTProxy `f36d8af` has `DEFAULT_ENGINE_USER "mtproxy"` (common/server-functions.h). We passed no `-u`; the panel runs as root, so the engine drops to user `mtproxy`, which does not exist → fatal on every start. Backend dead → Caddy accepts TCP, no data flows.
+- **Cause 2 (silent teardown):** `TproxyInstancesFromInbound` returned the all-disabled triple on ANY failed check (missing site zip, cert not covering hostname, asset fetch) without logging — reconcile stopped all three processes with no reason in the log. "Works with the modal open" was just the upload endpoint's immediate reconcile with the still-valid stored row; the save rewrote the row and a check (most likely the site dir) failed.
+- **Fix:** (1) `ensureMtproxyUser()` — `useradd -r -M -N mtproxy` when root, and `mtproxyArgs` always passes `-u <resolved>` (mtproxy → nobody → current user); assets relaxed to 0755/0644 (public core.telegram.org values, the dropped user re-reads proxy-multi.conf on periodic reload). (2) every disable path now logs `tunnel: tproxy-<id> disabled: <reason>`.
+- **Not bugs:** `proxy-multi.conf` full of `proxy_for <dc> 149.154.x.x:8888;` lines is the stock file from `core.telegram.org/getProxyConfig` — correct. "Port busy" with TrustTunnel on 443 is correct: WEB proxy is hardwired to 443 by the client type, one port = one listener, TT already owns it.
+- **Still client-side:** WEB proxy is a POC type — regular Telegram apps do not register `t.me/webproxy`; testing needs a TD desktop POC build or the POC Android client.
+- **Lesson:** a C sidecar with a built-in privilege-drop user needs that user provisioned (or an explicit `-u`), and a function that returns "all disabled" must say why — otherwise every field report starts with "чет не завелось" and nothing else.
+
+### Pattern 1af: tproxy “via Xray” hangs and kills all routing — FIXED (lucx.219)
+
+- **Symptom (VladufQa / Max, 04.09.2026):** WEB proxy + routeThroughXray. Telegram connects, no DC traffic. Other inbounds die until tproxy is off.
+- **Cause (prod Vladru.work.gd, lucx.209):** iptables REDIRECT into dokodemo. Sniffing `http,tls,quic` on raw MTProto DC sockets stalled (`CLOSE-WAIT Recv-Q=1`), mtproxy kept dialing every DC, xray hit thousands of fds, **all** routing died. lucx.210 removed sniffing; testers still hung. lucx.211 parked the toggle.
+- **lucx.219:** uid `lucx-mtproxy` (not host `mtproxy`) NAT OUTPUT REDIRECT → panel SOCKS5 bridge → Xray SOCKS inbound, no sniffing (same path as mtg). Dokodemo and TUN both leaked CLOSE-WAIT. Direct egress remains the default.
+- **Healing:** update to 219 and turn “Route through Xray” on.
+
+### Pattern 1v: AnyTLS dead when UFW is on, port is allowed — FIXED
+- **Symptom (Max, 29.08.2026):** AnyTLS works with UFW off. Port 8555 is in `ufw status` and `ufw-user-input` ACCEPT, but clients hang. `tcpdump` shows SYN in, no SYN-ACK. `iptables -L INPUT`: first rules are `RETURN tcp dpt:8555 /* lucx-anytls-anytls-17 */` with packet counters climbing; UFW’s 8555 ACCEPT stays at 0 pkts.
+- **Cause:** lucx.190 traffic scrape inserted `-j RETURN` at the top of builtin INPUT. RETURN from a builtin chain applies the chain policy. UFW sets INPUT policy DROP → SYN is counted then dropped, never reaches `ufw-user-input`. Comment `lucx-anytls-anytls-17` = `lucx-anytls-` + inbound key `anytls-17` (inbound id 17). Same for leftover 8443 rules from older anytls inbounds.
+- **Fix (lucx.192):** accounting must not terminate INPUT. lucx.192 first jumped to empty `LUCX_ANYTLS_ACCT` (UFW works, but iptables-nft often leaves jump counters at 0 → panel traffic/online stay empty). Now `-j MARK --set-xmark 0x0/0x0` (non-terminating, counters increment). Sweep leftover `-j RETURN` and `-j LUCX_ANYTLS_ACCT`.
+- **Healing without lucx.192:** `iptables -I INPUT 1 -p tcp --dport 8555 -j ACCEPT` (and 8443 if those RETURN rules exist). Deleting RETURN is pointless — scrape re-inserts until the update. Or leave UFW off.
+- **Lesson:** accounting rules must not change filter policy. `-j RETURN` on a builtin chain is not a no-op when policy is DROP. Jump-to-empty-chain is also not a counter: use a non-terminating target (`MARK 0/0`).

@@ -2,7 +2,7 @@
 
 Extracted from AGENTS.md. This file is project law.
 Read when the task depends on a known issue or product constraint.
-Changelog: `progress.md`, last 1–2 entries only.
+Changelog: `docs/progress.md`, last 1–2 entries only.
 
 ---
 
@@ -12,7 +12,7 @@ Changelog: `progress.md`, last 1–2 entries only.
 
 **Resolved (2026-07-13):** refactor by deleting dead code. Files `params.go`, `cps.go`, `config.go`, `templates.go`, `types.go`, `helpers.go` + 5 tests were fully dead — their functions (`GenerateAWGParams`, `GenerateCPS`, `BuildServerConfig`, `RenderPostUp`, etc.) were only called by tests, no live call site used them. Key/obfuscation generation is done in the frontend (`createDefaultAwgInboundSettings`). AWG cut from 19 to 8 files (6 .go + 2 tests) — nearly symmetric with mtproto (9 files). Upstream updates now need ~20 files ported instead of 29.
 
-**Finished (2026-07-18):** final slimming to exact parity. `traffic.go` merged into `manager.go` (Traffic + scrapeTransfer, later → scrapePeers, live only for CollectTraffic); `nat_{linux,other}.go` + `orphans_{linux,other}.go` merged into one platform pair `platform_{linux,other}.go`; also cleaned unused-import var guards (`strconv`/`syscall`) — leftovers from removed tun2socks. Core package result: **6 source + 3 test = 9 files**, exactly like mtproto (4 source + 2 platform + 3 test). `cps/` and `signature/` stay separate packages — features mtproto doesn’t have.
+**Finished (2026-07-18):** slimming toward mtproto parity. `cps/` and `signature/` stay separate. **Do not re-slim:** import, diagnostics, outbound (`awgo-N`), portfwd, vpnuri, kernel/gVisor fallback are live product, not dead mtproto copies. A second Amnezia path (`protocol=amneziawg` / `amneziawgnet`) exists for no-module hosts — do not mix with kernel `protocol=awg` on the same iface name without checking.
 
 ### 2. ~~Sidecar not verified in real runtime on a VPS~~ — CLOSED
 
@@ -62,7 +62,7 @@ Not to re-add: tun2socks (replaced by TUN inbound), DNS in the server .conf (bre
 
 ### 6. geo files overwritten on panel update — upstream behavior, we do NOT fix (decision 2026-08-09)
 
-**Essence:** `release.yml` packs fresh stock geo into the tarball; `update.sh` unpacks over the top → **any** panel update resets those names to stock. Symptom (Aleksandr SacredX, lucx.88): custom geosite groups vanished after web update → Xray won’t start (routing can’t find groups in geo.dat). **Decision:** leave `update.sh` alone (parity with upstream). Advice to operators: keep custom groups in files with a **separate name** — the tarball won’t touch them; or restore via cron after update.
+**Essence:** if geo is in the tarball, `update.sh` unpacks over the top → stock names reset. Symptom (Aleksandr SacredX, lucx.88): custom geosite groups vanished after web update → Xray won’t start. **Decision:** leave unpack-overwrite alone (parity with upstream). Advice: keep custom groups in a **separate filename**. lucx.198: fetch runs **before** first start so a fresh install is not missing geo. lucx.230: install/update **skip** a stock `.dat` that already exists (missing → fetch). Fresh geo: Xray `geodata.assets` cron + panel Geofiles / `x-ui update-geofiles`. Geo is not packed in the GitHub panel tarball; Yandex ships `x-ui-geo.tar.gz`.
 
 **Stock since lucx.99 (8 files):** `geoip/geosite.dat` (Loyalsoldier), `_IR` (chocolate4u), `_RU` (runetfreedom), **`_ROSCOM`** (hydraponique/roscomvpn-{geoip,geosite} — RKN geoblock / category-ru / category-ads / youtube/telegram/steam). ROSCOM is a separate name, doesn’t overwrite others’ customs. Update: panel Version → Geofiles / `x-ui` menu → RoscomVPN / `update-all-geofiles`. In routing: `ext:geosite_ROSCOM.dat:category-geoblock-ru` etc. (presets in `constants.ts`). Geodata browser picks up any `*.dat` in `bin/`.
 

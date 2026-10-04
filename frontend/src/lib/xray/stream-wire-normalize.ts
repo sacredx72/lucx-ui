@@ -153,9 +153,7 @@ export function validateRealityMaxClientVer(max: string, min: string): string | 
   if (!maxParts || !minParts) return undefined;
   for (let i = 0; i < 3; i++) {
     if (maxParts[i] !== minParts[i]) {
-      return maxParts[i] < minParts[i]
-        ? 'pages.inbounds.form.maxClientVerBelowMin'
-        : undefined;
+      return maxParts[i] < minParts[i] ? 'pages.inbounds.form.maxClientVerBelowMin' : undefined;
     }
   }
   return undefined;
@@ -255,12 +253,7 @@ export function normalizeXhttpForWire(
 
   if (out.xPaddingObfsMode !== true) {
     delete out.xPaddingObfsMode;
-    dropEmptyStrings(out, [
-      'xPaddingKey',
-      'xPaddingHeader',
-      'xPaddingPlacement',
-      'xPaddingMethod',
-    ]);
+    dropEmptyStrings(out, ['xPaddingKey', 'xPaddingHeader', 'xPaddingPlacement', 'xPaddingMethod']);
   }
 
   if (out.noGRPCHeader !== true) delete out.noGRPCHeader;
@@ -297,13 +290,7 @@ export function normalizeSockoptForWire(
     'mark',
   ]);
 
-  dropFalseFlags(out, [
-    'acceptProxyProtocol',
-    'tcpFastOpen',
-    'tcpMptcp',
-    'penetrate',
-    'V6Only',
-  ]);
+  dropFalseFlags(out, ['acceptProxyProtocol', 'tcpFastOpen', 'tcpMptcp', 'penetrate', 'V6Only']);
 
   if (out.tproxy === 'off') delete out.tproxy;
   if (out.domainStrategy === 'AsIs') delete out.domainStrategy;
@@ -334,6 +321,21 @@ export function normalizeSockoptForWire(
 
   if (Object.keys(out).length === 0) return undefined;
   return out;
+}
+
+// Emit `finalmask` only when a mask exists (legacy `hasFinalMask`), and drop an empty
+// sub-array beside a populated one so the payload carries no stray `"tcp": []`.
+export function dropEmptyFinalMask(stream: Record<string, unknown>): void {
+  const fm = stream.finalmask as { tcp?: unknown[]; udp?: unknown[]; quicParams?: unknown };
+  if (!fm || typeof fm !== 'object') return;
+  const hasTcp = Array.isArray(fm.tcp) && fm.tcp.length > 0;
+  const hasUdp = Array.isArray(fm.udp) && fm.udp.length > 0;
+  if (!hasTcp && !hasUdp && fm.quicParams == null) {
+    delete stream.finalmask;
+    return;
+  }
+  if (!hasTcp) delete fm.tcp;
+  if (!hasUdp) delete fm.udp;
 }
 
 export function normalizeStreamSettingsForWire(

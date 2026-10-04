@@ -79,7 +79,9 @@ function encodeForm(data: unknown): string {
       return;
     }
     if (typeof value === 'object') {
-      Object.entries(value as Record<string, unknown>).forEach(([k, v]) => append(`${key}[${k}]`, v));
+      Object.entries(value as Record<string, unknown>).forEach(([k, v]) =>
+        append(`${key}[${k}]`, v),
+      );
       return;
     }
     parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
@@ -192,6 +194,10 @@ export async function httpRequest(
   const parsed = await parseBody(res);
   if (!res.ok) throw new HttpError(res.status, res.statusText, parsed);
   return { ok: true, status: res.status, statusText: res.statusText, data: parsed };
+}
+
+export function withBasePath(path: string): string {
+  return basePathPrefix + path;
 }
 
 export function setupHttp(): void {

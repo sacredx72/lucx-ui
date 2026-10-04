@@ -13,7 +13,9 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/pem"
+	"io"
 	"math/big"
 	"net"
 	"os"
@@ -76,6 +78,14 @@ func TestTrustTunnelRenderVpnToml(t *testing.T) {
 	if strings.Contains(got, "socks5") || strings.Contains(got, "[metrics]") {
 		t.Fatal("direct config must not carry socks5/metrics")
 	}
+	if strings.Contains(got, "[listen_protocols.quic]") {
+		t.Fatal("http2 must not listen UDP")
+	}
+	cfg.UpstreamProtocol = "http3"
+	if quic := cfg.RenderVpnToml("/w/creds.toml", "/w/rules.toml", "", ""); !strings.Contains(quic, "[listen_protocols.quic]") || !strings.Contains(quic, "[listen_protocols.http2]") {
+		t.Fatalf("http3 must listen TCP and QUIC:\n%s", quic)
+	}
+	cfg.UpstreamProtocol = "http2"
 
 	cfg.ListenPreset = "stock"
 	got = cfg.Merge().RenderVpnToml("/w/creds.toml", "/w/rules.toml", "", "")
@@ -301,8 +311,8 @@ func TestTrustTunnelClientDeepLink(t *testing.T) {
 	if _, ok := tlvs[0x04]; ok {
 		t.Fatal("has_ipv6=true (default) must be omitted")
 	}
-	if _, ok := tlvs[0x09]; ok {
-		t.Fatal("http2 (default) must be omitted")
+	if got := tlvs[0x09]; len(got) != 1 || len(got[0]) != 1 || got[0][0] != 1 {
+		t.Fatalf("http2 must set upstream_protocol=1, got %v", tlvs[0x09])
 	}
 	dnsVal := tlvs[0x0D][0]
 	// [len][elem][len][elem]
@@ -312,6 +322,114 @@ func TestTrustTunnelClientDeepLink(t *testing.T) {
 
 	if cfg.ClientDeepLink("", AuthPair{User: "u", Pass: "p"}, "") != "" {
 		t.Fatal("empty address must yield empty link")
+	}
+}
+
+func TestTrustTunnelShareLines(t *testing.T) {
+	cfg := DefaultTrustTunnelConfig()
+	cfg.Hostname = "vpn.example.com"
+	pair := AuthPair{User: "u", Pass: "p"}
+	lines := cfg.ShareLines("vpn.example.com:443", pair, "r")
+	if len(lines) != 1 {
+		t.Fatalf("http2 lines = %d, want single TLV link: %q", len(lines), lines)
+	}
+	if !strings.HasPrefix(lines[0], "tt://?") {
+		t.Fatalf("http2 must emit the spec TLV deep link: %s", lines[0])
+	}
+	for _, line := range lines {
+		if strings.Contains(line, "alpn=h3") {
+			t.Fatalf("http2 must not advertise quic: %s", line)
+		}
+	}
+	cfg.UpstreamProtocol = "http3"
+	lines = cfg.ShareLines("vpn.example.com:443", pair, "r")
+	if len(lines) != 2 {
+		t.Fatalf("http3 lines = %d, want https+quic TLV links: %q", len(lines), lines)
+	}
+	var h2, h3 int
+	for _, line := range lines {
+		payload, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(line, "tt://?"))
+		if err != nil {
+			t.Fatalf("links must be TLV deep links: %v (%s)", err, line)
+		}
+		proto, err := tlvcUpstreamProto(payload)
+		if err != nil {
+			t.Fatalf("upstream_protocol TLV: %v (%s)", err, line)
+		}
+		switch proto {
+		case ttProtoHTTP2:
+			h2++
+		case ttProtoHTTP3:
+			h3++
+		}
+	}
+	if h2 != 1 || h3 != 1 {
+		t.Fatalf("http3 must advertise one https and one quic TLV, h2=%d h3=%d", h2, h3)
+	}
+}
+
+// tlvcUpstreamProto walks the TLV stream and returns tag 0x09's varint value.
+func tlvcUpstreamProto(payload []byte) (int, error) {
+	i := 0
+	for i < len(payload) {
+		tag, n := tlsVarintDecode(payload[i:])
+		if n == 0 {
+			return 0, io.ErrUnexpectedEOF
+		}
+		i += n
+		l, n := tlsVarintDecode(payload[i:])
+		if n == 0 {
+			return 0, io.ErrUnexpectedEOF
+		}
+		i += n
+		if int(l) > len(payload)-i {
+			return 0, io.ErrUnexpectedEOF
+		}
+		if tag == 0x09 {
+			v, _ := tlsVarintDecode(payload[i:])
+			return int(v), nil
+		}
+		i += int(l)
+	}
+	return 0, io.ErrUnexpectedEOF
+}
+
+func tlsVarintDecode(b []byte) (uint64, int) {
+	if len(b) == 0 {
+		return 0, 0
+	}
+	switch prefix := b[0] >> 6; prefix {
+	case 0:
+		return uint64(b[0] & 0x3f), 1
+	case 1:
+		if len(b) < 2 {
+			return 0, 0
+		}
+		return uint64(b[0]&0x3f)<<8 | uint64(b[1]), 2
+	case 2:
+		if len(b) < 4 {
+			return 0, 0
+		}
+		return uint64(b[0]&0x3f)<<24 | uint64(b[1])<<16 | uint64(b[2])<<8 | uint64(b[3]), 4
+	default:
+		if len(b) < 8 {
+			return 0, 0
+		}
+		v := binary.BigEndian.Uint64(b[:8])
+		return v & 0x3fffffffffffffff, 8
+	}
+}
+
+func TestPreserveOmittedClients(t *testing.T) {
+	old := `{"password":"p","clients":[{"email":"a@b","enable":true}]}`
+	stripped := `{"password":"q","sni":"x"}`
+	got := PreserveOmittedClients(old, stripped)
+	if !strings.Contains(got, `"email": "a@b"`) && !strings.Contains(got, `"email":"a@b"`) {
+		t.Fatalf("omitted clients must be restored: %s", got)
+	}
+	explicit := `{"clients":[]}`
+	if got := PreserveOmittedClients(old, explicit); strings.Contains(got, "a@b") {
+		t.Fatalf("explicit empty clients must stay empty: %s", got)
 	}
 }
 

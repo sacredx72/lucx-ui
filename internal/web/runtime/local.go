@@ -8,11 +8,14 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/mhsanaei/3x-ui/v3/internal/amneziawg"
+	"github.com/mhsanaei/3x-ui/v3/internal/amneziawgnet"
 	"github.com/mhsanaei/3x-ui/v3/internal/awg" // LUCX-HOOK: AWG sidecar
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 	"github.com/mhsanaei/3x-ui/v3/internal/lucx/tunnel" // LUCX-HOOK: Naive inbound sidecar
 	"github.com/mhsanaei/3x-ui/v3/internal/mtproto"
+	"github.com/mhsanaei/3x-ui/v3/internal/tuic"
 	"github.com/mhsanaei/3x-ui/v3/internal/xray"
 )
 
@@ -74,13 +77,68 @@ func (l *Local) AddInbound(_ context.Context, ib *model.Inbound) error {
 	if ib.Protocol == model.Qwdtt {
 		return l.ensureQwdttInbound(ib)
 	}
+	if ib.Protocol == model.Csqtt {
+		return l.ensureCsqttInbound(ib)
+	}
 	if ib.Protocol == model.Mieru {
 		return l.ensureMieruInbound(ib)
 	}
 	if ib.Protocol == model.TrustTunnel {
 		return l.ensureTrustTunnelInbound(ib)
 	}
+	if ib.Protocol == model.Anytls {
+		return l.ensureAnytlsInbound(ib)
+	}
+	if ib.Protocol == model.Tproxy {
+		return l.ensureTproxyInbound(ib)
+	}
+	if ib.Protocol == model.Cover {
+		return l.ensureCoverInbound(ib)
+	}
+	if ib.Protocol == model.Gateway {
+		return l.ensureGatewayInbound(ib)
+	}
 	// END LUCX-HOOK
+	if ib.Protocol == model.AmneziaWG {
+		inst, ok := amneziawg.InstanceFromInbound(ib)
+		if !ok {
+			return nil
+		}
+		err := amneziawgnet.GetManager().Ensure(amneziawgnet.Desired{
+			Instance: inst,
+			Options: amneziawgnet.DeviceOptions{
+				HeaderProtectionKey:    inst.Obfuscation.HeaderProtectionKey,
+				ContentPaddingAddition: inst.Obfuscation.ContentPaddingAddition,
+				RekeyAfterTime:         inst.Obfuscation.RekeyAfterTime,
+				RekeyTimeout:           inst.Obfuscation.RekeyTimeout,
+				RejectAfterTime:        inst.Obfuscation.RejectAfterTime,
+				KeepaliveTimeout:       inst.Obfuscation.KeepaliveTimeout,
+				MaxHandshakeAttempts:   inst.Obfuscation.MaxHandshakeAttempts,
+				RandomTrailers:         inst.Obfuscation.RandomTrailers,
+				DisableCookies:         inst.Obfuscation.DisableCookies,
+			},
+		})
+		// A brand new inbound can be the first one to qualify for
+		// injectAmneziawgnetSocks's Xray-side relay inbound (e.g. its first
+		// valid peer). Ensure only updates the embedded Device -- flag Xray
+		// for a resync so the relay actually gets created within the next
+		// ApplyPendingRestart tick instead of only at the next full restart.
+		if l.deps.SetNeedRestart != nil {
+			l.deps.SetNeedRestart()
+		}
+		return err
+	}
+	if ib.Protocol == model.TUIC {
+		inst, ok := tuic.InstanceFromInbound(ib)
+		if !ok {
+			return nil
+		}
+		err := tuic.GetManager().Ensure(inst)
+		if l.deps.SetNeedRestart != nil {
+			l.deps.SetNeedRestart()
+		}
+		return err
+	}
 	body, err := json.MarshalIndent(ib.GenXrayInboundConfig(), "", "  ")
 	if err != nil {
 		return err
@@ -103,6 +161,7 @@ func (l *Local) DelInbound(_ context.Context, ib *model.Inbound) error {
 	// LUCX-HOOK: tunnel inbound teardown.
 	if ib.Protocol == model.Naive {
 		tunnel.GetManager().Remove(tunnel.NaiveKey(ib.Id))
+		l.refreshCoverFronts()
 		return nil
 	}
 	if ib.Protocol == model.Olcrtc {
@@ -113,6 +172,10 @@ func (l *Local) DelInbound(_ context.Context, ib *model.Inbound) error {
 		tunnel.GetManager().Remove(tunnel.QwdttKey)
 		return nil
 	}
+	if ib.Protocol == model.Csqtt {
+		tunnel.GetManager().Remove(tunnel.CsqttKey)
+		return nil
+	}
 	if ib.Protocol == model.Mieru {
 		tunnel.GetManager().Remove(tunnel.MieruKey(ib.Id))
 		return nil
@@ -121,7 +184,45 @@ func (l *Local) DelInbound(_ context.Context, ib *model.Inbound) error {
 		tunnel.GetManager().Remove(tunnel.TrustTunnelKey(ib.Id))
 		return nil
 	}
+	if ib.Protocol == model.Anytls {
+		tunnel.GetManager().Remove(tunnel.AnytlsKey(ib.Id))
+		return nil
+	}
+	if ib.Protocol == model.Tproxy {
+		id := ib.Id
+		tunnel.GetManager().Remove(tunnel.TproxyCaddyKey(id))
+		tunnel.GetManager().Remove(tunnel.TproxyKey(id))
+		tunnel.GetManager().Remove(tunnel.MtproxyKey(id))
+		tunnel.ClearMtproxyLocalOnly(id)
+		l.refreshCoverFronts()
+		return nil
+	}
+	if ib.Protocol == model.Cover {
+		tunnel.GetManager().Remove(tunnel.CoverKey(ib.Id))
+		return nil
+	}
+	if ib.Protocol == model.Gateway {
+		tunnel.GetManager().Remove(tunnel.GatewayKey(ib.Id))
+		return nil
+	}
 	// END LUCX-HOOK
+	if ib.Protocol == model.AmneziaWG {
+		amneziawgnet.GetManager().Remove(ib.Id)
+		// The removed inbound may have been the only one backing Xray's
+		// injectAmneziawgnetSocks relay inbound for this tag -- flag a
+		// resync so the now-stale relay gets torn down promptly.
+		if l.deps.SetNeedRestart != nil {
+			l.deps.SetNeedRestart()
+		}
+		return nil
+	}
+	if ib.Protocol == model.TUIC {
+		tuic.GetManager().Remove(ib.Id)
+		if l.deps.SetNeedRestart != nil {
+			l.deps.SetNeedRestart()
+		}
+		return nil
+	}
 	return l.withAPI(func(api *xray.XrayAPI) error {
 		return api.DelInbound(ib.Tag)
 	})
@@ -130,6 +231,13 @@ func (l *Local) DelInbound(_ context.Context, ib *model.Inbound) error {
 func (l *Local) UpdateInbound(ctx context.Context, oldIb, newIb *model.Inbound) error {
 	if oldIb.Protocol == model.MTProto || newIb.Protocol == model.MTProto {
 		return l.updateMtprotoInbound(ctx, oldIb, newIb)
+	}
+	// LUCX-HOOK: AWG — keep the kernel interface across an inbound edit.
+	if oldIb.Protocol == model.AWG || newIb.Protocol == model.AWG {
+		return l.updateAwgInbound(ctx, oldIb, newIb)
+	}
+	if oldIb.Protocol == model.Tproxy || newIb.Protocol == model.Tproxy {
+		return l.updateTproxyInbound(ctx, oldIb, newIb)
 	}
 	// LUCX-HOOK: tunnel inbound update (Del+Add / Ensure restart).
 	if isTunnelInboundProto(oldIb.Protocol) || isTunnelInboundProto(newIb.Protocol) {
@@ -143,6 +251,12 @@ func (l *Local) UpdateInbound(ctx context.Context, oldIb, newIb *model.Inbound) 
 		return l.AddInbound(ctx, newIb)
 	}
 	// END LUCX-HOOK
+	if oldIb.Protocol == model.AmneziaWG || newIb.Protocol == model.AmneziaWG {
+		return l.updateAmneziaWGInbound(ctx, oldIb, newIb)
+	}
+	if oldIb.Protocol == model.TUIC || newIb.Protocol == model.TUIC {
+		return l.updateTuicInbound(ctx, oldIb, newIb)
+	}
 	_ = l.DelInbound(ctx, oldIb)
 	if !newIb.Enable {
 		return nil
@@ -151,17 +265,22 @@ func (l *Local) UpdateInbound(ctx context.Context, oldIb, newIb *model.Inbound) 
 }
 
 func isTunnelInboundProto(p model.Protocol) bool {
-	return p == model.Naive || p == model.Olcrtc || p == model.Qwdtt || p == model.Mieru || p == model.TrustTunnel
+	return p == model.Naive || p == model.Olcrtc || p == model.Qwdtt || p == model.Csqtt || p == model.Mieru || p == model.TrustTunnel || p == model.Anytls || p == model.Tproxy || p == model.Cover || p == model.Gateway
 }
 
 // ensureNaiveInbound builds and Ensures a Naive sidecar instance. Panel secret
 // is required for per-client basic_auth derivation (read from settings table
 // without importing service — avoids an import cycle with runtime).
 func (l *Local) ensureNaiveInbound(ib *model.Inbound) error {
+	l.refreshCoverFronts()
 	secret := panelSecretBytes()
 	inst, ok := tunnel.InstanceFromInbound(ib, secret)
 	if !ok {
 		return nil
+	}
+	cert, key := panelCertFilesForRuntime()
+	if tunnel.NaiveFrontedByCover(ib, listLocalInboundsForCover(), secret, cert, key) {
+		inst.Enabled = false
 	}
 	return tunnel.GetManager().Ensure(inst)
 }
@@ -176,6 +295,14 @@ func (l *Local) ensureOlcrtcInbound(ib *model.Inbound) error {
 
 func (l *Local) ensureQwdttInbound(ib *model.Inbound) error {
 	inst, ok := tunnel.QwdttInstanceFromInbound(ib)
+	if !ok {
+		return nil
+	}
+	return tunnel.GetManager().Ensure(inst)
+}
+
+func (l *Local) ensureCsqttInbound(ib *model.Inbound) error {
+	inst, ok := tunnel.CsqttInstanceFromInbound(ib)
 	if !ok {
 		return nil
 	}
@@ -197,6 +324,103 @@ func (l *Local) ensureTrustTunnelInbound(ib *model.Inbound) error {
 		return nil
 	}
 	return tunnel.GetManager().Ensure(inst)
+}
+
+func (l *Local) ensureAnytlsInbound(ib *model.Inbound) error {
+	cert, key := panelCertFilesForRuntime()
+	inst, ok := tunnel.AnytlsInstanceFromInbound(ib, cert, key)
+	if !ok {
+		return nil
+	}
+	return tunnel.GetManager().Ensure(inst)
+}
+
+func (l *Local) updateTproxyInbound(ctx context.Context, oldIb, newIb *model.Inbound) error {
+	if oldIb.Protocol == model.Tproxy && newIb.Protocol != model.Tproxy {
+		_ = l.DelInbound(ctx, oldIb)
+		if !newIb.Enable {
+			return nil
+		}
+		return l.AddInbound(ctx, newIb)
+	}
+	if oldIb.Protocol != model.Tproxy {
+		_ = l.DelInbound(ctx, oldIb)
+	}
+	return l.ensureTproxyInbound(newIb)
+}
+
+func (l *Local) ensureCoverInbound(ib *model.Inbound) error {
+	cert, key := panelCertFilesForRuntime()
+	inst, ok := tunnel.StandaloneCoverInstance(ib, listLocalInboundsForCover(), panelSecretBytes(), cert, key)
+	if !ok {
+		return nil
+	}
+	return tunnel.GetManager().Ensure(inst)
+}
+
+func (l *Local) ensureGatewayInbound(ib *model.Inbound) error {
+	cert, key := panelCertFilesForRuntime()
+	inst, ok := tunnel.GatewayInstanceFromInbound(ib, listLocalInboundsForCover(), panelSecretBytes(), cert, key)
+	if !ok {
+		return nil
+	}
+	return tunnel.GetManager().Ensure(inst)
+}
+
+func listLocalInboundsForCover() []*model.Inbound {
+	var rows []*model.Inbound
+	_ = database.GetDB().Where("node_id IS NULL").Find(&rows).Error
+	return rows
+}
+
+func (l *Local) refreshCoverFronts() {
+	cert, key := panelCertFilesForRuntime()
+	others := listLocalInboundsForCover()
+	secret := panelSecretBytes()
+	mgr := tunnel.GetManager()
+	for _, ib := range others {
+		if ib == nil || ib.Protocol != model.Cover {
+			continue
+		}
+		inst, ok := tunnel.StandaloneCoverInstance(ib, others, secret, cert, key)
+		if ok {
+			_ = mgr.Ensure(inst)
+		}
+	}
+	for _, ib := range others {
+		if ib == nil || ib.Protocol != model.Naive {
+			continue
+		}
+		inst, ok := tunnel.InstanceFromInbound(ib, secret)
+		if !ok {
+			continue
+		}
+		if tunnel.NaiveFrontedByCover(ib, others, secret, cert, key) {
+			inst.Enabled = false
+		}
+		_ = mgr.Ensure(inst)
+	}
+}
+
+func (l *Local) ensureTproxyInbound(ib *model.Inbound) error {
+	cert, key := panelCertFilesForRuntime()
+	insts, ok := tunnel.TproxyInstancesFromInbound(ib, cert, key, listLocalInboundsForCover()...)
+	if !ok {
+		return nil
+	}
+	mgr := tunnel.GetManager()
+	for _, inst := range insts {
+		if err := mgr.Ensure(inst); err != nil {
+			return err
+		}
+	}
+	l.refreshCoverFronts()
+	if ib.Enable {
+		tunnel.EnsureMtproxyLocalOnly(ib.Id)
+	} else {
+		tunnel.ClearMtproxyLocalOnly(ib.Id)
+	}
+	return nil
 }
 
 // panelCertFilesForRuntime reads webCertFile/webKeyFile settings (TrustTunnel
@@ -257,8 +481,127 @@ func (l *Local) updateMtprotoInbound(ctx context.Context, oldIb, newIb *model.In
 	return mtproto.GetManager().Ensure(inst)
 }
 
+// updateAwgInbound mirrors updateMtprotoInbound. Manager.Remove drops
+// m.procs[id], the entry holding the fingerprint ensureLocked compares against.
+func (l *Local) updateAwgInbound(ctx context.Context, oldIb, newIb *model.Inbound) error {
+	if oldIb.Protocol == model.AWG && newIb.Protocol != model.AWG {
+		awg.GetManager().Remove(oldIb.Id)
+		if !newIb.Enable {
+			return nil
+		}
+		return l.AddInbound(ctx, newIb)
+	}
+	if oldIb.Protocol != model.AWG {
+		_ = l.DelInbound(ctx, oldIb)
+	}
+	if !newIb.Enable {
+		awg.GetManager().Remove(newIb.Id)
+		return nil
+	}
+	inst, ok := awg.InstanceFromInbound(newIb)
+	if !ok {
+		awg.GetManager().Remove(newIb.Id)
+		return nil
+	}
+	return awg.GetManager().Ensure(inst)
+}
+
+// updateAmneziaWGInbound mirrors updateMtprotoInbound: it skips the
+// Remove+Ensure sequence a plain Del+Add would force so that, on an
+// AmneziaWG-to-AmneziaWG edit, Manager.Ensure's own fingerprint comparison
+// can reconfigure the running embedded Device in place via IpcSet instead
+// of always rebuilding it (see internal/amneziawgnet.Manager.ensureLocked --
+// only an address or effective-MTU change forces a rebuild there, S4
+// included, not a peer edit).
+//
+// Every exit path below only touches the embedded Device via
+// amneziawgnet.GetManager() -- none of it rebuilds Xray's own config, which
+// is what actually creates/removes injectAmneziawgnetSocks's relay inbound.
+// A peer edit that changes whether this inbound has a qualifying peer at
+// all (its first peer added, or its last one removed) must still get that
+// relay created or torn down, so flag Xray for a resync unconditionally
+// here rather than trying to enumerate which of the branches below need it.
+func (l *Local) updateAmneziaWGInbound(ctx context.Context, oldIb, newIb *model.Inbound) error {
+	if l.deps.SetNeedRestart != nil {
+		l.deps.SetNeedRestart()
+	}
+	if oldIb.Protocol == model.AmneziaWG && newIb.Protocol != model.AmneziaWG {
+		amneziawgnet.GetManager().Remove(oldIb.Id)
+		if !newIb.Enable {
+			return nil
+		}
+		return l.AddInbound(ctx, newIb)
+	}
+	if oldIb.Protocol != model.AmneziaWG {
+		_ = l.DelInbound(ctx, oldIb)
+	}
+	if !newIb.Enable {
+		amneziawgnet.GetManager().Remove(newIb.Id)
+		return nil
+	}
+	inst, ok := amneziawg.InstanceFromInbound(newIb)
+	if !ok {
+		amneziawgnet.GetManager().Remove(newIb.Id)
+		return nil
+	}
+	return amneziawgnet.GetManager().Ensure(amneziawgnet.Desired{
+		Instance: inst,
+		Options: amneziawgnet.DeviceOptions{
+			HeaderProtectionKey:    inst.Obfuscation.HeaderProtectionKey,
+			ContentPaddingAddition: inst.Obfuscation.ContentPaddingAddition,
+			RekeyAfterTime:         inst.Obfuscation.RekeyAfterTime,
+			RekeyTimeout:           inst.Obfuscation.RekeyTimeout,
+			RejectAfterTime:        inst.Obfuscation.RejectAfterTime,
+			KeepaliveTimeout:       inst.Obfuscation.KeepaliveTimeout,
+			MaxHandshakeAttempts:   inst.Obfuscation.MaxHandshakeAttempts,
+			RandomTrailers:         inst.Obfuscation.RandomTrailers,
+			DisableCookies:         inst.Obfuscation.DisableCookies,
+		},
+	})
+}
+
+func (l *Local) updateTuicInbound(ctx context.Context, oldIb, newIb *model.Inbound) error {
+	if oldIb.Protocol == model.TUIC && newIb.Protocol != model.TUIC {
+		tuic.GetManager().Remove(oldIb.Id)
+		if l.deps.SetNeedRestart != nil {
+			l.deps.SetNeedRestart()
+		}
+		if !newIb.Enable {
+			return nil
+		}
+		return l.AddInbound(ctx, newIb)
+	}
+	if oldIb.Protocol != model.TUIC {
+		_ = l.DelInbound(ctx, oldIb)
+		if l.deps.SetNeedRestart != nil {
+			l.deps.SetNeedRestart()
+		}
+	}
+	if oldIb.Protocol == model.TUIC && newIb.Protocol == model.TUIC && oldIb.Enable && newIb.Enable && oldIb.Tag != newIb.Tag && l.deps.SetNeedRestart != nil {
+		l.deps.SetNeedRestart()
+	}
+	if !newIb.Enable {
+		tuic.GetManager().Remove(newIb.Id)
+		if oldIb.Enable && l.deps.SetNeedRestart != nil {
+			l.deps.SetNeedRestart()
+		}
+		return nil
+	}
+	if !oldIb.Enable && newIb.Enable {
+		if l.deps.SetNeedRestart != nil {
+			l.deps.SetNeedRestart()
+		}
+	}
+	inst, ok := tuic.InstanceFromInbound(newIb)
+	if !ok {
+		tuic.GetManager().Remove(newIb.Id)
+		return nil
+	}
+	return tuic.GetManager().Ensure(inst)
+}
+
 func (l *Local) AddUser(_ context.Context, ib *model.Inbound, userMap map[string]any) error {
-	if ib.Protocol == model.MTProto {
+	if ib.Protocol == model.MTProto || ib.Protocol == model.AmneziaWG || ib.Protocol == model.TUIC {
 		return nil
 	}
 	// LUCX-HOOK: AWG — peer reconciliation is driven by the periodic awg job,
@@ -277,7 +620,7 @@ func (l *Local) AddUser(_ context.Context, ib *model.Inbound, userMap map[string
 }
 
 func (l *Local) RemoveUser(_ context.Context, ib *model.Inbound, email string) error {
-	if ib.Protocol == model.MTProto {
+	if ib.Protocol == model.MTProto || ib.Protocol == model.AmneziaWG || ib.Protocol == model.TUIC {
 		return nil
 	}
 	// LUCX-HOOK: AWG — peer removal is picked up by the next Reconcile tick.

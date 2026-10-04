@@ -56,10 +56,12 @@ func TestQwdttBuildArgs(t *testing.T) {
 	cfg.ConfigDir = "/var/lib/qwdtt"
 	args := cfg.BuildArgs()
 	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "/var/lib/qwdtt") {
+		t.Errorf("configDir outside workDir must be ignored: %v", args)
+	}
 	for _, want := range []string{
 		"-listen 0.0.0.0:56000",
 		"-wg-port 56001",
-		"-config-dir /var/lib/qwdtt",
 		"-password s3cret",
 		"-dns 8.8.8.8",
 		"-listen-raw 0.0.0.0:56003",
@@ -105,6 +107,9 @@ func TestQwdttClientURI(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("URI missing %q: %s", want, got)
 		}
+	}
+	if strings.ContainsAny(got, "\r\n") || strings.Contains(got, "\nwdtt://") {
+		t.Fatalf("ClientURI must be a single qwdtt:// line, got %q", got)
 	}
 	cfg.SubHost = ""
 	if cfg.ClientURI() != "" {
@@ -169,7 +174,22 @@ func TestQwdttNameRegistry(t *testing.T) {
 		t.Fatalf("BinaryName = %q", got)
 	}
 	all := All()
-	if len(all) != 5 || all[2] != Qwdtt || all[3] != Mieru || all[4] != TrustTunnel {
+	if len(all) != 12 || all[2] != Qwdtt || all[3] != Csqtt || all[4] != Mieru || all[5] != TrustTunnel || all[6] != Anytls || all[7] != Tproxy || all[10] != Cover || all[11] != Gateway {
 		t.Fatalf("All() = %v", all)
+	}
+}
+
+func TestQwdttWithPeerHost(t *testing.T) {
+	cfg := DefaultQwdttConfig()
+	cfg = cfg.WithPeerHost("10.1.2.3")
+	if cfg.SubHost != "10.1.2.3:56000" {
+		t.Fatalf("SubHost = %q", cfg.SubHost)
+	}
+	if cfg.WithPeerHost("").SubHost != cfg.SubHost {
+		t.Fatal("empty host must not clear SubHost")
+	}
+	v6 := DefaultQwdttConfig().WithPeerHost("2001:db8::1")
+	if v6.SubHost != "[2001:db8::1]:56000" {
+		t.Fatalf("ipv6 SubHost = %q", v6.SubHost)
 	}
 }

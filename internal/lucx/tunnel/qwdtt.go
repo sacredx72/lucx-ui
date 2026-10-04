@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -22,7 +23,7 @@ import (
 // QwdttConfig is the operator-facing configuration of the qWDTT core
 // (SpaceNeuroX/proxy-turn-vk-android server.go — WireGuard over VK TURN).
 // The binary takes pure CLI flags (no config file); state lives in ConfigDir
-// (passwords.json, wg-keys.dat). Schema mirrors Bebrik2283555/Ex3-ui extras.
+// (passwords.json, wg-keys.dat). Sidecar pin: SpaceNeuroX v1.4.4 (see pack-sidecars.sh).
 type QwdttConfig struct {
 	Remark  string `json:"remark"`
 	Enabled bool   `json:"enabled"`
@@ -59,6 +60,9 @@ type QwdttConfig struct {
 	RouteThroughXray bool `json:"routeThroughXray"`
 	// OutboundTag optional force-route target (empty = Xray default kettle).
 	OutboundTag string `json:"outboundTag"`
+
+	MigratedToInbound bool `json:"migratedToInbound,omitempty"`
+	MigratedInboundId int  `json:"migratedInboundId,omitempty"`
 }
 
 // DefaultQwdttConfig returns sensible defaults for a fresh qWDTT core.
@@ -148,6 +152,16 @@ func (c QwdttConfig) EnsurePassword() (QwdttConfig, error) {
 	return c, nil
 }
 
+// WithPeerHost sets SubHost to host:dtlsPort. Empty host is a no-op.
+func (c QwdttConfig) WithPeerHost(host string) QwdttConfig {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return c
+	}
+	c.SubHost = net.JoinHostPort(host, strconv.Itoa(c.publicDTLSPort()))
+	return c
+}
+
 // EnsureSubHost fills SubHost with "<outboundIPv4>:<dtlsPort>" when empty so
 // ClientURI / subscription always have a peer after save. Dial-based probe
 // (no HTTP); fails open (leaves empty) when the host has no outbound route.
@@ -185,10 +199,24 @@ func detectOutboundIPv4() string {
 
 // ResolveConfigDir returns the effective state directory.
 func (c QwdttConfig) ResolveConfigDir() string {
-	if d := strings.TrimSpace(c.ConfigDir); d != "" {
-		return d
+	fallback := DataDir(Qwdtt)
+	d := strings.TrimSpace(c.ConfigDir)
+	if d == "" {
+		return fallback
 	}
-	return DataDir(Qwdtt)
+	abs, err := filepath.Abs(d)
+	if err != nil {
+		return fallback
+	}
+	root, err := filepath.Abs(workDir())
+	if err != nil {
+		return fallback
+	}
+	sep := string(filepath.Separator)
+	if abs == root || strings.HasPrefix(abs, root+sep) {
+		return abs
+	}
+	return fallback
 }
 
 // BuildArgs converts the config into the argv passed to the binary
@@ -232,8 +260,10 @@ func (c QwdttConfig) peerHost() string {
 	return ""
 }
 
-// ClientURI renders the qwdtt://config?... share link understood by the
-// SpaceNeuroX Android client. Empty password or peer yields "".
+// ClientURI renders the single qwdtt://config?... share link understood by
+// the SpaceNeuroX Android client (v1.4.4 parsePayload / parseQwdttUri).
+// Never concatenate LegacyURI onto this string — a second line is parsed as
+// part of pass and the DTLS handshake dies. Empty password or peer yields "".
 func (c QwdttConfig) ClientURI() string {
 	peer := c.peerHost()
 	pass := strings.TrimSpace(c.Password)

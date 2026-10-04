@@ -17,8 +17,7 @@ import (
 
 func TestGenerateAWGParams_Invariants(t *testing.T) {
 	SetRand(crand.New(crand.NewSource(42)))
-	// Version "2" (no header protection key): H1-H4 are "lo-hi" ranges.
-	for _, prof := range []ObfProfile{ObfLite, ObfStandard, ObfPro} {
+	for _, prof := range []ObfProfile{ObfLite, ObfStandard, ObfPro, ObfPremium} {
 		for i := 0; i < 200; i++ {
 			p, err := GenerateAWGParams(prof, "2")
 			if err != nil {
@@ -50,7 +49,7 @@ func TestGenerateAWGParams_Invariants(t *testing.T) {
 // 64+S3, 32+S4) must stay pairwise distinct across many generations.
 func TestGenerateAWGParams_PacketSizesDistinct(t *testing.T) {
 	SetRand(crand.New(crand.NewSource(1337)))
-	for _, prof := range []ObfProfile{ObfLite, ObfStandard, ObfPro} {
+	for _, prof := range []ObfProfile{ObfLite, ObfStandard, ObfPro, ObfPremium} {
 		for i := 0; i < 500; i++ {
 			p, err := GenerateAWGParams(prof, "2")
 			if err != nil {
@@ -150,6 +149,45 @@ func TestGenerateAWGParams_HFormatByVersion(t *testing.T) {
 	}
 }
 
+func TestGenerateAWGParams_Premium31(t *testing.T) {
+	SetRand(crand.New(crand.NewSource(1)))
+	p, err := GenerateAWGParams(ObfPremium, "3.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if p.Jc != 5 || p.Jmin != 10 || p.Jmax != 80 {
+		t.Fatalf("junk = Jc=%d Jmin=%d Jmax=%d, want 5/10/80", p.Jc, p.Jmin, p.Jmax)
+	}
+	if p.S1 != 164 || p.S2 != 528 || p.S3 != 389 || p.S4 != 12 {
+		t.Fatalf("S = %d/%d/%d/%d, want 164/528/389/12", p.S1, p.S2, p.S3, p.S4)
+	}
+	got := strings.Join([]string{p.H1, p.H2, p.H3, p.H4}, ",")
+	if got != "1,2,3,4" {
+		t.Fatalf("H1-H4 = %q, want 1,2,3,4", got)
+	}
+	p2, err := GenerateAWGParams(ObfPremium, "2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got2 := strings.Join([]string{p2.H1, p2.H2, p2.H3, p2.H4}, ",")
+	if got2 == "1,2,3,4" {
+		t.Fatal("premium on v2 must not use WireGuard default headers")
+	}
+	d := GenerateAwg3DeviceTimings(ObfPremium)
+	if d.ContentPaddingAddition != "10-100" {
+		t.Fatalf("ContentPaddingAddition = %q, want 10-100", d.ContentPaddingAddition)
+	}
+	if d.RekeyAfterTime != "100-120" {
+		t.Fatalf("RekeyAfterTime = %q, want 100-120", d.RekeyAfterTime)
+	}
+	if d.KeepaliveTimeout != "7-13" {
+		t.Fatalf("KeepaliveTimeout = %q, want 7-13", d.KeepaliveTimeout)
+	}
+}
+
 func TestGenerateHeaderProtectionKey_Format(t *testing.T) {
 	for i := 0; i < 32; i++ {
 		k, err := GenerateHeaderProtectionKey()
@@ -211,7 +249,7 @@ func TestGenerateCPS_AllProfilesNonEmpty(t *testing.T) {
 	SetRand(crand.New(crand.NewSource(7)))
 	for _, mp := range []MimicryProfile{ProfileTLS, ProfileDNS, ProfileSIP, ProfileQUIC} {
 		for _, reg := range []Region{RegionRU, RegionWorld} {
-			r1, err := GenerateCPS(mp, reg, "", BrowserChrome, true)
+			r1, err := GenerateCPS(mp, reg, "", BrowserChrome, true, kernelBudget())
 			if err != nil {
 				t.Fatalf("profile %s region %s onlyI1: %v", mp, reg, err)
 			}
@@ -221,22 +259,13 @@ func TestGenerateCPS_AllProfilesNonEmpty(t *testing.T) {
 			if r1.I2 != "" {
 				t.Fatalf("profile %s region %s: onlyI1 leaked I2", mp, reg)
 			}
-			r5, err := GenerateCPS(mp, reg, "", BrowserChrome, false)
-			if err != nil {
-				t.Fatalf("profile %s region %s full: %v", mp, reg, err)
-			}
-			for i, v := range []string{r5.I1, r5.I2, r5.I3, r5.I4, r5.I5} {
-				if v == "" {
-					t.Fatalf("profile %s region %s: I%d empty in full mode", mp, reg, i+1)
-				}
-			}
 		}
 	}
 }
 
 func TestGenerateCPS_ExplicitDomain(t *testing.T) {
 	SetRand(crand.New(crand.NewSource(1)))
-	r, err := GenerateCPS(ProfileTLS, RegionWorld, "example.com", BrowserChrome, true)
+	r, err := GenerateCPS(ProfileTLS, RegionWorld, "example.com", BrowserChrome, true, kernelBudget())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +276,7 @@ func TestGenerateCPS_ExplicitDomain(t *testing.T) {
 
 func TestGenerateCPS_DNSHasR2Prefix(t *testing.T) {
 	SetRand(crand.New(crand.NewSource(3)))
-	r, err := GenerateCPS(ProfileDNS, RegionWorld, "example.com", BrowserChrome, true)
+	r, err := GenerateCPS(ProfileDNS, RegionWorld, "example.com", BrowserChrome, true, kernelBudget())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +288,7 @@ func TestGenerateCPS_DNSHasR2Prefix(t *testing.T) {
 func TestGenerateCPS_NonDNSNoR2Prefix(t *testing.T) {
 	SetRand(crand.New(crand.NewSource(5)))
 	for _, mp := range []MimicryProfile{ProfileTLS, ProfileSIP, ProfileQUIC} {
-		r, err := GenerateCPS(mp, RegionWorld, "example.com", BrowserChrome, true)
+		r, err := GenerateCPS(mp, RegionWorld, "example.com", BrowserChrome, true, kernelBudget())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -272,7 +301,7 @@ func TestGenerateCPS_NonDNSNoR2Prefix(t *testing.T) {
 func TestGenerateCPS_AllBrowsersNonEmpty(t *testing.T) {
 	SetRand(crand.New(crand.NewSource(11)))
 	for _, browser := range []BrowserProfile{BrowserChrome, BrowserFirefox, BrowserSafari} {
-		r, err := GenerateCPS(ProfileTLS, RegionWorld, "example.com", browser, true)
+		r, err := GenerateCPS(ProfileTLS, RegionWorld, "example.com", browser, true, kernelBudget())
 		if err != nil {
 			t.Fatalf("browser %s: %v", browser, err)
 		}
@@ -281,54 +310,6 @@ func TestGenerateCPS_AllBrowsersNonEmpty(t *testing.T) {
 		}
 		if !strings.HasPrefix(r.I1, "<b 0x") {
 			t.Fatalf("browser %s: I1 must be hex tag, got %q", browser, r.I1[:20])
-		}
-	}
-}
-
-func TestQuicInitialPacket_RespectsBrowser(t *testing.T) {
-	SetRand(crand.New(crand.NewSource(7)))
-	chrome := quicInitialPacket("example.com", BrowserChrome)
-	SetRand(crand.New(crand.NewSource(7)))
-	firefox := quicInitialPacket("example.com", BrowserFirefox)
-	if chrome == firefox {
-		t.Error("chrome and firefox QUIC Initials must differ (embedded ClientHello differs)")
-	}
-	for name, tag := range map[string]string{"chrome": chrome, "firefox": firefox} {
-		if len(tag) < 2400 {
-			t.Errorf("%s: QUIC Initial must pad to ~1200 bytes (>=2400 hex chars), got %d", name, len(tag))
-		}
-	}
-}
-
-// TestQuicInitialPacket_NoZeroPaddingRun guards the regression where the QUIC
-// Initial padded its ~1200-byte minimum with open 0x00 bytes, producing a hex
-// string with ~1700 consecutive zeros — a fingerprint no real client (whose
-// payload is AEAD-encrypted) ever shows. The padding must be high-entropy: the
-// longest "00" run in the hex should stay tiny relative to the packet. Chrome
-// and Safari are tested — Firefox's embedded ClientHello pads to a 512-byte
-// boundary with a legitimate (for the open TLS ClientHello) zero-filled
-// padding extension, so it is excluded here.
-func TestQuicInitialPacket_NoZeroPaddingRun(t *testing.T) {
-	SetRand(crand.New(crand.NewSource(7)))
-	for _, browser := range []BrowserProfile{BrowserChrome, BrowserSafari} {
-		tag := quicInitialPacket("example.com", browser)
-		raw, err := hex.DecodeString(strings.TrimPrefix(strings.TrimSuffix(tag, ">"), "<b 0x"))
-		if err != nil {
-			t.Fatalf("%s: not valid hex: %v", browser, err)
-		}
-		maxRun, curRun := 0, 0
-		for _, b := range raw {
-			if b == 0x00 {
-				curRun++
-				if curRun > maxRun {
-					maxRun = curRun
-				}
-			} else {
-				curRun = 0
-			}
-		}
-		if maxRun > 128 {
-			t.Fatalf("%s: QUIC Initial has a %d-byte zero run — padding must be high-entropy", browser, maxRun)
 		}
 	}
 }
@@ -488,6 +469,22 @@ func TestValidate_DeviceFieldRange(t *testing.T) {
 	}
 }
 
+func TestValidate_LegacyAmneziaSWithoutHPK(t *testing.T) {
+	awg15 := AWGParams{Jmin: 10, Jmax: 50, S1: 59, S2: 106, S3: 0, S4: 0}
+	if err := awg15.Validate(); err != nil {
+		t.Fatalf("AWG 1.5 S3=S4=0 must import: %v", err)
+	}
+	awg2 := AWGParams{Jmin: 10, Jmax: 50, S1: 45, S2: 135, S3: 1, S4: 12}
+	if err := awg2.Validate(); err != nil {
+		t.Fatalf("AWG2 S3=1 must import: %v", err)
+	}
+	awg3 := awg2
+	awg3.HeaderProtectionKey = "dGVzdC1ocGstMzItYnl0ZXMta2V5ISE="
+	if err := awg3.Validate(); err == nil {
+		t.Fatal("HPK + S3=1 must fail")
+	}
+}
+
 func TestValidate_DeviceFieldsAccept2Byte(t *testing.T) {
 	p := AWGParams{
 		Jmin: 50, Jmax: 200, S1: 30, S2: 120, S3: 50, S4: 70,
@@ -519,7 +516,7 @@ func parseAwg3Range(t *testing.T, s string) (int, int) {
 // KeepaliveTimeout+RekeyTimeout, RekeyAfterTime below RejectAfterTime,
 // MaxHandshakeAttempts >= 1).
 func TestGenerateAwg3DeviceTimings_FormatAndInvariants(t *testing.T) {
-	for _, prof := range []ObfProfile{ObfLite, ObfStandard, ObfPro} {
+	for _, prof := range []ObfProfile{ObfLite, ObfStandard, ObfPro, ObfPremium} {
 		prof := prof
 		t.Run(string(prof), func(t *testing.T) {
 			SetRand(crand.New(crand.NewSource(42)))
@@ -565,5 +562,31 @@ func TestGenerateAwg3DeviceTimings_FormatAndInvariants(t *testing.T) {
 				t.Errorf("MaxHandshakeAttempts lo=%d < 1", parsed["MaxHandshakeAttempts"][0])
 			}
 		})
+	}
+}
+
+// Every panel process must draw its own obfuscation. A fixed seed makes the
+// first inbound created after a restart identical on every server that runs
+// this code — Jc, S1-S4 and H1-H4 included.
+func TestNewSeededRand_DiffersBetweenSources(t *testing.T) {
+	draw := func() [8]int64 {
+		r := newSeededRand()
+		var out [8]int64
+		for i := range out {
+			out[i] = r.Int63()
+		}
+		return out
+	}
+	a, b := draw(), draw()
+	if a == b {
+		t.Fatalf("two sources produced the same sequence %v — the seed is fixed", a)
+	}
+	fixed := crand.New(crand.NewSource(1))
+	var seedOne [8]int64
+	for i := range seedOne {
+		seedOne[i] = fixed.Int63()
+	}
+	if a == seedOne {
+		t.Fatal("the source is seeded with the literal 1")
 	}
 }

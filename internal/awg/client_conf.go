@@ -16,14 +16,6 @@ import (
 // does NOT override the system default route — Xray's sockopt.interface handles
 // egress), a single [Peer] (the upstream server), and DNS is NEVER written.
 //
-// I1-I5 (CPS packets) are NEVER written to the .conf, even when set in Settings.
-// The kernel amneziawg module does not accept CPS tags in setconf input —
-// `awg setconf awgo-N /dev/fd/63` returns "Invalid argument" and awg-quick
-// rolls back the interface, so reconcile fails every 10s (caught live by a
-// tester on awgo-2: every reconcile failed with exit status 1). This mirrors
-// renderServerConf, which already documents the same constraint for the server
-// .conf. I1-I5 stay in Settings JSON for a future userspace CPS sender.
-//
 // DNS is NEVER written even when set in Settings. With Table = off, the client
 // AWG interface does not carry the system default route, so the panel host's
 // system DNS must NOT be overwritten through the tunnel. Writing DNS makes
@@ -39,77 +31,103 @@ import (
 func renderClientConf(ci ClientInstance) string {
 	s := ci.Settings
 	var b strings.Builder
+	b.WriteString(xuiManagedMarker + "\n")
 	b.WriteString("[Interface]\n")
-	fmt.Fprintf(&b, "PrivateKey = %s\n", s.PrivateKey)
-	fmt.Fprintf(&b, "Address = %s\n", s.Address)
-	fmt.Fprintf(&b, "MTU = %d\n", s.MTU)
+	fmt.Fprintf(&b, "PrivateKey = %s\n", confValue(s.PrivateKey))
+	fmt.Fprintf(&b, "Address = %s\n", confValue(s.Address))
+	if s.MTU > 0 {
+		fmt.Fprintf(&b, "MTU = %d\n", s.MTU)
+	}
 	b.WriteString("Table = off\n")
 	// DNS deliberately NOT written — see function comment. resolvconf crash
 	// on hosts without systemd-resolved/openresolv took down every reconcile.
 	awg3ok := IsAwg3Plus(s.AwgVersion) && ModuleSupportsAwg3()
 	awg31ok := IsAwg31(s.AwgVersion) && ModuleSupportsAwg31()
-	if s.Jc > 0 {
+	// Jc gates the junk-packet fields only. S1-S4 pad the handshake on their own
+	// and ParseConf keeps them, so an imported Jc = 0 conf must not lose them.
+	junk := s.Jc > 0
+	if junk {
 		fmt.Fprintf(&b, "Jc = %d\n", s.Jc)
 		fmt.Fprintf(&b, "Jmin = %d\n", s.Jmin)
 		fmt.Fprintf(&b, "Jmax = %d\n", s.Jmax)
+	}
+	if junk || s.S1 > 0 {
 		fmt.Fprintf(&b, "S1 = %d\n", s.S1)
+	}
+	if junk || s.S2 > 0 {
 		fmt.Fprintf(&b, "S2 = %d\n", s.S2)
-		fmt.Fprintf(&b, "S3 = %d\n", s.S3)
-		fmt.Fprintf(&b, "S4 = %d\n", s.S4)
-		fmt.Fprintf(&b, "H1 = %s\n", s.H1)
-		fmt.Fprintf(&b, "H2 = %s\n", s.H2)
-		fmt.Fprintf(&b, "H3 = %s\n", s.H3)
-		fmt.Fprintf(&b, "H4 = %s\n", s.H4)
-		// HeaderProtectionKey (AWG3) is written ONLY when AwgVersion == "3" and
-		// the key is non-empty — mirrors renderServerConf. The upstream kernel
-		// v3.0.20260731 + tools v3.0.20260730 parse the field; older builds
-		// reject it, so version-gating keeps v1/v2 outbounds working. S1-S4
-		// >= 12 is required for the kernel to accept the key (enforced by
-		// the generator when version "3" is selected). Module-gated so a v3
-		// outbound on a host with a v1.x module does not emit the line.
-		if awg3ok && s.HeaderProtectionKey != "" {
-			fmt.Fprintf(&b, "HeaderProtectionKey = %s\n", s.HeaderProtectionKey)
+	}
+	if NormalizeAWGVersion(s.AwgVersion) != "1.5" {
+		if junk || s.S3 > 0 {
+			fmt.Fprintf(&b, "S3 = %d\n", s.S3)
 		}
-		// AWG3 device-level timers/padding — AwgTimer holds single or range
-		// ("lo-hi") values verbatim; IsZero omits the kernel default.
-		if awg3ok {
-			if !s.ContentPaddingAddition.IsZero() {
-				fmt.Fprintf(&b, "ContentPaddingAddition = %s\n", s.ContentPaddingAddition)
-			}
-			if !s.RekeyAfterTime.IsZero() {
-				fmt.Fprintf(&b, "RekeyAfterTime = %s\n", s.RekeyAfterTime)
-			}
-			if !s.RekeyTimeout.IsZero() {
-				fmt.Fprintf(&b, "RekeyTimeout = %s\n", s.RekeyTimeout)
-			}
-			if !s.RejectAfterTime.IsZero() {
-				fmt.Fprintf(&b, "RejectAfterTime = %s\n", s.RejectAfterTime)
-			}
-			if !s.KeepaliveTimeout.IsZero() {
-				fmt.Fprintf(&b, "KeepaliveTimeout = %s\n", s.KeepaliveTimeout)
-			}
-			if !s.MaxHandshakeAttempts.IsZero() {
-				fmt.Fprintf(&b, "MaxHandshakeAttempts = %s\n", s.MaxHandshakeAttempts)
-			}
+		if junk || s.S4 > 0 {
+			fmt.Fprintf(&b, "S4 = %d\n", s.S4)
 		}
-		if awg31ok {
-			if s.RandomTrailers {
-				b.WriteString("RandomTrailers = on\n")
-			}
-			if s.DisableCookies {
-				b.WriteString("DisableCookies = on\n")
+	}
+	// Per field and outside the Jc gate, exactly like renderServerConf: a blank one
+	// is skipped ("H1 = " makes setconf reject the file), Jc=0 keeps its headers.
+	for i, h := range []string{s.H1, s.H2, s.H3, s.H4} {
+		if strings.TrimSpace(h) != "" {
+			fmt.Fprintf(&b, "H%d = %s\n", i+1, confValue(h))
+		}
+	}
+	// Version- and module-gated like renderServerConf (manager.go:840 carries the
+	// full why): an older kernel rejects the line and awg-quick then deletes awgo-N.
+	if awg3ok && strings.TrimSpace(s.HeaderProtectionKey) != "" {
+		fmt.Fprintf(&b, "HeaderProtectionKey = %s\n", confValue(s.HeaderProtectionKey))
+	}
+	// AWG3 device-level timers/padding — AwgTimer holds single or range
+	// ("lo-hi") values verbatim; IsZero omits the kernel default.
+	if awg3ok {
+		if !s.ContentPaddingAddition.IsZero() {
+			fmt.Fprintf(&b, "ContentPaddingAddition = %s\n", confValue(string(s.ContentPaddingAddition)))
+		}
+		if !s.RekeyAfterTime.IsZero() {
+			fmt.Fprintf(&b, "RekeyAfterTime = %s\n", confValue(string(s.RekeyAfterTime)))
+		}
+		if !s.RekeyTimeout.IsZero() {
+			fmt.Fprintf(&b, "RekeyTimeout = %s\n", confValue(string(s.RekeyTimeout)))
+		}
+		if !s.RejectAfterTime.IsZero() {
+			fmt.Fprintf(&b, "RejectAfterTime = %s\n", confValue(string(s.RejectAfterTime)))
+		}
+		if !s.KeepaliveTimeout.IsZero() {
+			fmt.Fprintf(&b, "KeepaliveTimeout = %s\n", confValue(string(s.KeepaliveTimeout)))
+		}
+		if !s.MaxHandshakeAttempts.IsZero() {
+			fmt.Fprintf(&b, "MaxHandshakeAttempts = %s\n", confValue(string(s.MaxHandshakeAttempts)))
+		}
+	}
+	if awg31ok {
+		if s.RandomTrailers {
+			b.WriteString("RandomTrailers = on\n")
+		}
+		if s.DisableCookies {
+			b.WriteString("DisableCookies = on\n")
+		}
+	}
+	// In the .conf so the FIRST handshake carries CPS mimicry — a post-up `awg
+	// set` landed 20.4 ms late. Budgeted worst-case, like every other renderer.
+	if NormalizeAWGVersion(s.AwgVersion) != "1.5" &&
+		IBytes(s.I1, s.I2, s.I3, s.I4, s.I5) <= WorstCaseIBytesBudget(strings.TrimSpace(s.HeaderProtectionKey) != "") {
+		for _, f := range []struct{ key, value string }{
+			{"I1", s.I1}, {"I2", s.I2}, {"I3", s.I3}, {"I4", s.I4}, {"I5", s.I5},
+		} {
+			if v := strings.TrimSpace(f.value); v != "" {
+				fmt.Fprintf(&b, "%s = %s\n", f.key, confValue(v))
 			}
 		}
 	}
 	b.WriteString("\n[Peer]\n")
-	fmt.Fprintf(&b, "PublicKey = %s\n", s.PublicKey)
+	fmt.Fprintf(&b, "PublicKey = %s\n", confValue(s.PublicKey))
 	if psk := strings.TrimSpace(s.PSK); psk != "" {
-		fmt.Fprintf(&b, "PresharedKey = %s\n", psk)
+		fmt.Fprintf(&b, "PresharedKey = %s\n", confValue(psk))
 	}
-	fmt.Fprintf(&b, "Endpoint = %s\n", s.Endpoint)
-	fmt.Fprintf(&b, "AllowedIPs = %s\n", s.AllowedIPs)
+	fmt.Fprintf(&b, "Endpoint = %s\n", confValue(s.Endpoint))
+	fmt.Fprintf(&b, "AllowedIPs = %s\n", confValue(s.AllowedIPs))
 	if !s.Keepalive.IsZero() {
-		fmt.Fprintf(&b, "PersistentKeepalive = %s\n", s.Keepalive)
+		fmt.Fprintf(&b, "PersistentKeepalive = %s\n", confValue(string(s.Keepalive)))
 	}
 	return b.String()
 }

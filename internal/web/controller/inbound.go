@@ -59,6 +59,35 @@ func (a *InboundController) broadcastInboundsUpdate(userId int) {
 	websocket.BroadcastInbounds(inbounds)
 }
 
+// awgSaveNote appends the notes an I-set earns to a save's success text:
+// entity.Msg has no warning channel, and the operator has to be told. Neither
+// note refuses the save — a save that refuses froze node reconcile once already.
+func awgSaveNote(c *gin.Context, msg string, inbound *model.Inbound) string {
+	if inbound == nil || inbound.Protocol != model.AWG {
+		return msg
+	}
+	var notes []string
+	if measured := service.AwgIFieldBudgetWarning(inbound.Settings); measured != "" {
+		notes = append(notes, I18nWeb(c, "pages.inbounds.form.awgIFieldBudget")+" ("+measured+")")
+	}
+	if lost := service.AwgIFieldExportNote(inbound.Settings); lost != "" {
+		notes = append(notes, I18nWeb(c, "pages.inbounds.form.awgIFieldGrammar")+" ("+lost+")")
+	}
+	if len(notes) == 0 {
+		return msg
+	}
+	return msg + " — " + strings.Join(notes, "; ")
+}
+
+// inboundServiceFor tells the service whether this request is a master's
+// node-sync push, so the node stores the row instead of re-judging it.
+func (a *InboundController) inboundServiceFor(c *gin.Context) *service.InboundService {
+	svc := a.inboundService
+	scope, _ := c.Get("api_token_scope")
+	svc.FromNodeSync = scope == model.ApiScopeNodeSync
+	return &svc
+}
+
 // initRouter initializes the routes for inbound-related operations.
 func (a *InboundController) initRouter(g *gin.RouterGroup) {
 	g.GET("/list", a.getInbounds)
@@ -76,6 +105,7 @@ func (a *InboundController) initRouter(g *gin.RouterGroup) {
 	g.POST("/bulkDel", a.bulkDelInbounds)
 	g.POST("/update/:id", a.updateInbound)
 	g.POST("/setEnable/:id", a.setInboundEnable)
+	g.POST("/:id/subSortIndex", a.setInboundSubSortIndex)
 	g.POST("/:id/resetTraffic", a.resetInboundTraffic)
 	g.POST("/:id/delAllClients", a.delAllInboundClients)
 	g.POST("/resetAllTraffics", a.resetAllTraffics)
@@ -90,6 +120,14 @@ func (a *InboundController) initRouter(g *gin.RouterGroup) {
 	g.GET("/:id/awgDiagnostics", a.awgDiagnostics)
 	// LUCX-HOOK: AWG — path-MTU probe (DF-ping ceiling check for the configured MTU).
 	g.GET("/:id/awgTestMtu", a.awgTestMtu)
+	g.GET("/awg/import/preview", a.awgImportPreview)
+	g.POST("/awg/import/dismiss", a.awgImportDismiss)
+	g.POST("/awg/import/commit", a.awgImportCommit)
+	g.POST("/awg/import/delete", a.awgImportDelete)
+	g.POST("/gatewayEnsure", a.gatewayEnsure)
+	g.GET("/:id/gatewayPreview", a.gatewayPreview)
+	g.POST("/:id/gatewayApply", a.gatewayApply)
+	g.POST("/:id/gatewayRevert", a.gatewayRevert)
 	// END LUCX-HOOK
 }
 
@@ -190,12 +228,12 @@ func (a *InboundController) addInbound(c *gin.Context) {
 		inbound.NodeID = nil
 	}
 
-	inbound, needRestart, err := a.inboundService.AddInbound(inbound)
+	inbound, needRestart, err := a.inboundServiceFor(c).AddInbound(inbound)
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}
-	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.toasts.inboundCreateSuccess"), inbound, nil)
+	jsonMsgObj(c, awgSaveNote(c, I18nWeb(c, "pages.inbounds.toasts.inboundCreateSuccess"), inbound), inbound, nil)
 	if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
@@ -270,12 +308,12 @@ func (a *InboundController) updateInbound(c *gin.Context) {
 	if inbound.NodeID != nil && *inbound.NodeID == 0 {
 		inbound.NodeID = nil
 	}
-	inbound, needRestart, err := a.inboundService.UpdateInbound(inbound)
+	inbound, needRestart, err := a.inboundServiceFor(c).UpdateInbound(inbound)
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}
-	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.toasts.inboundUpdateSuccess"), inbound, nil)
+	jsonMsgObj(c, awgSaveNote(c, I18nWeb(c, "pages.inbounds.toasts.inboundUpdateSuccess"), inbound), inbound, nil)
 	if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
@@ -284,11 +322,30 @@ func (a *InboundController) updateInbound(c *gin.Context) {
 	notifyClientsChanged()
 }
 
-// setInboundEnable flips only the enable flag of an inbound. This is a
-// dedicated endpoint because the regular update path serialises the entire
-// settings JSON (every client) — far too heavy for an interactive switch
-// on inbounds with thousands of clients. Frontend optimistically updates
-// the UI; we just persist + sync xray + nudge other open admin sessions.
+// setInboundSubSortIndex changes only subscription ordering without sending
+// the inbound's settings/client payload.
+func (a *InboundController) setInboundSubSortIndex(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundUpdateSuccess"), err)
+		return
+	}
+	type form struct {
+		SubSortIndex int `json:"subSortIndex" form:"subSortIndex" binding:"required"`
+	}
+	var f form
+	if err := c.ShouldBind(&f); err != nil {
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
+		return
+	}
+	if err := a.inboundService.SetInboundSubSortIndex(id, f.SubSortIndex); err != nil {
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
+		return
+	}
+	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundUpdateSuccess"), nil)
+	websocket.BroadcastInvalidate(websocket.MessageTypeInbounds)
+}
+
 func (a *InboundController) setInboundEnable(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
@@ -434,7 +491,7 @@ func (a *InboundController) importInbound(c *gin.Context) {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}
-	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.toasts.inboundCreateSuccess"), inbound, nil)
+	jsonMsgObj(c, awgSaveNote(c, I18nWeb(c, "pages.inbounds.toasts.inboundCreateSuccess"), inbound), inbound, nil)
 	if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
@@ -442,14 +499,8 @@ func (a *InboundController) importInbound(c *gin.Context) {
 	notifyClientsChanged()
 }
 
-// resolveHost mirrors what sub.SubService.ResolveRequest does for the host
-// field: prefers X-Forwarded-Host (first entry of any list, port stripped),
-// then the host portion of c.Request.Host. Keeping it in the controller layer
-// means the service interface stays HTTP-agnostic — service methods receive a
-// plain host string instead of a *gin.Context.
-// X-Real-IP is deliberately not consulted: behind nginx it carries the
-// *viewer's* address, so it turned every generated link/QR for an inbound
-// without an address of its own into the admin's own IP.
+// resolveHost mirrors SubService.ResolveRequest's host: trusted X-Forwarded-Host,
+// else the dialed request Host. X-Real-IP names the visitor, not the panel (#6589).
 func resolveHost(c *gin.Context) string {
 	if isTrustedForwardedRequest(c) {
 		if h := strings.TrimSpace(c.GetHeader("X-Forwarded-Host")); h != "" {

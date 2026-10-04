@@ -9,7 +9,9 @@ package tunnel
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
@@ -69,6 +71,20 @@ func TrustTunnelConfigFromInbound(ib *model.Inbound) (TrustTunnelConfig, bool) {
 		ListenPreset:       s.ListenPreset,
 		ClientRandomPrefix: s.ClientRandomPrefix,
 	}.Merge()
+	if ib.Port > 0 {
+		host := "0.0.0.0"
+		if h, _, err := net.SplitHostPort(strings.TrimSpace(cfg.Listen)); err == nil && h != "" {
+			host = h
+		}
+		if IsLoopbackListen(ib.Listen) {
+			host = "127.0.0.1"
+		}
+		cfg.Listen = net.JoinHostPort(host, strconv.Itoa(ib.Port))
+	} else if IsLoopbackListen(ib.Listen) {
+		if _, p, err := net.SplitHostPort(strings.TrimSpace(cfg.Listen)); err == nil {
+			cfg.Listen = net.JoinHostPort("127.0.0.1", p)
+		}
+	}
 	return cfg, true
 }
 
@@ -104,7 +120,7 @@ func TrustTunnelInstanceFromInbound(ib *model.Inbound, secret []byte, panelCert,
 			if !c.Enable || strings.TrimSpace(c.Email) == "" {
 				continue
 			}
-			users = append(users, TrustTunnelClientAuth(secret, ib.Id, c.Email))
+			users = append(users, InboundAuthPair(secret, ib, c.Email))
 		}
 	}
 	if len(users) == 0 {

@@ -52,11 +52,10 @@ func TestManager_CollectTraffic_Empty(t *testing.T) {
 	}
 }
 
-// TestManager_Reconcile_EmptyDesired verifies Reconcile with an empty desired
-// set is safe and leaves the manager empty. Does not exercise awg-quick
-// (which requires Linux + the amneziawg kernel module); this guards the
-// state-machine bookkeeping only.
+// TestManager_Reconcile_EmptyDesired verifies Reconcile(nil) is safe and empties
+// the manager without touching the real host (see withTempConfigDir).
 func TestManager_Reconcile_EmptyDesired(t *testing.T) {
+	withTempConfigDir(t)
 	m := GetManager()
 	m.Reconcile(nil)
 	if len(m.procs) != 0 {
@@ -77,6 +76,9 @@ func TestParseAwgDump(t *testing.T) {
 	}
 	if peers[0].PublicKey != "peerA" || peers[0].Rx != 1024 || peers[0].Tx != 2048 || peers[0].LastHandshake != 1800000000 {
 		t.Errorf("peerA parsed wrong: %+v", peers[0])
+	}
+	if peers[0].Endpoint != "1.2.3.4:51820" || peers[0].AllowedIPs != "10.8.0.2/32" {
+		t.Errorf("peerA endpoint/ips: %+v", peers[0])
 	}
 	if peers[1].LastHandshake != 0 {
 		t.Errorf("peerB must keep zero handshake, got %d", peers[1].LastHandshake)
@@ -125,5 +127,14 @@ func TestParseInboundConfName(t *testing.T) {
 		if id != tc.wantID || ok != tc.wantOK {
 			t.Errorf("parseInboundConfName(%q) = (%d,%v), want (%d,%v)", tc.name, id, ok, tc.wantID, tc.wantOK)
 		}
+	}
+}
+
+func TestSetRebuildPause_BlocksEnsure(t *testing.T) {
+	m := GetManager()
+	SetRebuildPause(true)
+	t.Cleanup(func() { SetRebuildPause(false) })
+	if err := m.Ensure(Instance{Id: 1, Ifname: "awg1", Port: 51820}); err == nil {
+		t.Fatal("Ensure must fail while rebuild is paused")
 	}
 }

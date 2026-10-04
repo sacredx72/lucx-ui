@@ -46,6 +46,7 @@ func healthyKernelProber() fakeProber {
 			"ip -o -4 route show default":     "default via 192.168.1.1 dev eth0 proto static\n",
 			"awg version":                     "amneziawg-tools v3.0.20260730 - https://amnezia.org\n",
 			"iptables -t mangle -C PREROUTING -i awg1 -j MARK --set-mark 655361":         "",
+			"iptables -t nat -C POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE":        "",
 			"iptables -t nat -C POSTROUTING -m mark --mark 655361 -o eth0 -j MASQUERADE": "",
 			"iptables -C FORWARD -i awg1 -j ACCEPT":                                      "",
 			"iptables -C FORWARD -o awg1 -j ACCEPT":                                      "",
@@ -66,8 +67,8 @@ func TestDiagnose_KernelNATHealthy(t *testing.T) {
 			}
 		}
 	}
-	if len(d.Checks) != 7 {
-		t.Errorf("kernel-nat must run 7 checks, got %d: %+v", len(d.Checks), d.Checks)
+	if len(d.Checks) != 8 {
+		t.Errorf("kernel-nat must run 8 checks, got %d: %+v", len(d.Checks), d.Checks)
 	}
 	var peers DiagCheck
 	for _, c := range d.Checks {
@@ -99,6 +100,7 @@ func TestDiagnose_MissingInterfaceShortCircuits(t *testing.T) {
 func TestDiagnose_KernelNATFlushedRules(t *testing.T) {
 	p := healthyKernelProber()
 	p.failing["iptables -t mangle -C PREROUTING -i awg1 -j MARK --set-mark 655361"] = true
+	p.failing["iptables -t nat -C POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE"] = true
 	p.failing["iptables -t nat -C POSTROUTING -m mark --mark 655361 -o eth0 -j MASQUERADE"] = true
 	p.failing["iptables -C FORWARD -o awg1 -j ACCEPT"] = true
 	d := diagnose(natInstance(), p, fixedNow)
@@ -111,8 +113,8 @@ func TestDiagnose_KernelNATFlushedRules(t *testing.T) {
 			fwd = c
 		}
 	}
-	if masq.OK || !strings.Contains(masq.Detail, "-o eth0") || !strings.Contains(masq.Detail, "MARK") {
-		t.Errorf("masquerade check must fail and name mark+iface rule, got %+v", masq)
+	if masq.OK || !strings.Contains(masq.Detail, "-o eth0") || !strings.Contains(masq.Detail, "MASQUERADE") {
+		t.Errorf("masquerade check must fail and name the iface rule, got %+v", masq)
 	}
 	if fwd.OK || !strings.Contains(fwd.Detail, "-o awg1") {
 		t.Errorf("forward check must fail and name only the missing leg, got %+v", fwd)
@@ -184,6 +186,74 @@ func TestDiagnose_XrayTunRouteLost(t *testing.T) {
 	}
 	if route.OK || !strings.Contains(route.Detail, "reconcile re-adds") {
 		t.Errorf("lost default route must fail and point at reconcile recovery, got %+v", route)
+	}
+}
+
+func TestDiagnose_P2PIsolated(t *testing.T) {
+	d := diagnose(natInstance(), healthyKernelProber(), fixedNow)
+	var p2p DiagCheck
+	for _, c := range d.Checks {
+		if c.Name == "p2p" {
+			p2p = c
+		}
+	}
+	if !p2p.OK || !strings.Contains(p2p.Detail, "isolated") {
+		t.Errorf("p2p off must report isolation, got %+v", p2p)
+	}
+}
+
+func TestDiagnose_P2PHairpinNAT(t *testing.T) {
+	inst := natInstance()
+	inst.P2P = true
+	p := healthyKernelProber()
+	p.failing["iptables -C FORWARD -i awg1 -o awg1 -j DROP"] = true
+	d := diagnose(inst, p, fixedNow)
+	var p2p DiagCheck
+	for _, c := range d.Checks {
+		if c.Name == "p2p" {
+			p2p = c
+		}
+	}
+	if !p2p.OK || !strings.Contains(p2p.Detail, "hairpin allowed") {
+		t.Errorf("p2p on kernel-nat must allow hairpin, got %+v", p2p)
+	}
+}
+
+func TestDiagnose_P2PHairpinXray(t *testing.T) {
+	inst := natInstance()
+	inst.RouteThroughXray = true
+	inst.P2P = true
+	p := fakeProber{
+		outputs: map[string]string{
+			"ip link show awg1":               "3: awg1: <UP,LOWER_UP> mtu 1320 state UP",
+			"sysctl -n net.ipv4.ip_forward":   "1\n",
+			"awg show awg1 peers":             "pubkeyA\n",
+			"awg show awg1 latest-handshakes": "pubkeyA\t1799999999\n",
+			"ip link show tun1":               "7: tun1: <POINTOPOINT,UP,LOWER_UP> mtu 9000 state UNKNOWN",
+			"ip rule show iif awg1":           "201: from all to 10.8.0.0/24 iif awg1 lookup main\n32000: from all iif awg1 lookup 1001\n",
+			"ip rule show pref 201":           "201: from all to 10.8.0.0/24 iif awg1 lookup main\n",
+			"ip route show table 1001":        "default dev tun1 scope link\n",
+		},
+		failing: map[string]bool{
+			"iptables -C FORWARD -i awg1 -o awg1 -j DROP": true,
+		},
+	}
+	d := diagnose(inst, p, fixedNow)
+	if !d.Healthy() {
+		for _, c := range d.Checks {
+			if !c.OK {
+				t.Errorf("check %q failed: %s", c.Name, c.Detail)
+			}
+		}
+	}
+	var p2p DiagCheck
+	for _, c := range d.Checks {
+		if c.Name == "p2p" {
+			p2p = c
+		}
+	}
+	if !strings.Contains(p2p.Detail, "10.8.0.0/24") {
+		t.Errorf("xray p2p must name the subnet, got %+v", p2p)
 	}
 }
 

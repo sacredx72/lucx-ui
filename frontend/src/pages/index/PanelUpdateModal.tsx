@@ -36,35 +36,23 @@ const POLL_INITIAL_MS = 5_000;
 const POLL_DEADLINE_MS = 15 * 60_000;
 const POLL_INTERVAL_MS = 3_000;
 
-export default function PanelUpdateModal({
-  open,
-  info,
-  onClose,
-  onBusy,
-}: PanelUpdateModalProps) {
+export default function PanelUpdateModal({ open, info, onClose, onBusy }: PanelUpdateModalProps) {
   const { t } = useTranslation();
   const [modal, contextHolder] = Modal.useModal();
   const [notesExpanded, setNotesExpanded] = useState(false);
   const [feed, setFeed] = useState<PanelReleaseNote[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [page, setPage] = useState(1);
-  const [feedLoading, setFeedLoading] = useState(false);
+  // Starts true: the modal renders nothing while closed, and on open the
+  // spinner must show until the first fetch settles.
+  const [feedLoading, setFeedLoading] = useState(true);
   const [moreLoading, setMoreLoading] = useState(false);
 
   const notes = (info.releaseNotes || '').trim();
 
   useEffect(() => {
-    if (!open || !info.updateAvailable) {
-      setFeed([]);
-      setHasMore(false);
-      setPage(1);
-      setFeedLoading(false);
-      setMoreLoading(false);
-      setNotesExpanded(false);
-      return;
-    }
+    if (!open || !info.updateAvailable) return;
     let cancelled = false;
-    setFeedLoading(true);
     HttpUtil.get<PanelReleaseNotes>(
       '/panel/api/server/getPanelReleaseNotes',
       { page: 1 },
@@ -114,6 +102,17 @@ export default function PanelUpdateModal({
     return d.toLocaleDateString();
   }
 
+  // Reset from the modal's close event, not from an effect: the oxlint
+  // set-state-in-effect rule forbids synchronous setState in useEffect.
+  function resetNotesState() {
+    setFeed([]);
+    setHasMore(false);
+    setPage(1);
+    setFeedLoading(true);
+    setMoreLoading(false);
+    setNotesExpanded(false);
+  }
+
   async function pollUpdateStatus(expectedRunId: string): Promise<UpdateOutcome> {
     await PromiseUtil.sleep(POLL_INITIAL_MS);
     const deadline = Date.now() + POLL_DEADLINE_MS;
@@ -140,7 +139,10 @@ export default function PanelUpdateModal({
   function updatePanel() {
     modal.confirm({
       title: t('pages.index.panelUpdateDialog'),
-      content: t('pages.index.panelUpdateDialogDesc').replace('#version#', info.latestVersion || ''),
+      content: t('pages.index.panelUpdateDialogDesc').replace(
+        '#version#',
+        info.latestVersion || '',
+      ),
       okText: t('confirm'),
       cancelText: t('cancel'),
       onOk: async () => {
@@ -161,8 +163,16 @@ export default function PanelUpdateModal({
           return;
         }
         modal[outcome === 'failed' ? 'error' : 'warning']({
-          title: t(outcome === 'failed' ? 'pages.index.panelUpdateFailedTitle' : 'pages.index.panelUpdateUnknownTitle'),
-          content: t(outcome === 'failed' ? 'pages.index.panelUpdateFailedDesc' : 'pages.index.panelUpdateUnknownDesc'),
+          title: t(
+            outcome === 'failed'
+              ? 'pages.index.panelUpdateFailedTitle'
+              : 'pages.index.panelUpdateUnknownTitle',
+          ),
+          content: t(
+            outcome === 'failed'
+              ? 'pages.index.panelUpdateFailedDesc'
+              : 'pages.index.panelUpdateUnknownDesc',
+          ),
           okText: t('refresh'),
           onOk: () => window.location.reload(),
         });
@@ -179,6 +189,9 @@ export default function PanelUpdateModal({
         footer={null}
         onCancel={onClose}
         width={640}
+        afterOpenChange={(visible) => {
+          if (!visible) resetNotesState();
+        }}
       >
         {info.updateAvailable && (
           <Alert
@@ -192,7 +205,9 @@ export default function PanelUpdateModal({
         <div className="version-list">
           <div className="version-list-item">
             <span>{t('pages.index.currentPanelVersion')}</span>
-            <Tag color="green">{formatPanelVersion(window.X_UI_CUR_VER || info.currentVersion) || '?'}</Tag>
+            <Tag color="green">
+              {formatPanelVersion(window.X_UI_CUR_VER || info.currentVersion) || '?'}
+            </Tag>
           </div>
           {info.updateAvailable ? (
             <div className="version-list-item">
@@ -221,7 +236,9 @@ export default function PanelUpdateModal({
                     <div className="release-note-meta">
                       <Tag color="purple">{item.tag}</Tag>
                       {item.publishedAt ? (
-                        <span className="release-note-date">{formatPublished(item.publishedAt)}</span>
+                        <span className="release-note-date">
+                          {formatPublished(item.publishedAt)}
+                        </span>
                       ) : null}
                     </div>
                     {item.body ? (
@@ -250,7 +267,12 @@ export default function PanelUpdateModal({
                 ellipsis={
                   notesExpanded
                     ? false
-                    : { rows: 8, expandable: true, symbol: t('pages.index.releaseNotesMore'), onExpand: () => setNotesExpanded(true) }
+                    : {
+                        rows: 8,
+                        expandable: true,
+                        symbol: t('pages.index.releaseNotesMore'),
+                        onExpand: () => setNotesExpanded(true),
+                      }
                 }
               >
                 {notes}

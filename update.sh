@@ -19,19 +19,6 @@ done
 cur_dir="$(cd -P "$(dirname "$b_source")" > /dev/null 2>&1 && pwd || pwd -P)"
 script_name=$(basename "$0")
 
-# LUCX-HOOK (lucx.66): detect interactive vs headless execution. The panel's
-# web updater runs this script detached (systemd-run, stdin=/dev/null, no TTY).
-# Every interactive prompt (read -rp) then reads EOF: the server-IP fallback
-# loop spins forever, and the SSL wizard silently picks its default — stopping
-# the panel to issue a Let's Encrypt certificate. Both broke panels updated
-# from the web. Interactive console runs (x-ui update) keep the prompts.
-if [[ -t 0 ]]; then
-    lucx_interactive=1
-else
-    lucx_interactive=0
-fi
-# END LUCX-HOOK
-
 # Check command exist function
 _command_exists() {
     type "$1" &> /dev/null
@@ -861,64 +848,46 @@ config_after_update() {
 
     if [[ -z "$server_ip" ]]; then
         echo -e "${yellow}Could not auto-detect server IP from any provider.${plain}"
-        if [[ "$lucx_interactive" == "1" ]]; then
-            while [[ -z "$server_ip" ]]; do
-                read -rp "Please enter your server's public IPv4 address: " server_ip
-                server_ip="${server_ip// /}"
-                if [[ ! "$server_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                    echo -e "${red}Invalid IPv4 address. Please try again.${plain}"
-                    server_ip=""
-                fi
-            done
-        else
-            # Headless (web-panel) update: no TTY to answer the prompt, and the
-            # old unconditional `read` loop read EOF forever. server_ip is only
-            # consumed by the SSL wizard below, which is itself skipped headless,
-            # so an empty value is safe here.
-            echo -e "${yellow}Non-interactive update: skipping manual server IP entry.${plain}"
-        fi
+        while [[ -z "$server_ip" ]]; do
+            read -rp "Please enter your server's public IPv4 address: " server_ip
+            server_ip="${server_ip// /}"
+            if [[ ! "$server_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                echo -e "${red}Invalid IPv4 address. Please try again.${plain}"
+                server_ip=""
+            fi
+        done
     fi
 
-    # LUCX-HOOK (lucx.131): never reset an existing webBasePath on update.
-    # Upstream regenerates a missing/short path here, which silently changes
-    # the panel URL on live installs (e.g. a vanilla 3x-ui overlay whose path
-    # is "/"). Owner policy: a scripted update must not touch login/password
-    # or paths — the operator's access URL survives verbatim.
-    # END LUCX-HOOK
+    # Handle missing/short webBasePath
+    if [[ ${#existing_webBasePath} -lt 4 ]]; then
+        echo -e "${yellow}WebBasePath is missing or too short. Generating a new one...${plain}"
+        local config_webBasePath=$(gen_random_string 18)
+        ${xui_folder}/x-ui setting -webBasePath "${config_webBasePath}"
+        existing_webBasePath="${config_webBasePath}"
+        panel_needs_restart=1
+        echo -e "${green}New WebBasePath: ${config_webBasePath}${plain}"
+    fi
 
     # Check and prompt for SSL if missing
     if [[ -z "$existing_cert" ]]; then
-        if [[ "$lucx_interactive" == "1" ]]; then
-            echo ""
-            echo -e "${red}═══════════════════════════════════════════${plain}"
-            echo -e "${red}      ⚠ NO SSL CERTIFICATE DETECTED ⚠     ${plain}"
-            echo -e "${red}═══════════════════════════════════════════${plain}"
-            echo -e "${yellow}For security, SSL certificate is MANDATORY for all panels.${plain}"
-            echo -e "${yellow}Let's Encrypt now supports both domains and IP addresses!${plain}"
-            echo ""
+        echo ""
+        echo -e "${red}═══════════════════════════════════════════${plain}"
+        echo -e "${red}      ⚠ NO SSL CERTIFICATE DETECTED ⚠     ${plain}"
+        echo -e "${red}═══════════════════════════════════════════${plain}"
+        echo -e "${yellow}For security, SSL certificate is MANDATORY for all panels.${plain}"
+        echo -e "${yellow}Let's Encrypt now supports both domains and IP addresses!${plain}"
+        echo ""
 
-            # Prompt and setup SSL (domain or IP)
-            prompt_and_setup_ssl "${existing_port}" "${existing_webBasePath}" "${server_ip}"
+        # Prompt and setup SSL (domain or IP)
+        prompt_and_setup_ssl "${existing_port}" "${existing_webBasePath}" "${server_ip}"
 
-            echo ""
-            echo -e "${green}═══════════════════════════════════════════${plain}"
-            echo -e "${green}     Panel Access Information              ${plain}"
-            echo -e "${green}═══════════════════════════════════════════${plain}"
-            echo -e "${green}Access URL: https://${SSL_HOST}:${existing_port}/${existing_webBasePath}${plain}"
-            echo -e "${green}═══════════════════════════════════════════${plain}"
-            echo -e "${yellow}⚠ SSL Certificate: Enabled and configured${plain}"
-        else
-            # LUCX-HOOK (lucx.66): headless (web-panel) update. The SSL wizard
-            # is interactive and, with no TTY, used to default to issuing a
-            # Let's Encrypt certificate — it stops the panel, runs acme.sh on
-            # port 80 and restarts, which left panels/Xray broken when run from
-            # the web updater. Skip it entirely here; the certificate can be set
-            # up later from a console (`x-ui` menu) or the panel settings.
-            echo ""
-            echo -e "${yellow}No SSL certificate configured. Non-interactive update: skipping SSL setup.${plain}"
-            echo -e "${yellow}Configure a certificate later via the console menu or panel settings.${plain}"
-            # END LUCX-HOOK
-        fi
+        echo ""
+        echo -e "${green}═══════════════════════════════════════════${plain}"
+        echo -e "${green}     Panel Access Information              ${plain}"
+        echo -e "${green}═══════════════════════════════════════════${plain}"
+        echo -e "${green}Access URL: https://${SSL_HOST}:${existing_port}/${existing_webBasePath}${plain}"
+        echo -e "${green}═══════════════════════════════════════════${plain}"
+        echo -e "${yellow}⚠ SSL Certificate: Enabled and configured${plain}"
     else
         echo -e "${green}SSL certificate is already configured${plain}"
         # Show access URL with existing certificate
@@ -952,6 +921,13 @@ setup_fail2ban() {
 
     if [[ ! -x /usr/bin/x-ui ]]; then
         echo -e "${yellow}x-ui CLI not found; skipping Fail2ban auto-setup.${plain}"
+        return 0
+    fi
+
+    # Scripts older than v3.4.0 have no setup-fail2ban and exit 0 from the
+    # usage banner, which would read as success here.
+    if ! grep -q '"setup-fail2ban")' /usr/bin/x-ui; then
+        echo -e "${yellow}This x-ui.sh predates 'x-ui setup-fail2ban'; skipping Fail2ban auto-setup.${plain}"
         return 0
     fi
 
@@ -998,6 +974,21 @@ _install_xui_service_unit() {
     return 0
 }
 
+# Older tags predate some of these files (x-ui.rc arrived in v2.8.4). Serving
+# main's copy against an old binary is the mismatch this pinning exists to
+# prevent, so probe before the old install is removed and refuse the tag.
+require_repo_files() {
+    local ref="$1" name status
+    shift
+    [[ "${ref}" == "main" ]] && return 0
+    for name in "$@"; do
+        status=$(${curl_bin} -sIL --retry 3 --connect-timeout 15 -o /dev/null -w '%{http_code}' "https://raw.githubusercontent.com/AlexeyLCP/lucx-ui/${ref}/${name}")
+        if [[ "${status}" != "200" ]]; then
+            _fail "ERROR: ${name} is not available for ${ref} (HTTP ${status}). Update to a release that ships it, or to 'dev-latest'. The current installation is untouched."
+        fi
+    done
+}
+
 update_x-ui() {
     cd ${xui_folder%/x-ui}/
 
@@ -1024,6 +1015,17 @@ update_x-ui() {
         fi
     fi
     echo -e "Got x-ui latest version: ${tag_version}, beginning the installation..."
+    # x-ui.sh, x-ui.rc and the unit files must come from the same release as
+    # the binary; only the rolling dev build tracks main.
+    script_ref="${tag_version}"
+    if [[ "${tag_version}" == "dev-latest" ]]; then
+        script_ref="main"
+    fi
+    # The unit files are only fetched when the release tarball lacks them, so
+    # they are checked at that point instead of here.
+    local required_files=("x-ui.sh")
+    [[ $release == "alpine" ]] && required_files+=("x-ui.rc")
+    require_repo_files "${script_ref}" "${required_files[@]}"
     ${curl_bin} -fLRo ${xui_folder}-linux-$(arch).tar.gz https://github.com/AlexeyLCP/lucx-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz 2> /dev/null
     if [[ $? -ne 0 ]]; then
         _fail "ERROR: Failed to download x-ui, please be sure that your server can access GitHub"
@@ -1031,6 +1033,28 @@ update_x-ui() {
     if [[ ! -s ${xui_folder}-linux-$(arch).tar.gz ]]; then
         rm ${xui_folder}-linux-$(arch).tar.gz -f > /dev/null 2>&1
         _fail "ERROR: Downloaded x-ui release archive is empty, please be sure that your server can access GitHub"
+    fi
+    # Releases publish <asset>.sha256 next to each archive. A mismatch or a
+    # failed sidecar download aborts the update; only a 404 (releases
+    # predating the sidecar) is tolerated with a warning.
+    archive="${xui_folder}-linux-$(arch).tar.gz"
+    rm -f "${archive}.sha256"
+    sidecar_code=$(${curl_bin} -sL --retry 3 --retry-delay 3 --connect-timeout 15 --max-time 60 -o "${archive}.sha256" -w '%{http_code}' "https://github.com/AlexeyLCP/lucx-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz.sha256" 2> /dev/null)
+    if [[ "${sidecar_code}" == "200" ]]; then
+        expected_sha256=$(awk 'NR == 1 {print $1}' "${archive}.sha256")
+        actual_sha256=$(sha256sum "${archive}" | awk '{print $1}')
+        rm -f "${archive}.sha256"
+        if [[ ! "${expected_sha256}" =~ ^[0-9a-f]{64}$ || "${expected_sha256}" != "${actual_sha256}" ]]; then
+            rm -f "${archive}"
+            _fail "ERROR: Checksum mismatch for $(basename "${archive}"): expected ${expected_sha256:-<none>}, got ${actual_sha256}"
+        fi
+        echo -e "${green}Checksum verified: ${actual_sha256}${plain}"
+    elif [[ "${sidecar_code}" == "404" ]]; then
+        rm -f "${archive}.sha256"
+        echo -e "${yellow}No checksum published for this release, skipping verification${plain}"
+    else
+        rm -f "${archive}.sha256" "${archive}"
+        _fail "ERROR: Failed to download the checksum for x-ui-linux-$(arch).tar.gz (HTTP ${sidecar_code})"
     fi
 
     if [[ -e ${xui_folder}/ ]]; then
@@ -1062,6 +1086,7 @@ update_x-ui() {
         # an inbound port with an outdated secret, silently breaking new clients.
         # The new panel respawns a clean mtg per inbound on next start.
         pkill -f 'mtg-linux-[^ ]* run ' > /dev/null 2>&1 || true
+        pkill -f 'tuic-server.*-c .*bin/tuic/tuic_[0-9]+\.json' > /dev/null 2>&1 || true
         echo -e "${green}Removing old x-ui version...${plain}"
         rm ${xui_folder} -f > /dev/null 2>&1
         rm ${xui_folder}/x-ui.service -f > /dev/null 2>&1
@@ -1077,6 +1102,8 @@ update_x-ui() {
         echo -e "${green}Removing old README and LICENSE file...${plain}"
         rm ${xui_folder}/bin/README.md -f > /dev/null 2>&1
         rm ${xui_folder}/bin/LICENSE -f > /dev/null 2>&1
+        rm ${xui_folder}/bin/tuic-server -f > /dev/null 2>&1
+        rm ${xui_folder}/bin/tuic -rf > /dev/null 2>&1
     else
         rm x-ui-linux-$(arch).tar.gz -f > /dev/null 2>&1
         _fail "ERROR: x-ui not installed."
@@ -1117,7 +1144,7 @@ update_x-ui() {
     echo -e "${green}Downloading and installing x-ui.sh script...${plain}"
     local xui_script_temp="/usr/bin/x-ui-temp.$$"
     rm -f "${xui_script_temp}"
-    ${curl_bin} -fLRo "${xui_script_temp}" https://raw.githubusercontent.com/AlexeyLCP/lucx-ui/main/x-ui.sh > /dev/null 2>&1
+    ${curl_bin} -fLRo "${xui_script_temp}" "https://raw.githubusercontent.com/AlexeyLCP/lucx-ui/${script_ref}/x-ui.sh" > /dev/null 2>&1
     if [[ $? -ne 0 ]]; then
         rm -f "${xui_script_temp}"
         _fail "ERROR: Failed to download x-ui.sh script, please be sure that your server can access GitHub"
@@ -1148,7 +1175,7 @@ update_x-ui() {
         echo -e "${green}Downloading and installing startup unit x-ui.rc...${plain}"
         xui_rc_temp="/etc/init.d/x-ui.tmp.$$"
         rm -f "${xui_rc_temp}"
-        ${curl_bin} -fLRo "${xui_rc_temp}" https://raw.githubusercontent.com/AlexeyLCP/lucx-ui/main/x-ui.rc > /dev/null 2>&1
+        ${curl_bin} -fLRo "${xui_rc_temp}" "https://raw.githubusercontent.com/AlexeyLCP/lucx-ui/${script_ref}/x-ui.rc" > /dev/null 2>&1
         if [[ $? -ne 0 ]]; then
             rm -f "${xui_rc_temp}"
             _fail "ERROR: Failed to download startup unit x-ui.rc, please be sure that your server can access GitHub"
@@ -1207,18 +1234,18 @@ update_x-ui() {
                 echo -e "${yellow}Service files not found in tar.gz, downloading from GitHub...${plain}"
                 case "${release}" in
                     ubuntu | debian | armbian)
-                        service_unit_url="https://raw.githubusercontent.com/AlexeyLCP/lucx-ui/main/x-ui.service.debian"
+                        service_unit_url="https://raw.githubusercontent.com/AlexeyLCP/lucx-ui/${script_ref}/x-ui.service.debian"
                         ;;
                     arch | manjaro | parch)
-                        service_unit_url="https://raw.githubusercontent.com/AlexeyLCP/lucx-ui/main/x-ui.service.arch"
+                        service_unit_url="https://raw.githubusercontent.com/AlexeyLCP/lucx-ui/${script_ref}/x-ui.service.arch"
                         ;;
                     *)
-                        service_unit_url="https://raw.githubusercontent.com/AlexeyLCP/lucx-ui/main/x-ui.service.rhel"
+                        service_unit_url="https://raw.githubusercontent.com/AlexeyLCP/lucx-ui/${script_ref}/x-ui.service.rhel"
                         ;;
                 esac
 
                 if ! _install_xui_service_unit "$service_unit_url" "true"; then
-                    echo -e "${red}Failed to install x-ui.service from GitHub${plain}"
+                    echo -e "${red}Failed to install x-ui.service from GitHub (${script_ref}) -- the release tarball did not ship one either${plain}"
                     exit 1
                 fi
             fi
@@ -1227,61 +1254,6 @@ update_x-ui() {
         chmod 644 ${xui_service}/x-ui.service > /dev/null 2>&1
         systemctl daemon-reload > /dev/null 2>&1
         systemctl enable x-ui > /dev/null 2>&1
-
-        # LUCX-HOOK: rebuild AWG kernel module when upstream moved + reboot
-        # into a freshly upgraded kernel at the very end of the update.
-        # update.sh runs both on web-panel and console `x-ui update`. The panel
-        # is stopped (line ~1019), so awgN interfaces are gone and rmmod is
-        # safe. The rebuild gate compares the marker file — the commit SHA the
-        # module was built from, written by bin/install-awg-module.sh — against
-        # upstream master via git ls-remote (no clone). A version string
-        # cannot discriminate: upstream stamps PACKAGE_VERSION="1.0.0" into
-        # every module build, v1 and v3 alike. lucx.145: matching SHA skips
-        # reinstall and kernel upgrade; mismatch still --force-rebuild (and
-        # may reboot into the new kernel). Never fatal: a failed rebuild
-        # keeps the existing module (panel still starts).
-        if [[ -x bin/install-awg-module.sh ]]; then
-            # Opt-in (lucx.130): never install AWG on a host that never had it.
-            # Marker, loaded module, or awg-quick means the operator installed
-            # it (or a pre-130 auto-install left it). Otherwise skip — Cores /
-            # `x-ui install-awg` is the install path.
-            AWG_ALREADY=0
-            [[ -f /etc/x-ui/.awg-module-version ]] && AWG_ALREADY=1
-            [[ -d /sys/module/amneziawg ]] && AWG_ALREADY=1
-            command -v awg-quick >/dev/null 2>&1 && AWG_ALREADY=1
-            if [[ $AWG_ALREADY -eq 0 ]]; then
-                echo -e "${yellow}AWG module not installed — skip. Install: x-ui install-awg${plain}"
-            else
-            INSTALLED_AWG_SHA=""
-            [[ -f /etc/x-ui/.awg-module-version ]] && INSTALLED_AWG_SHA=$(cat /etc/x-ui/.awg-module-version 2>/dev/null)
-            UPSTREAM_AWG_SHA=$(git ls-remote https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git refs/heads/master 2>/dev/null | awk '{print $1}')
-            if [[ -n "$UPSTREAM_AWG_SHA" && "$INSTALLED_AWG_SHA" != "$UPSTREAM_AWG_SHA" ]]; then
-                echo -e "${green}AWG module ${INSTALLED_AWG_SHA:-none} → ${UPSTREAM_AWG_SHA:0:12}: rebuilding...${plain}"
-                bash bin/install-awg-module.sh --force-rebuild || \
-                    echo -e "${red}AWG module rebuild failed (non-fatal). Run: bash <(curl -fL https://raw.githubusercontent.com/AlexeyLCP/lucx-ui/main/install.sh)${plain}"
-                # Kernel upgraded inside install-awg-module.sh: schedule the
-                # reboot once everything else (panel start, migrate, fail2ban)
-                # has finished.
-                NEWEST_KERNEL=$(ls -1 /lib/modules 2>/dev/null | sort -V | tail -1)
-                if [[ -n "$NEWEST_KERNEL" && "$NEWEST_KERNEL" != "$(uname -r)" && -d "/lib/modules/$NEWEST_KERNEL/build" ]]; then
-                    xui_kernel_reboot=1
-                    xui_newest_kernel="$NEWEST_KERNEL"
-                fi
-            elif [[ -z "$UPSTREAM_AWG_SHA" ]]; then
-                # No network: do not force a reinstall of an already-present
-                # module (lucx.145). install-awg-module.sh would also skip.
-                echo -e "${yellow}AWG module: can't probe upstream — leave installed module as-is.${plain}"
-            else
-                # SHA already matches target — do not reinstall or bump the
-                # kernel (lucx.145). Tools-only refresh still runs inside the
-                # script if awg < v3.1.
-                bash bin/install-awg-module.sh || true
-                echo -e "${green}AWG module up to date (${INSTALLED_AWG_SHA:0:12}).${plain}"
-            fi
-            fi
-        fi
-        # END LUCX-HOOK
-
         systemctl start x-ui > /dev/null 2>&1
     fi
 
@@ -1291,6 +1263,17 @@ update_x-ui() {
     # works out of the box on update too (no-op when XUI_ENABLE_FAIL2BAN=false).
     # Never fatal.
     setup_fail2ban
+
+    # LUCX-HOOK: AWG after panel start (no-op when pin matches). Never fatal.
+    # Absolute path: SSL/acme `cd ~` leaves cwd at /root, so relative bin/ skips.
+    local awg_installer="${xui_folder}/bin/install-awg-module.sh"
+    if [[ -x "${awg_installer}" ]]; then
+        echo -e "${green}Checking AmneziaWG kernel module...${plain}"
+        bash "${awg_installer}" || echo -e "${red}AWG install failed — AWG inbounds will be unavailable until manually fixed.${plain}"
+    else
+        echo -e "${red}AWG installer missing at ${awg_installer}${plain}"
+    fi
+    # END LUCX-HOOK
 
     echo -e "${green}x-ui ${tag_version}${plain} updating finished, it is running now..."
     echo -e ""
@@ -1312,23 +1295,10 @@ update_x-ui() {
 │  ${blue}x-ui install${plain}      - Install                          │
 │  ${blue}x-ui uninstall${plain}    - Uninstall                        │
 └───────────────────────────────────────────────────────┘"
-
-    # LUCX-HOOK: reboot into the freshly upgraded kernel once the update is
-    # fully finished — the panel is running on the old kernel right now;
-    # systemd brings it back after the reboot, and install-awg-module.sh has
-    # already compiled the AWG module for the new kernel. The delay lets the
-    # final output reach the web-panel/console session.
-    # Also honor /etc/x-ui/.awg-reboot-needed from install-awg-module.sh
-    # (lucx.122: never reboot mid-script).
-    if [[ "${xui_kernel_reboot:-0}" == "1" || -f /etc/x-ui/.awg-reboot-needed ]]; then
+    # LUCX-HOOK: never auto-reboot on update (web update looked hung).
+    if [[ -f /etc/x-ui/.awg-reboot-needed ]]; then
         echo -e ""
-        if [[ "${xui_kernel_reboot:-0}" == "1" ]]; then
-            echo -e "${green}Ядро обновлено: $(uname -r) → ${xui_newest_kernel}. Перезагрузка через 10 секунд...${plain}"
-        else
-            echo -e "${green}AWG: module built for a newer kernel — reboot in 10s (panel already running).${plain}"
-        fi
-        rm -f /etc/x-ui/.awg-reboot-needed
-        ( sleep 10 && reboot ) > /dev/null 2>&1 &
+        echo -e "${yellow}AWG: reboot required so the new kernel module loads. Reboot when convenient.${plain}"
     fi
     # END LUCX-HOOK
 }

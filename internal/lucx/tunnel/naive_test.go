@@ -27,7 +27,7 @@ func TestNameRegistry(t *testing.T) {
 	if !Olcrtc.Valid() || Olcrtc.DisplayName() != "olcRTC" {
 		t.Errorf("Olcrtc Valid/DisplayName broken: %v %q", Olcrtc.Valid(), Olcrtc.DisplayName())
 	}
-	if got := All(); len(got) != 5 || got[0] != Naive || got[1] != Olcrtc || got[2] != Qwdtt || got[3] != Mieru || got[4] != TrustTunnel {
+	if got := All(); len(got) != 12 || got[0] != Naive || got[1] != Olcrtc || got[2] != Qwdtt || got[3] != Csqtt || got[4] != Mieru || got[5] != TrustTunnel || got[6] != Anytls || got[7] != Tproxy || got[8] != Mtproxy || got[9] != TproxyCaddy || got[10] != Cover || got[11] != Gateway {
 		t.Errorf("All() = %v", got)
 	}
 	if got := Olcrtc.BinaryName(); !strings.HasPrefix(got, "olcrtc-") {
@@ -44,6 +44,21 @@ func TestNameRegistry(t *testing.T) {
 	}
 	if got := TrustTunnel.BinaryName(); !strings.HasPrefix(got, "trusttunnel-") {
 		t.Errorf("TrustTunnel.BinaryName = %q", got)
+	}
+	if !Anytls.Valid() || Anytls.DisplayName() != "AnyTLS" {
+		t.Errorf("Anytls Valid/DisplayName broken: %v %q", Anytls.Valid(), Anytls.DisplayName())
+	}
+	if got := Anytls.BinaryName(); !strings.HasPrefix(got, "anytls-") {
+		t.Errorf("Anytls.BinaryName = %q", got)
+	}
+	if !Tproxy.Valid() || Tproxy.DisplayName() != "Telegram WEB proxy" {
+		t.Errorf("Tproxy Valid/DisplayName broken: %v %q", Tproxy.Valid(), Tproxy.DisplayName())
+	}
+	if got := TproxyCaddy.BinaryName(); !strings.Contains(got, "caddy-naive") {
+		t.Errorf("TproxyCaddy.BinaryName = %q, want caddy-naive", got)
+	}
+	if got := Gateway.BinaryName(); !strings.Contains(got, "caddy-layer4") {
+		t.Errorf("Gateway.BinaryName = %q, want caddy-layer4", got)
 	}
 }
 
@@ -99,6 +114,10 @@ func TestNaiveValidate(t *testing.T) {
 		{"bad log level", func(c *NaiveConfig) { c.LogLevel = "LOUD" }},
 		{"acme without domain", func(c *NaiveConfig) { c.UseAcme = true; c.Domain = "" }},
 		{"acme on custom port", func(c *NaiveConfig) { c.UseAcme = true; c.Domain = "n.example.org"; c.Port = 8443 }},
+		{"domain brace inject", func(c *NaiveConfig) { c.Domain = "x.com {\n foo" }},
+		{"domain comma inject", func(c *NaiveConfig) { c.Domain = "x.com, :80" }},
+		{"listen not ip", func(c *NaiveConfig) { c.Listen = "not-an-ip" }},
+		{"email newline", func(c *NaiveConfig) { c.AcmeEmail = "a@b.com\nfoo" }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -143,9 +162,8 @@ func TestRenderCaddyfileUpstreamWhenRouted(t *testing.T) {
 	cfg.RouteXrayPort = 50123
 
 	got := cfg.RenderCaddyfile(nil, "")
-	want := "upstream socks5://127.0.0.1:50123"
-	if !strings.Contains(got, want) {
-		t.Fatalf("routed Caddyfile missing %q:\n%s", want, got)
+	if !strings.Contains(got, "upstream socks5://") || !strings.Contains(got, "@127.0.0.1:50123") {
+		t.Fatalf("routed Caddyfile missing authenticated socks upstream:\n%s", got)
 	}
 
 	cfg.RouteThroughXray = false
@@ -182,7 +200,7 @@ func TestRenderCaddyfileManual(t *testing.T) {
 		"skip_install_trust",
 		"auto_https off",
 		"level WARN",
-		":443, n.example.org {",
+		`:443, "n.example.org" {`,
 		"tls \"/etc/ssl/cert.pem\" \"/etc/ssl/key.pem\"",
 		"forward_proxy {",
 		"basic_auth \"alice\" \"s3cret\"",
@@ -211,6 +229,22 @@ func TestRenderCaddyfileManual(t *testing.T) {
 	}
 }
 
+func TestRenderCaddyfileLoopbackPinsH1H2(t *testing.T) {
+	cfg := DefaultNaiveConfig()
+	cfg.AuthUser = "u"
+	cfg.AuthPass = "p"
+	cfg.CertFile = "/c.pem"
+	cfg.KeyFile = "/k.pem"
+	cfg.Domain = "n.example.org"
+	cfg.Listen = "127.0.0.1"
+	cfg.Port = 54807
+	cfg.EnableH3 = true
+	got := cfg.RenderCaddyfile(nil, "")
+	if !strings.Contains(got, "protocols h1 h2") {
+		t.Fatalf("loopback naive must pin h1/h2 (L4 has no UDP):\n%s", got)
+	}
+}
+
 func TestRenderCaddyfileBindAndH3Off(t *testing.T) {
 	cfg := DefaultNaiveConfig()
 	cfg.AuthUser = "u"
@@ -225,8 +259,8 @@ func TestRenderCaddyfileBindAndH3Off(t *testing.T) {
 
 	got := cfg.RenderCaddyfile(nil, "")
 	for _, want := range []string{
-		":8443, n.example.org:8443 {",
-		"bind 10.0.0.5",
+		`:8443, "n.example.org:8443" {`,
+		`bind "10.0.0.5"`,
 		"protocols h1 h2",
 	} {
 		if !strings.Contains(got, want) {
@@ -251,10 +285,10 @@ func TestRenderCaddyfileAcme(t *testing.T) {
 	cfg.AuthPass = "p"
 
 	got := cfg.RenderCaddyfile(nil, "")
-	if !strings.Contains(got, "n.example.org {") {
+	if !strings.Contains(got, `"n.example.org" {`) {
 		t.Errorf("ACME site address must be the domain:\n%s", got)
 	}
-	if !strings.Contains(got, "tls admin@example.org") {
+	if !strings.Contains(got, `tls "admin@example.org"`) {
 		t.Errorf("ACME email missing:\n%s", got)
 	}
 	if strings.Contains(got, ":443,") {
@@ -287,8 +321,19 @@ func TestRenderCaddyfileEscapesCredentials(t *testing.T) {
 func TestRenderCaddyfileRawMode(t *testing.T) {
 	cfg := NaiveConfig{UseRawConfig: true, RawConfig: ":8443 {\n\trespond \"ok\"\n}"}
 	got := cfg.RenderCaddyfile(nil, "")
-	if got != ":8443 {\n\trespond \"ok\"\n}\n" {
-		t.Errorf("raw mode must pass text through with a trailing newline:\n%q", got)
+	if !strings.HasPrefix(got, "{\n\tadmin off\n\tskip_install_trust\n}\n\n") {
+		t.Errorf("raw mode must prepend admin off:\n%q", got)
+	}
+	if !strings.Contains(got, ":8443 {\n\trespond \"ok\"\n}") {
+		t.Errorf("raw site block missing:\n%q", got)
+	}
+	hostile := NaiveConfig{UseRawConfig: true, RawConfig: "{\n\tadmin 0.0.0.0:2019\n}\n:443 {\n}\n"}
+	got = hostile.RenderCaddyfile(nil, "")
+	if strings.Contains(got, "0.0.0.0:2019") {
+		t.Errorf("raw admin listener survived:\n%s", got)
+	}
+	if !strings.Contains(got, "admin off") || !strings.Contains(got, "skip_install_trust") {
+		t.Errorf("forced global missing:\n%s", got)
 	}
 }
 
@@ -373,6 +418,23 @@ func TestNaiveClientURL(t *testing.T) {
 	}
 }
 
+func TestNaiveClientURLForRemark(t *testing.T) {
+	cfg := DefaultNaiveConfig()
+	cfg.Domain = "n.example.org"
+	cfg.Port = 443
+	got := cfg.ClientURLFor(AuthPair{User: "alice", Pass: "s3cret"}, "naive-in-user")
+	if !strings.HasSuffix(got, "#naive-in-user") {
+		t.Errorf("ClientURLFor fragment: %q", got)
+	}
+	if !strings.Contains(got, "@n.example.org:443") {
+		t.Errorf("ClientURLFor host:port: %q", got)
+	}
+	at := cfg.ClientURLAt(AuthPair{User: "alice", Pass: "s3cret"}, "example.com", 443, "r")
+	if !strings.Contains(at, "@n.example.org:443") || strings.Contains(at, "sni=") {
+		t.Fatalf("ClientURLAt: %q", at)
+	}
+}
+
 func TestInstanceFingerprint(t *testing.T) {
 	a := Instance{Core: Naive, Enabled: true, ConfigText: "x", ExtraArgs: "--a"}
 	b := Instance{Core: Naive, Enabled: true, ConfigText: "x", ExtraArgs: "--a"}
@@ -394,5 +456,65 @@ func TestInstanceFingerprint(t *testing.T) {
 	e.Enabled = false
 	if a.Fingerprint() != e.Fingerprint() {
 		t.Error("enabled flag must not move the fingerprint")
+	}
+}
+
+// The forced global block must disarm the admin endpoint without touching
+// anything else that happens to contain the word. Each case below is an
+// ordinary Caddyfile the regex used to mangle into an unparseable one.
+func TestForceCaddySafeGlobal_KeepsUnrelatedAdminWords(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		keep string
+	}{
+		{"site address", "admin.example.com {\n\troot * /srv\n}\n", "admin.example.com {"},
+		{"credential", ":443 {\n\tbasic_auth admin S3cretPassw0rd\n}\n", "basic_auth admin S3cretPassw0rd"},
+		{"path", ":443 {\n\ttls /etc/ssl/admin.crt /etc/ssl/admin.key\n}\n", "/etc/ssl/admin.key"},
+		{"header value", ":443 {\n\theader X-Role admin\n}\n", "header X-Role admin"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := forceCaddySafeGlobal(tc.raw)
+			if !strings.Contains(got, tc.keep) {
+				t.Errorf("hardening ate a line it does not own; want %q in:\n%s", tc.keep, got)
+			}
+			if !strings.Contains(got, "admin off") {
+				t.Errorf("forced global missing:\n%s", got)
+			}
+		})
+	}
+}
+
+// Caddy refuses a global options block that is not the first thing in the file,
+// and a leading comment is the ordinary way to head a config.
+func TestForceCaddySafeGlobal_LeadingCommentKeepsOneGlobalBlock(t *testing.T) {
+	raw := "# my config\n{\n\tdebug\n}\n\n:8443 {\n\trespond \"ok\"\n}\n"
+	got := forceCaddySafeGlobal(raw)
+	if n := strings.Count(got, "skip_install_trust"); n != 1 {
+		t.Fatalf("expected exactly one forced global block, got %d:\n%s", n, got)
+	}
+	if !strings.Contains(got, "debug") {
+		t.Errorf("the operator's own global options were dropped:\n%s", got)
+	}
+	if strings.Contains(got, "}\n\n{\n") || strings.HasPrefix(got, "{\n\tadmin off") {
+		t.Errorf("a second global block was prepended ahead of the existing one:\n%s", got)
+	}
+}
+
+// The real admin directive still has to go, in every position it can occupy.
+func TestForceCaddySafeGlobal_StillDisarmsTheAdminEndpoint(t *testing.T) {
+	for _, raw := range []string{
+		"{\n\tadmin 0.0.0.0:2019\n}\n:443 {\n}\n",
+		"{\n\tadmin unix//run/caddy.sock\n}\n:443 {\n}\n",
+		"# lead\n{\n\tadmin :2019\n}\n:443 {\n}\n",
+	} {
+		got := forceCaddySafeGlobal(raw)
+		if strings.Contains(got, "2019") || strings.Contains(got, "caddy.sock") {
+			t.Errorf("raw admin listener survived:\n%s", got)
+		}
+		if !strings.Contains(got, "admin off") {
+			t.Errorf("forced global missing:\n%s", got)
+		}
 	}
 }

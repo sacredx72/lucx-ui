@@ -44,6 +44,10 @@ func (j *AwgJob) Run() {
 	if service.AwgRebuildRunning() {
 		return
 	}
+	if !awg.KernelAvailable() {
+		awg.GetManager().Reconcile(nil)
+		return
+	}
 	inbounds, err := j.inboundService.GetAllInbounds()
 	if err != nil {
 		logger.Warning("awg job: get inbounds failed:", err)
@@ -141,19 +145,18 @@ func (j *AwgJob) Run() {
 	j.lastTick = now
 	// END LUCX-HOOK
 
-	// Online status: fresh handshake (<180 s) = online. activeTags marks the
-	// running AWG inbounds so the "active inbound" gating works for AWG too.
+	// Online status: fresh handshake (<180 s) = online. activeTags only for
+	// inbounds that actually have a live peer, so a quiet AWG inbound does
+	// not steal another protocol's online client on the Inbounds page.
 	var onlineEmails []string
+	activeTags := make([]string, 0, len(onlineByTag))
 	for tag, keys := range onlineByTag {
+		activeTags = append(activeTags, tag)
 		for _, key := range keys {
 			if email, ok := emailsByTag[tag][key]; ok {
 				onlineEmails = append(onlineEmails, email)
 			}
 		}
-	}
-	activeTags := make([]string, 0, len(desired))
-	for _, inst := range desired {
-		activeTags = append(activeTags, inst.Tag)
 	}
 	j.inboundService.RefreshLocalOnlineClients(onlineEmails, activeTags)
 
@@ -165,15 +168,35 @@ func (j *AwgJob) Run() {
 		outbounds, err := svc.GetOutbounds()
 		if err == nil {
 			m := awg.GetManager()
+			// The rows are the only record of what should exist; a disabled one
+			// is still wanted here, RemoveClient below tears it down properly.
+			want := make(map[string]struct{}, len(outbounds))
+			for _, o := range outbounds {
+				want["awgo-"+strconv.Itoa(o.Id)] = struct{}{}
+			}
+			m.SweepOrphanClients(want)
+			needXray := false
 			for _, o := range outbounds {
 				if !o.Enable {
 					_ = m.RemoveClient("awgo-" + strconv.Itoa(o.Id))
 					continue
 				}
 				if ci, ok := awg.ClientInstanceFromOutbound(o); ok {
+					_, _, _, wasUp := m.CollectClientTraffic(ci.Ifname)
 					if err := m.EnsureClient(ci); err != nil {
 						logger.Warning("awg: outbound reconcile failed for", o.Tag, err)
+						continue
 					}
+					if !wasUp {
+						if _, _, _, up := m.CollectClientTraffic(ci.Ifname); up {
+							needXray = true
+						}
+					}
+				}
+			}
+			if needXray {
+				if err := (&service.XrayService{}).RestartXray(false); err != nil {
+					logger.Warning("awg: restart xray after outbound iface up:", err)
 				}
 			}
 		}

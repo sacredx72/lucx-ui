@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"embed"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -16,12 +17,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mhsanaei/3x-ui/v3/internal/amneziawgnet"
 	"github.com/mhsanaei/3x-ui/v3/internal/awg" // LUCX-HOOK: AWG sidecar
 	"github.com/mhsanaei/3x-ui/v3/internal/config"
 	"github.com/mhsanaei/3x-ui/v3/internal/eventbus"
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
 	"github.com/mhsanaei/3x-ui/v3/internal/lucx/tunnel" // LUCX-HOOK: tunnel sidecars (NaiveProxy)
 	"github.com/mhsanaei/3x-ui/v3/internal/mtproto"
+	"github.com/mhsanaei/3x-ui/v3/internal/tuic"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/common"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/sys"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/controller"
@@ -31,6 +34,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v3/internal/web/network"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/runtime"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service"
+	"github.com/mhsanaei/3x-ui/v3/internal/web/service/discord"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service/email"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service/panel"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service/tgbot"
@@ -122,11 +126,14 @@ type Server struct {
 	xrayService    service.XrayService
 	settingService service.SettingService
 	tgbotService   tgbot.Tgbot
+	discordService *discord.DiscordService
+	discordGateway *discord.GatewayClient
 
 	wsHub *websocket.Hub
 
-	bus  *eventbus.Bus
-	cron *cron.Cron
+	bus                  *eventbus.Bus
+	cron                 *cron.Cron
+	discordNotifyEntryID cron.EntryID
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -176,7 +183,7 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 	const maxRequestBodyBytes = 10 << 20 // 10 MiB
 	// LUCX-HOOK: the tunnel core binary upload (~50 MB caddy build) is exempt
 	// from the global body limit, like the DB import.
-	engine.Use(middleware.MaxBodyBytes(maxRequestBodyBytes, "/panel/api/server/importDB", "/panel/api/tunnel/naive/upload", "/panel/api/tunnel/olcrtc/upload", "/panel/api/tunnel/qwdtt/upload", "/panel/api/tunnel/mieru/upload", "/panel/api/tunnel/trusttunnel/upload", "/panel/api/sidecar-outbounds/upload/naive", "/panel/api/sidecar-outbounds/upload/mieru", "/panel/api/sidecar-outbounds/upload/trusttunnel"))
+	engine.Use(middleware.MaxBodyBytes(maxRequestBodyBytes, "/panel/api/server/importDB", "/panel/api/tunnel/naive/upload", "/panel/api/tunnel/olcrtc/upload", "/panel/api/tunnel/qwdtt/upload", "/panel/api/tunnel/csqtt/upload", "/panel/api/tunnel/mieru/upload", "/panel/api/tunnel/trusttunnel/upload", "/panel/api/tunnel/anytls/upload", "/panel/api/tunnel/tproxy/upload", "/panel/api/tunnel/mtproxy/upload", "/panel/api/tunnel/tproxy/uploadSite", "/panel/api/sidecar-outbounds/upload/naive", "/panel/api/sidecar-outbounds/upload/mieru", "/panel/api/sidecar-outbounds/upload/trusttunnel"))
 	// END LUCX-HOOK
 
 	webDomain, err := s.settingService.GetWebDomain()
@@ -249,6 +256,10 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 	controller.SetDistFS(distFS)
 
 	g := engine.Group(basePath)
+	g.GET("/manifest.webmanifest", controller.ServePWAManifest)
+	g.GET("/pwa-register.js", controller.ServePWARegister)
+	g.GET("/service-worker.js", controller.ServePWAServiceWorker)
+	g.GET("/icons/:name", controller.ServePWAIcon)
 
 	s.index = controller.NewIndexController(g)
 	s.panel = controller.NewXUIController(g)
@@ -294,10 +305,14 @@ const (
 	cadenceMtproto       = "@every 10s"
 	cadenceAwg           = "@every 10s" // LUCX-HOOK: AWG sidecar reconcile + traffic
 	cadenceTunnel        = "@every 10s" // LUCX-HOOK: tunnel sidecars reconcile + Naive traffic/online
+	cadenceAmneziaWG     = "@every 10s"
+	cadenceTuic          = "@every 10s"
 	cadenceClientIPScan  = "@every 10s"
 	cadenceNodeHeartbeat = "@every 5s"
 	cadenceNodeTraffic   = "@every 5s"
 	cadenceOutboundSub   = "@every 5m"
+	cadenceReapOrphans   = "@every 5m"
+	cadenceRemoteRouting = "@every 5m"
 	cadenceXrayLogPrune  = "@every 10m"
 	cadenceCheckHash     = "@every 2m"
 	// cpu.Percent samples over a full minute (blocking), so a finer cadence just
@@ -343,6 +358,15 @@ func (s *Server) startTask(restartXray bool, loc *time.Location) {
 	go tunnelJob.Run()
 	// END LUCX-HOOK
 
+	// Reconcile embedded AmneziaWG interfaces; traffic rides Xray's own stats
+	amneziawgJob := job.NewAmneziaWGJob()
+	_, _ = s.cron.AddJob(cadenceAmneziaWG, amneziawgJob)
+	go amneziawgJob.Run()
+
+	tuicJob := job.NewTuicJob()
+	_, _ = s.cron.AddJob(cadenceTuic, tuicJob)
+	go tuicJob.Run()
+
 	// check client ips from log file every 10 sec
 	_, _ = s.cron.AddJob(cadenceClientIPScan, job.NewCheckClientIpJob())
 
@@ -353,9 +377,20 @@ func (s *Server) startTask(restartXray bool, loc *time.Location) {
 	// Outbound subscription auto-refresh (respects per-sub updateInterval)
 	_, _ = s.cron.AddJob(cadenceOutboundSub, job.NewOutboundSubscriptionJob())
 
+	_, _ = s.cron.AddJob(cadenceReapOrphans, job.NewReapSyncOrphansJob())
+
+	// Warm permanent routing URLs immediately and refresh them outside the
+	// latency-sensitive subscription request path.
+	remoteRoutingJob := job.NewRemoteRoutingJob()
+	_, _ = s.cron.AddJob(cadenceRemoteRouting, remoteRoutingJob)
+	common.GoRecover("remote-routing-warm", remoteRoutingJob.Run)
+
 	// check client ips from log file every day
 	_, _ = s.cron.AddJob("@daily", job.NewClearLogsJob())
 	_, _ = s.cron.AddJob(cadenceXrayLogPrune, job.NewPruneXrayLogsJob())
+	// LUCX-HOOK: delete log files older than the configured retention period
+	_, _ = s.cron.AddJob("@daily", job.NewLogRetentionJob())
+	// END LUCX-HOOK
 	_, _ = s.cron.AddJob("@hourly", job.NewWarpIpJob())
 
 	// Inbound traffic reset jobs
@@ -397,6 +432,25 @@ func (s *Server) startTask(restartXray bool, loc *time.Location) {
 
 		// check for Telegram bot callback query hash storage reset
 		_, _ = s.cron.AddJob(cadenceCheckHash, job.NewCheckHashStorageJob())
+	}
+
+	// Discord-bot-dependent jobs: periodic stats report + database backup.
+	isDiscordEnabled, err := s.settingService.GetDiscordBotEnable()
+	if (err == nil) && isDiscordEnabled {
+		runtime, err := s.settingService.GetDiscordRunTime()
+		if err != nil {
+			logger.Warningf("Add NewDiscordNotifyJob: failed to load runtime: %v; using default @daily", err)
+			runtime = "@daily"
+		} else if strings.TrimSpace(runtime) == "" {
+			logger.Warning("Add NewDiscordNotifyJob runtime is empty, using default @daily")
+			runtime = "@daily"
+		}
+		logger.Infof("Discord notify enabled, run at %s", runtime)
+		if entryID, err := s.cron.AddJob(runtime, job.NewDiscordNotifyJob(s.discordService)); err != nil {
+			logger.Warningf("Add NewDiscordNotifyJob: failed to schedule runtime %q: %v", runtime, err)
+		} else {
+			s.discordNotifyEntryID = entryID
+		}
 	}
 
 	// CPU monitor publishes cpu.high events; register it whenever any notifier
@@ -446,6 +500,13 @@ func (s *Server) cpuAlarmWanted() bool {
 			return true
 		}
 	}
+	if on, _ := s.settingService.GetDiscordBotEnable(); on {
+		events, _ := s.settingService.GetDiscordEnabledEvents()
+		cpu, _ := s.settingService.GetDiscordCpu()
+		if wants(events, cpu) {
+			return true
+		}
+	}
 	return false
 }
 
@@ -472,6 +533,13 @@ func (s *Server) memoryAlarmWanted() bool {
 	if on, _ := s.settingService.GetSmtpEnable(); on {
 		events, _ := s.settingService.GetSmtpEnabledEvents()
 		mem, _ := s.settingService.GetSmtpMemory()
+		if wants(events, mem) {
+			return true
+		}
+	}
+	if on, _ := s.settingService.GetDiscordBotEnable(); on {
+		events, _ := s.settingService.GetDiscordEnabledEvents()
+		mem, _ := s.settingService.GetDiscordMemory()
 		if wants(events, mem) {
 			return true
 		}
@@ -579,9 +647,14 @@ func (s *Server) start(restartXray bool, startTgBot bool) (err error) {
 			// Opt-in node mTLS: when a trust CA is configured, request and verify
 			// client certs (VerifyClientCertIfGiven keeps browsers working). With
 			// no CA the listener is unchanged.
-			if pool, perr := s.settingService.NodeMtlsClientCAPool(); perr != nil {
-				logger.Warning("node mTLS: failed to build client CA trust pool:", perr)
-			} else if pool != nil {
+			pool, perr := s.settingService.NodeMtlsClientCAPool()
+			switch {
+			case errors.Is(perr, service.ErrNodeMtlsTrustBundleInvalid):
+				logger.Error("Node mTLS is configured but its trust bundle will not parse, so client certificates are not accepted:", perr)
+			case perr != nil:
+				logger.Error("Node mTLS trust bundle could not be read, so client certificates are not accepted:", perr)
+			}
+			if pool != nil {
 				applyNodeMtls(c, pool)
 				logger.Info("Node mTLS enabled: verifying client certificates for the node API")
 			}
@@ -605,9 +678,7 @@ func (s *Server) start(restartXray bool, startTgBot bool) (err error) {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	go func() {
-		_ = s.httpServer.Serve(listener)
-	}()
+	go network.ServeHTTP(s.httpServer, listener, "Web server")
 
 	// Create event bus before startTask so jobs can use it
 	s.bus = eventbus.New(eventbus.DefaultBufferSize)
@@ -632,6 +703,48 @@ func (s *Server) start(restartXray bool, startTgBot bool) (err error) {
 
 	// Wire email service to controller for test endpoint
 	controller.SetEmailService(emailService)
+
+	// Register discord subscriber (always — it checks discordBotEnable at runtime)
+	s.discordService = discord.NewDiscordService(s.settingService)
+	discordSub := discord.NewSubscriber(s.settingService, s.discordService)
+	s.bus.Subscribe("discord-notifier", discordSub.HandleEvent)
+
+	// Wire discord service to controller for test endpoint
+	controller.SetDiscordService(s.discordService)
+
+	serverService := &service.ServerService{}
+	inboundService := &service.InboundService{}
+	s.discordGateway = discord.NewGatewayClient(s.discordService, s.settingService, serverService, inboundService, &s.xrayService)
+
+	// Wire reload discord callback for settings updates
+	controller.SetReloadDiscordFunc(func() {
+		if s.discordNotifyEntryID != 0 {
+			s.cron.Remove(s.discordNotifyEntryID)
+			s.discordNotifyEntryID = 0
+		}
+		enabled, err := s.settingService.GetDiscordBotEnable()
+		if err != nil || !enabled {
+			if s.discordGateway != nil && s.discordGateway.IsRunning() {
+				s.discordGateway.Stop()
+			}
+			return
+		}
+		runtime, err := s.settingService.GetDiscordRunTime()
+		if err != nil || strings.TrimSpace(runtime) == "" {
+			runtime = "@daily"
+		}
+		entryID, err := s.cron.AddJob(runtime, job.NewDiscordNotifyJob(s.discordService))
+		if err != nil {
+			logger.Warningf("Reload Discord notify: failed to schedule runtime %q: %v", runtime, err)
+		} else {
+			s.discordNotifyEntryID = entryID
+			logger.Infof("Discord notify rescheduled, run at %s", runtime)
+		}
+
+		if s.discordGateway != nil && !s.discordGateway.IsRunning() {
+			_ = s.discordGateway.Start(s.ctx)
+		}
+	})
 
 	// Wire Telegram test function to controller
 	controller.SetTestTgFunc(func() error {
@@ -679,6 +792,11 @@ func (s *Server) start(restartXray bool, startTgBot bool) (err error) {
 		}
 	}
 
+	isDiscordEnabled, err := s.settingService.GetDiscordBotEnable()
+	if (err == nil) && isDiscordEnabled && s.discordGateway != nil {
+		_ = s.discordGateway.Start(s.ctx)
+	}
+
 	return nil
 }
 
@@ -693,14 +811,34 @@ func (s *Server) StopPanelOnly() error {
 
 func (s *Server) stop(stopXray bool, stopTgBot bool) error {
 	s.cancel()
-	if stopXray {
-		_ = s.xrayService.StopXray()
-		mtproto.GetManager().StopAll()
-		awg.GetManager().StopAll()    // LUCX-HOOK: stop AWG sidecars
-		tunnel.GetManager().StopAll() // LUCX-HOOK: stop tunnel sidecars (NaiveProxy)
+	var err1 error
+	var err2 error
+	if s.httpServer != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err1 = s.httpServer.Shutdown(shutdownCtx)
+		shutdownCancel()
 	}
 	if s.cron != nil {
-		s.cron.Stop()
+		<-s.cron.Stop().Done()
+	}
+	if stopXray {
+		tuic.GetManager().StopAll()
+		if err := job.NewTuicJob().FlushStoppedTraffic(); err != nil {
+			logger.Warning("persist final TUIC traffic on shutdown failed:", err)
+			err2 = err
+		}
+		mtproto.GetManager().StopAll()
+		amneziawgnet.GetManager().StopAll()
+		amneziawgnet.GetOutboundManager().StopAll()
+		// LUCX-HOOK: inbound awgN Start refuses a device that already exists.
+		awg.GetManager().StopAll()
+		tunnel.GetManager().StopAll()
+		// END LUCX-HOOK
+	}
+	if stopXray {
+		if err := s.xrayService.StopXray(); err != nil {
+			err2 = common.Combine(err2, err)
+		}
 	}
 	if s.bus != nil {
 		s.bus.Stop()
@@ -714,19 +852,15 @@ func (s *Server) stop(stopXray bool, stopTgBot bool) error {
 	if stopTgBot && s.tgbotService.IsRunning() {
 		s.tgbotService.Stop()
 	}
+	if s.discordGateway != nil && s.discordGateway.IsRunning() {
+		s.discordGateway.Stop()
+	}
 	// Gracefully stop WebSocket hub
 	if s.wsHub != nil {
 		s.wsHub.Stop()
 	}
-	var err1 error
-	var err2 error
-	if s.httpServer != nil {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer shutdownCancel()
-		err1 = s.httpServer.Shutdown(shutdownCtx)
-	}
 	if s.listener != nil {
-		err2 = s.listener.Close()
+		err1 = common.Combine(err1, s.listener.Close())
 	}
 	return common.Combine(err1, err2)
 }

@@ -1,11 +1,15 @@
 package service
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"gorm.io/gorm"
+
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
+	"github.com/mhsanaei/3x-ui/v3/internal/database/dbtest"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 	"github.com/mhsanaei/3x-ui/v3/internal/xray"
 )
@@ -19,10 +23,7 @@ import (
 func TestMigrationRequirements_BackfillsClientTrafficsWithMultiDomainInbound(t *testing.T) {
 	dbDir := t.TempDir()
 	t.Setenv("XUI_DB_FOLDER", dbDir)
-	if err := database.InitDB(filepath.Join(dbDir, "x-ui.db")); err != nil {
-		t.Fatalf("InitDB: %v", err)
-	}
-	t.Cleanup(func() { _ = database.CloseDB() })
+	dbtest.InitDB(t, filepath.Join(dbDir, "x-ui.db"))
 
 	db := database.GetDB()
 
@@ -90,6 +91,38 @@ func TestMigrationRequirements_BackfillsClientTrafficsWithMultiDomainInbound(t *
 	}
 }
 
+func TestMigrationRequirementsReturnsAddClientStatFailure(t *testing.T) {
+	dbDir := t.TempDir()
+	t.Setenv("XUI_DB_FOLDER", dbDir)
+	dbtest.InitDB(t, filepath.Join(dbDir, "x-ui.db"))
+	db := database.GetDB()
+	first := &model.Inbound{UserId: 1, Tag: "first", Port: 31001, Protocol: model.VLESS, Settings: `{"clients":[{"email":"first@example.test","id":"id-1"}]}`, StreamSettings: `{}`}
+	if err := db.Create(first).Error; err != nil {
+		t.Fatalf("create first: %v", err)
+	}
+	const injected = "injected AddClientStat failure"
+	failSave := func(tx *gorm.DB) {
+		tx.AddError(errors.New(injected))
+	}
+	if err := db.Callback().Update().Before("gorm:update").Register("test:fail-migration-inbound-save", failSave); err != nil {
+		t.Fatalf("register update callback: %v", err)
+	}
+	if err := db.Callback().Create().Before("gorm:create").Register("test:fail-migration-inbound-save", failSave); err != nil {
+		t.Fatalf("register create callback: %v", err)
+	}
+	err := (&InboundService{}).MigrationRequirements()
+	if err == nil || err.Error() != injected {
+		t.Fatalf("MigrationRequirements error = %v, want %q", err, injected)
+	}
+	var count int64
+	if err := db.Model(&xray.ClientTraffic{}).Where("email = ?", "first@example.test").Count(&count).Error; err != nil {
+		t.Fatalf("count rolled-back traffic: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("earlier traffic write committed after save failure: count=%d", count)
+	}
+}
+
 // TestMigrationRequirements_CleansLegacyZeroAddrTag guards the legacy tag cleanup that
 // strips the auto-generated "0.0.0.0:" prefix. The inbound is MultiDomain TLS so the
 // externalProxy detection query returns rows and the cleanup is reached (it early-returns
@@ -98,17 +131,14 @@ func TestMigrationRequirements_BackfillsClientTrafficsWithMultiDomainInbound(t *
 func TestMigrationRequirements_CleansLegacyZeroAddrTag(t *testing.T) {
 	dbDir := t.TempDir()
 	t.Setenv("XUI_DB_FOLDER", dbDir)
-	if err := database.InitDB(filepath.Join(dbDir, "x-ui.db")); err != nil {
-		t.Fatalf("InitDB: %v", err)
-	}
-	t.Cleanup(func() { _ = database.CloseDB() })
+	dbtest.InitDB(t, filepath.Join(dbDir, "x-ui.db"))
 
 	db := database.GetDB()
 	legacy := &model.Inbound{
 		UserId:         1,
-		Tag:            "inbound-0.0.0.0:30002",
+		Tag:            "inbound-0.0.0.0:30003",
 		Enable:         true,
-		Port:           30002,
+		Port:           30003,
 		Protocol:       model.VLESS,
 		Settings:       `{"clients":[]}`,
 		StreamSettings: `{"security":"tls","tlsSettings":{"settings":{"domains":[{"domain":"example.com"}]}}}`,
@@ -124,8 +154,60 @@ func TestMigrationRequirements_CleansLegacyZeroAddrTag(t *testing.T) {
 	if err := db.First(&got, legacy.Id).Error; err != nil {
 		t.Fatalf("reload inbound: %v", err)
 	}
-	if got.Tag != "inbound-30002" {
-		t.Fatalf("legacy 0.0.0.0: tag not stripped: got %q, want %q", got.Tag, "inbound-30002")
+	if got.Tag != "inbound-30003" {
+		t.Fatalf("legacy 0.0.0.0: tag not stripped: got %q, want %q", got.Tag, "inbound-30003")
+	}
+}
+
+func TestMigrationRequirements_SkipsLegacyZeroAddrTagCollision(t *testing.T) {
+	setupConflictDB(t)
+	db := database.GetDB()
+
+	existing := &model.Inbound{
+		UserId:         1,
+		Tag:            "inbound-30004",
+		Enable:         true,
+		Port:           30004,
+		Protocol:       model.VLESS,
+		Settings:       `{"clients":[]}`,
+		StreamSettings: `{"network":"tcp","security":"none"}`,
+	}
+	legacy := &model.Inbound{
+		UserId:         1,
+		Tag:            "inbound-0.0.0.0:30004",
+		Enable:         true,
+		Port:           30005,
+		Protocol:       model.VLESS,
+		Settings:       `{"clients":[]}`,
+		StreamSettings: `{"security":"tls","tlsSettings":{"settings":{"domains":[{"domain":"example.com"}]}}}`,
+	}
+	if err := db.Create(existing).Error; err != nil {
+		t.Fatalf("create existing inbound: %v", err)
+	}
+	if err := db.Create(legacy).Error; err != nil {
+		t.Fatalf("create legacy inbound: %v", err)
+	}
+
+	svc := InboundService{}
+	// The cleanup shares a transaction with every other requirement, so a unique
+	// violation here rolls all of them back and only reaches the log.
+	if err := svc.MigrationRequirements(); err != nil {
+		t.Fatalf("MigrationRequirements: %v", err)
+	}
+
+	var got model.Inbound
+	if err := db.First(&got, legacy.Id).Error; err != nil {
+		t.Fatalf("reload legacy inbound: %v", err)
+	}
+	if got.Tag != "inbound-0.0.0.0:30004" {
+		t.Fatalf("colliding legacy tag should be left unchanged, got %q", got.Tag)
+	}
+	var count int64
+	if err := db.Model(&model.Inbound{}).Where("tag = ?", "inbound-30004").Count(&count).Error; err != nil {
+		t.Fatalf("count existing tag: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("target tag count = %d, want 1", count)
 	}
 }
 
@@ -273,4 +355,201 @@ func TestMigrationRequirements_NormalizesShareAddressFields(t *testing.T) {
 	if gotInvalidAddress.ShareAddrStrategy != "node" || gotInvalidAddress.ShareAddr != "" {
 		t.Fatalf("invalid address share fields = (%q, %q), want (node, empty)", gotInvalidAddress.ShareAddrStrategy, gotInvalidAddress.ShareAddr)
 	}
+}
+
+const (
+	liveTunnelPriv  = "awg-live-priv"
+	liveTunnelPub   = "awg-live-pub"
+	liveTunnelPSK   = "awg-live-psk"
+	staleTunnelPriv = "vless-copy-priv"
+	staleTunnelPub  = "vless-copy-pub"
+	staleTunnelPSK  = "vless-copy-psk"
+	// Observed on a live node: the keyless copy carried another server's subnet.
+	staleTunnelAddr = "10.8.0.3/32"
+)
+
+// Vision is only restorable on a transport that can carry it; plain is the neutral
+// stand-in mkInbound omits, and json_extract rejects that empty column outright.
+const (
+	plainStream  = `{"network":"tcp","security":"none"}`
+	visionStream = `{"network":"tcp","security":"tls"}`
+)
+
+// mkMigrationInbound is mkInbound plus stream settings: the externalProxy detection
+// query runs json_extract over that column and rejects the empty string mkInbound leaves.
+func mkMigrationInbound(t *testing.T, port int, proto model.Protocol, settings, stream string) *model.Inbound {
+	t.Helper()
+	ib := mkInbound(t, port, proto, settings)
+	if err := database.GetDB().Model(&model.Inbound{}).Where("id = ?", ib.Id).
+		Update("stream_settings", stream).Error; err != nil {
+		t.Fatalf("set stream settings on inbound %d: %v", port, err)
+	}
+	return ib
+}
+
+// seedTunnelKeyClobber builds the shape that broke two live panels: one identity whose
+// live keypair comes from an AWG inbound, plus a keyless inbound holding a stale copy.
+func seedTunnelKeyClobber(t *testing.T, email string, awgPort, keylessPort int) *model.Inbound {
+	t.Helper()
+	awgClient := model.Client{
+		Email:        email,
+		SubID:        "sub-" + email,
+		Enable:       true,
+		PrivateKey:   liveTunnelPriv,
+		PublicKey:    liveTunnelPub,
+		PreSharedKey: liveTunnelPSK,
+		AllowedIPs:   []string{"10.200.0.2/32"},
+	}
+	awgIb := mkMigrationInbound(t, awgPort, model.AWG, clientsSettings(t, []model.Client{awgClient}), plainStream)
+	if err := (&ClientService{}).SyncInbound(nil, awgIb.Id, []model.Client{awgClient}); err != nil {
+		t.Fatalf("seed AWG client record: %v", err)
+	}
+
+	stale := awgClient
+	stale.ID = "9f1d0f6e-1c2b-4a3d-8e5f-0a1b2c3d4e5f"
+	stale.AllowedIPs = []string{staleTunnelAddr}
+	stale.PrivateKey = staleTunnelPriv
+	stale.PublicKey = staleTunnelPub
+	stale.PreSharedKey = staleTunnelPSK
+	mkMigrationInbound(t, keylessPort, model.VLESS, clientsSettings(t, []model.Client{stale}), plainStream)
+	return awgIb
+}
+
+func assertLiveTunnelKeys(t *testing.T, email, wantAddr, when string) {
+	t.Helper()
+	rec := lookupClientRecord(t, email)
+	if rec.PrivateKey != liveTunnelPriv || rec.PublicKey != liveTunnelPub || rec.PreSharedKey != liveTunnelPSK {
+		t.Fatalf("%s: client record keys = (%q, %q, %q), want (%q, %q, %q)",
+			when, rec.PrivateKey, rec.PublicKey, rec.PreSharedKey,
+			liveTunnelPriv, liveTunnelPub, liveTunnelPSK)
+	}
+	// The address decides which subnet the kernel routes to this peer, so a
+	// foreign copy kills the tunnel just as surely as a foreign key.
+	if rec.AllowedIPs != wantAddr {
+		t.Fatalf("%s: client record allowedIPs = %q, want %q", when, rec.AllowedIPs, wantAddr)
+	}
+}
+
+// x-ui migrate runs on every web update and syncs only keyless inbounds, so a stale
+// tunnel keypair sitting in their settings JSON used to overwrite the working one.
+func TestMigrationRequirements_KeylessInboundKeepsTunnelKeys(t *testing.T) {
+	setupBulkDB(t)
+	const email = "demo-user@example.test"
+	seedTunnelKeyClobber(t, email, 32001, 32002)
+
+	if err := (&InboundService{}).MigrationRequirements(); err != nil {
+		t.Fatalf("MigrationRequirements: %v", err)
+	}
+	assertLiveTunnelKeys(t, email, "10.200.0.2/32", "after migrate")
+}
+
+// The record feeds the subscription .conf and the AWG inbound's settings feed the kernel
+// peer: a tunnel client's keys are legitimate, and migrate must not drive the two apart.
+func TestMigrationRequirements_ClientRecordStillMatchesTunnelPeer(t *testing.T) {
+	setupBulkDB(t)
+	const email = "demo-pair@example.test"
+	awgIb := seedTunnelKeyClobber(t, email, 32021, 32022)
+
+	if err := (&InboundService{}).MigrationRequirements(); err != nil {
+		t.Fatalf("MigrationRequirements: %v", err)
+	}
+
+	var got model.Inbound
+	if err := database.GetDB().First(&got, awgIb.Id).Error; err != nil {
+		t.Fatalf("reload AWG inbound: %v", err)
+	}
+	peers, err := (&InboundService{}).GetClients(&got)
+	if err != nil {
+		t.Fatalf("parse AWG inbound clients: %v", err)
+	}
+	var peer model.Client
+	for _, p := range peers {
+		if p.Email == email {
+			peer = p
+		}
+	}
+	if peer.Email == "" {
+		t.Fatalf("client %q vanished from the AWG inbound settings: %s", email, got.Settings)
+	}
+
+	rec := lookupClientRecord(t, email)
+	if rec.PrivateKey != peer.PrivateKey || rec.PublicKey != peer.PublicKey || rec.PreSharedKey != peer.PreSharedKey {
+		t.Fatalf("record drifted from the AWG peer: record = (%q, %q, %q), inbound = (%q, %q, %q)",
+			rec.PrivateKey, rec.PublicKey, rec.PreSharedKey,
+			peer.PrivateKey, peer.PublicKey, peer.PreSharedKey)
+	}
+}
+
+func TestMigrateDB_TunnelKeysUnchangedOnSecondRun(t *testing.T) {
+	setupBulkDB(t)
+	const email = "demo-idem@example.test"
+	seedTunnelKeyClobber(t, email, 32011, 32012)
+
+	svc := &InboundService{}
+	svc.MigrateDB()
+	assertLiveTunnelKeys(t, email, "10.200.0.2/32", "after first migrate")
+	first := lookupClientRecord(t, email)
+
+	svc.MigrateDB()
+	assertLiveTunnelKeys(t, email, "10.200.0.2/32", "after second migrate")
+	second := lookupClientRecord(t, email)
+
+	// Every run restamps updated_at in the settings JSON by design; nothing else may move.
+	first.UpdatedAt = second.UpdatedAt
+	if first != second {
+		t.Fatalf("second MigrateDB changed the client record:\n first  = %+v\n second = %+v", first, second)
+	}
+}
+
+// MigrationRestoreVisionFlow is the second migrate path that syncs a keyless inbound's
+// settings into the clients table, and it clobbered the tunnel keypair the same way.
+func TestMigrationRestoreVisionFlow_KeepsTunnelKeys(t *testing.T) {
+	setupBulkDB(t)
+	const email = "demo-vision@example.test"
+	clientSvc := &ClientService{}
+
+	awgClient := model.Client{
+		Email:        email,
+		SubID:        "sub-vision",
+		Enable:       true,
+		PrivateKey:   liveTunnelPriv,
+		PublicKey:    liveTunnelPub,
+		PreSharedKey: liveTunnelPSK,
+		AllowedIPs:   []string{"10.200.0.4/32"},
+	}
+	awgIb := mkMigrationInbound(t, 32031, model.AWG, clientsSettings(t, []model.Client{awgClient}), plainStream)
+	if err := clientSvc.SyncInbound(nil, awgIb.Id, []model.Client{awgClient}); err != nil {
+		t.Fatalf("seed AWG client record: %v", err)
+	}
+
+	// The sibling link supplies flow_override=vision, which is the intended flow the
+	// restore reads back; with no such link it finds nothing to heal and never syncs.
+	sibling := model.Client{
+		Email: email, ID: "5c6d7e8f-9a0b-4c1d-8e2f-3a4b5c6d7e8f",
+		SubID: "sub-vision", Enable: true, Flow: visionFlow,
+	}
+	siblingIb := mkMigrationInbound(t, 32032, model.VLESS, clientsSettings(t, []model.Client{sibling}), visionStream)
+	if err := clientSvc.SyncInbound(nil, siblingIb.Id, []model.Client{sibling}); err != nil {
+		t.Fatalf("seed vision flow override: %v", err)
+	}
+
+	// The inbound to heal: flow lost, and the stale copy of the tunnel keypair alongside.
+	stale := model.Client{
+		Email: email, ID: "5c6d7e8f-9a0b-4c1d-8e2f-3a4b5c6d7e8f",
+		SubID: "sub-vision", Enable: true,
+		PrivateKey: staleTunnelPriv, PublicKey: staleTunnelPub, PreSharedKey: staleTunnelPSK,
+		AllowedIPs: []string{staleTunnelAddr},
+	}
+	targetIb := mkMigrationInbound(t, 32033, model.VLESS, clientsSettings(t, []model.Client{stale}), visionStream)
+
+	(&InboundService{}).MigrationRestoreVisionFlow()
+
+	var healed model.Inbound
+	if err := database.GetDB().First(&healed, targetIb.Id).Error; err != nil {
+		t.Fatalf("reload healed inbound: %v", err)
+	}
+	if !strings.Contains(healed.Settings, visionFlow) {
+		t.Fatalf("restore never ran, so the sync under test never happened: settings = %s", healed.Settings)
+	}
+	assertLiveTunnelKeys(t, email, "10.200.0.4/32", "after vision flow restore")
 }

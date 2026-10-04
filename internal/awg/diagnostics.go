@@ -64,15 +64,33 @@ type prober interface {
 type execProber struct{}
 
 func (execProber) Run(name string, args ...string) (string, error) {
-	out, err := exec.CommandContext(context.Background(), awgBin(name), args...).CombinedOutput()
+	ifname := probedIfname(name, args)
+	if err := stuckReadErr(ifname); err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), awgShowTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, awgBin(name), args...).CombinedOutput()
+	if ifname != "" {
+		noteAwgRead(ctx, ifname, err)
+	}
 	return string(out), err
+}
+
+// probedIfname names the device an `awg show <if> …` probe reads, so its stuck
+// warning shares the latch with the traffic scrapers; "" for host-wide probes.
+func probedIfname(name string, args []string) string {
+	if name == "awg" && len(args) >= 2 && args[0] == "show" {
+		return args[1]
+	}
+	return ""
 }
 
 // Diagnose probes the live kernel state of an instance (interface, forwarding,
 // peers, and the mode-specific routing rules) and returns the report rendered
 // by the panel's AWG diagnostics view. It never mutates state — fixes belong
-// to the reconcile loop (ensureNatRules / ensureXrayRouting); this only makes
-// their failures visible.
+// to the reconcile loop (ensureNatRules / ensureXrayRouting / ensureP2PRules);
+// this only makes their failures visible.
 func Diagnose(inst Instance) Diagnostics {
 	return diagnose(inst, execProber{}, time.Now)
 }
@@ -81,6 +99,9 @@ func diagnose(inst Instance, p prober, now func() time.Time) Diagnostics {
 	mode := "kernel-nat"
 	if inst.RouteThroughXray {
 		mode = "xray-tun"
+	}
+	if inst.UsesTproxy() {
+		mode = "xray-tproxy"
 	}
 	d := Diagnostics{Ifname: inst.Ifname, Mode: mode}
 
@@ -128,12 +149,39 @@ func diagnose(inst Instance, p prober, now func() time.Time) Diagnostics {
 		d.Checks = append(d.Checks, DiagCheck{"wireguard peers", peers > 0, detail})
 	}
 
-	if inst.RouteThroughXray {
+	if inst.UsesTproxy() {
+		d.Checks = append(d.Checks, diagnoseTproxy(inst, p)...)
+	} else if inst.RouteThroughXray {
 		d.Checks = append(d.Checks, diagnoseXrayTun(inst, p)...)
 	} else {
 		d.Checks = append(d.Checks, diagnoseKernelNAT(inst, p)...)
 	}
+	d.Checks = append(d.Checks, diagnoseP2P(inst, p))
 	return d
+}
+
+func diagnoseP2P(inst Instance, p prober) DiagCheck {
+	dropArgs := append([]string{"-C", "FORWARD"}, p2pDropSpec(inst.Ifname)...)
+	_, dropErr := p.Run("iptables", dropArgs...)
+	isolated := dropErr == nil
+	if !inst.P2P {
+		if isolated {
+			return DiagCheck{"p2p", true, "isolated (FORWARD DROP hairpin on " + inst.Ifname + ")"}
+		}
+		return DiagCheck{"p2p", false, "isolation missing — clients may talk; reconcile re-adds DROP within 10s"}
+	}
+	if isolated {
+		return DiagCheck{"p2p", false, "hairpin still DROPped — toggle on did not clear isolation"}
+	}
+	if inst.RouteThroughXray && !inst.UsesTproxy() {
+		subnet := clientSubnet(inst.Address)
+		out, err := p.Run("ip", "rule", "show", "pref", strconv.Itoa(awgP2PRulePref(inst.Id)))
+		if err != nil || !p2pHairpinRulePresent(out, subnet) {
+			return DiagCheck{"p2p", false, fmt.Sprintf("no dest %s lookup main — subnet still stolen by tunN: %s", subnet, oneLine(out))}
+		}
+		return DiagCheck{"p2p", true, "hairpin allowed, dest " + subnet + " stays in main"}
+	}
+	return DiagCheck{"p2p", true, "hairpin allowed on " + inst.Ifname}
 }
 
 // diagnoseXrayTun probes the routeThroughXray chain: Xray-owned tunN device,
@@ -194,31 +242,30 @@ func diagnoseKernelNAT(inst Instance, p prober) []DiagCheck {
 	}
 
 	mark := strconv.Itoa(awgNatMark(inst.Id))
+	subnet := clientSubnet(inst.Address)
 	markArgs := []string{"-t", "mangle", "-C", "PREROUTING", "-i", inst.Ifname, "-j", "MARK", "--set-mark", mark}
+	subnetArgs := []string{"-t", "nat", "-C", "POSTROUTING", "-s", subnet, "-o", extIface, "-j", "MASQUERADE"}
 	masqArgs := []string{"-t", "nat", "-C", "POSTROUTING", "-m", "mark", "--mark", mark, "-o", extIface, "-j", "MASQUERADE"}
-	markOut, markErr := p.Run("iptables", markArgs...)
-	masqOut, masqErr := p.Run("iptables", masqArgs...)
-	switch {
-	case markErr != nil && masqErr != nil:
+	_, markErr := p.Run("iptables", markArgs...)
+	_, subnetErr := p.Run("iptables", subnetArgs...)
+	_, masqErr := p.Run("iptables", masqArgs...)
+	if subnetErr == nil || masqErr == nil {
+		detail := fmt.Sprintf("MASQUERADE -o %s", extIface)
+		if subnetErr == nil && subnet != "" {
+			detail = fmt.Sprintf("MASQUERADE -s %s -o %s", subnet, extIface)
+		}
+		if masqErr == nil {
+			detail += fmt.Sprintf(" + mark=%s", mark)
+		}
+		if markErr != nil {
+			detail += " (mangle MARK missing — out-of-subnet peers may leak)"
+		}
+		checks = append(checks, DiagCheck{"masquerade", true, detail})
+	} else {
 		checks = append(checks, DiagCheck{
 			"masquerade", false,
-			fmt.Sprintf("missing MARK iif %s + MASQUERADE mark=%s -o %s (flushed? fail2ban/docker reload?) — reconcile re-adds within 10s: %s",
-				inst.Ifname, mark, extIface, oneLine(markOut+" "+masqOut)),
-		})
-	case markErr != nil:
-		checks = append(checks, DiagCheck{
-			"masquerade", false,
-			fmt.Sprintf("missing mangle PREROUTING -i %s MARK --set-mark %s: %s", inst.Ifname, mark, oneLine(markOut)),
-		})
-	case masqErr != nil:
-		checks = append(checks, DiagCheck{
-			"masquerade", false,
-			fmt.Sprintf("missing POSTROUTING -m mark --mark %s -o %s MASQUERADE: %s", mark, extIface, oneLine(masqOut)),
-		})
-	default:
-		checks = append(checks, DiagCheck{
-			"masquerade", true,
-			fmt.Sprintf("MARK iif %s → MASQUERADE mark=%s -o %s", inst.Ifname, mark, extIface),
+			fmt.Sprintf("missing POSTROUTING MASQUERADE -s %s / mark=%s -o %s (flushed? fail2ban/docker reload?) — reconcile re-adds within 10s",
+				subnet, mark, extIface),
 		})
 	}
 

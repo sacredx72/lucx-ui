@@ -5,14 +5,57 @@ export const SCHEMAS: Record<string, unknown> = {
       "datepicker": {
         "type": "string"
       },
+      "discordAdminIds": {
+        "type": "string"
+      },
+      "discordBotBackup": {
+        "type": "boolean"
+      },
+      "discordBotEnable": {
+        "type": "boolean"
+      },
+      "discordBotToken": {
+        "type": "string"
+      },
+      "discordChannelId": {
+        "type": "string"
+      },
+      "discordCpu": {
+        "maximum": 100,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "discordEnabledEvents": {
+        "type": "string"
+      },
+      "discordLang": {
+        "type": "string"
+      },
+      "discordMemory": {
+        "maximum": 100,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "discordRunTime": {
+        "type": "string"
+      },
       "expireDiff": {
         "minimum": 0,
         "type": "integer"
+      },
+      "externalSubUserAgent": {
+        "type": "string"
       },
       "externalTrafficInformEnable": {
         "type": "boolean"
       },
       "externalTrafficInformURI": {
+        "type": "string"
+      },
+      "happLinkEnable": {
+        "type": "boolean"
+      },
+      "ipLimitAllowlist": {
         "type": "string"
       },
       "ldapAutoCreate": {
@@ -83,6 +126,12 @@ export const SCHEMAS: Record<string, unknown> = {
       "ldapVlessField": {
         "type": "string"
       },
+      "logRetentionDays": {
+        "description": "END LUCX-HOOK\nLUCX-HOOK: auto-delete log files older than N days (0 = disabled)",
+        "maximum": 3650,
+        "minimum": 0,
+        "type": "integer"
+      },
       "outboundDownThreshold": {
         "maximum": 100,
         "minimum": 1,
@@ -96,6 +145,9 @@ export const SCHEMAS: Record<string, unknown> = {
       "panelOutbound": {
         "type": "string"
       },
+      "realityScanCandidates": {
+        "type": "string"
+      },
       "remarkTemplate": {
         "type": "string"
       },
@@ -103,6 +155,7 @@ export const SCHEMAS: Record<string, unknown> = {
         "type": "boolean"
       },
       "sessionMaxAge": {
+        "description": "END LUCX-HOOK",
         "maximum": 525600,
         "minimum": 1,
         "type": "integer"
@@ -162,6 +215,9 @@ export const SCHEMAS: Record<string, unknown> = {
       "subAwgURI": {
         "type": "string"
       },
+      "subCalendarExpireInclusive": {
+        "type": "boolean"
+      },
       "subCertFile": {
         "type": "string"
       },
@@ -198,21 +254,188 @@ export const SCHEMAS: Record<string, unknown> = {
       "subEncrypt": {
         "type": "boolean"
       },
+      "subExpiredTemplate": {
+        "type": "string"
+      },
+      "subHappAlwaysHwid": {
+        "type": "boolean"
+      },
+      "subHappAutoConnect": {
+        "type": "boolean"
+      },
+      "subHappAutoConnectType": {
+        "type": "string"
+      },
+      "subHappAutoDetect": {
+        "description": "Happ client customization settings (app-management / routing / UX).",
+        "type": "boolean"
+      },
+      "subHappColorProfile": {
+        "type": "string"
+      },
+      "subHappExcludeApns": {
+        "type": "boolean"
+      },
+      "subHappExcludeRoutes": {
+        "type": "string"
+      },
+      "subHappFallbackUrl": {
+        "type": "string"
+      },
+      "subHappLocalProxyAuth": {
+        "type": "string"
+      },
+      "subHappNewUrl": {
+        "type": "string"
+      },
+      "subHappNoLimit": {
+        "type": "boolean"
+      },
+      "subHappNotificationExpire": {
+        "type": "boolean"
+      },
+      "subHappPerAppList": {
+        "type": "string"
+      },
+      "subHappPerAppMode": {
+        "type": "string"
+      },
+      "subHappPingType": {
+        "type": "string"
+      },
+      "subHappProviderId": {
+        "type": "string"
+      },
+      "subHappSubExpire": {
+        "type": "boolean"
+      },
+      "subHappSubExpireButtonLink": {
+        "type": "string"
+      },
+      "subHappSubInfoButtonLink": {
+        "type": "string"
+      },
+      "subHappSubInfoButtonText": {
+        "type": "string"
+      },
+      "subHappSubInfoColor": {
+        "type": "string"
+      },
+      "subHappSubInfoText": {
+        "type": "string"
+      },
+      "subHappTunMode": {
+        "type": "string"
+      },
+      "subHappTunType": {
+        "type": "string"
+      },
       "subHideSettings": {
         "type": "boolean"
+      },
+      "subIncyAnnounceUrl": {
+        "type": "string"
+      },
+      "subIncyAppAutoDetect": {
+        "description": "Incy client customization settings (app-management). A \"\" value omits\nthe header so the subscriber's own app setting is left alone.",
+        "type": "boolean"
+      },
+      "subIncyBannerBgColor": {
+        "type": "string"
+      },
+      "subIncyBannerButtonColor": {
+        "type": "string"
+      },
+      "subIncyBannerButtonText": {
+        "type": "string"
+      },
+      "subIncyBannerButtonUrl": {
+        "type": "string"
+      },
+      "subIncyBannerText": {
+        "type": "string"
       },
       "subIncyEnableRouting": {
         "description": "END LUCX-HOOK",
         "type": "boolean"
       },
+      "subIncyFragmentInterval": {
+        "type": "string"
+      },
+      "subIncyFragmentLength": {
+        "type": "string"
+      },
+      "subIncyFragmentPackets": {
+        "type": "string"
+      },
+      "subIncyFragmentationEnable": {
+        "type": "string"
+      },
+      "subIncyHideCheck": {
+        "type": "string"
+      },
+      "subIncyHideUrl": {
+        "type": "string"
+      },
+      "subIncyNoLimitEnabled": {
+        "type": "string"
+      },
+      "subIncyNoisesDelay": {
+        "type": "string"
+      },
+      "subIncyNoisesEnable": {
+        "type": "string"
+      },
+      "subIncyNoisesPacket": {
+        "type": "string"
+      },
+      "subIncyNoisesType": {
+        "type": "string"
+      },
+      "subIncyPerAppEnable": {
+        "type": "string"
+      },
+      "subIncyPerAppList": {
+        "type": "string"
+      },
+      "subIncyPerAppMode": {
+        "type": "string"
+      },
+      "subIncyPremiumUrl": {
+        "type": "string"
+      },
+      "subIncyProfileDescription": {
+        "type": "string"
+      },
+      "subIncyResolveDnsDomain": {
+        "type": "string"
+      },
+      "subIncyResolveDnsIp": {
+        "type": "string"
+      },
+      "subIncyResolveEnable": {
+        "type": "string"
+      },
       "subIncyRoutingRules": {
         "type": "string"
+      },
+      "subIncySortOrder": {
+        "type": "string"
+      },
+      "subIncySupportEmail": {
+        "type": "string"
+      },
+      "subInfoNodeEnable": {
+        "type": "boolean"
       },
       "subJsonAlwaysArray": {
         "type": "boolean"
       },
       "subJsonAutoDetect": {
         "type": "boolean"
+      },
+      "subJsonDns": {
+        "type": "string"
       },
       "subJsonEnable": {
         "type": "boolean"
@@ -224,7 +447,13 @@ export const SCHEMAS: Record<string, unknown> = {
         "description": "END LUCX-HOOK",
         "type": "string"
       },
+      "subJsonObservatory": {
+        "type": "string"
+      },
       "subJsonPath": {
+        "type": "string"
+      },
+      "subJsonRoutingRules": {
         "type": "string"
       },
       "subJsonRules": {
@@ -250,6 +479,9 @@ export const SCHEMAS: Record<string, unknown> = {
         "minimum": 1,
         "type": "integer"
       },
+      "subProfileMode": {
+        "type": "string"
+      },
       "subProfileUrl": {
         "type": "string"
       },
@@ -270,6 +502,9 @@ export const SCHEMAS: Record<string, unknown> = {
         "type": "string"
       },
       "subTitle": {
+        "type": "string"
+      },
+      "subTrafficDepletedTemplate": {
         "type": "string"
       },
       "subURI": {
@@ -347,6 +582,10 @@ export const SCHEMAS: Record<string, unknown> = {
       "webDomain": {
         "type": "string"
       },
+      "webFavicon": {
+        "description": "LUCX-HOOK: optional panel tab favicon (emoji or image data URI / base64)",
+        "type": "string"
+      },
       "webKeyFile": {
         "type": "string"
       },
@@ -361,9 +600,22 @@ export const SCHEMAS: Record<string, unknown> = {
     },
     "required": [
       "datepicker",
+      "discordAdminIds",
+      "discordBotBackup",
+      "discordBotEnable",
+      "discordBotToken",
+      "discordChannelId",
+      "discordCpu",
+      "discordEnabledEvents",
+      "discordLang",
+      "discordMemory",
+      "discordRunTime",
       "expireDiff",
+      "externalSubUserAgent",
       "externalTrafficInformEnable",
       "externalTrafficInformURI",
+      "happLinkEnable",
+      "ipLimitAllowlist",
       "ldapAutoCreate",
       "ldapAutoDelete",
       "ldapBaseDN",
@@ -385,9 +637,11 @@ export const SCHEMAS: Record<string, unknown> = {
       "ldapUserAttr",
       "ldapUserFilter",
       "ldapVlessField",
+      "logRetentionDays",
       "outboundDownThreshold",
       "pageSize",
       "panelOutbound",
+      "realityScanCandidates",
       "remarkTemplate",
       "restartXrayOnClientDisable",
       "sessionMaxAge",
@@ -407,6 +661,7 @@ export const SCHEMAS: Record<string, unknown> = {
       "subAwgEnable",
       "subAwgPath",
       "subAwgURI",
+      "subCalendarExpireInclusive",
       "subCertFile",
       "subClashAutoDetect",
       "subClashEnable",
@@ -419,15 +674,72 @@ export const SCHEMAS: Record<string, unknown> = {
       "subEnable",
       "subEnableRouting",
       "subEncrypt",
+      "subExpiredTemplate",
+      "subHappAlwaysHwid",
+      "subHappAutoConnect",
+      "subHappAutoConnectType",
+      "subHappAutoDetect",
+      "subHappColorProfile",
+      "subHappExcludeApns",
+      "subHappExcludeRoutes",
+      "subHappFallbackUrl",
+      "subHappLocalProxyAuth",
+      "subHappNewUrl",
+      "subHappNoLimit",
+      "subHappNotificationExpire",
+      "subHappPerAppList",
+      "subHappPerAppMode",
+      "subHappPingType",
+      "subHappProviderId",
+      "subHappSubExpire",
+      "subHappSubExpireButtonLink",
+      "subHappSubInfoButtonLink",
+      "subHappSubInfoButtonText",
+      "subHappSubInfoColor",
+      "subHappSubInfoText",
+      "subHappTunMode",
+      "subHappTunType",
       "subHideSettings",
+      "subIncyAnnounceUrl",
+      "subIncyAppAutoDetect",
+      "subIncyBannerBgColor",
+      "subIncyBannerButtonColor",
+      "subIncyBannerButtonText",
+      "subIncyBannerButtonUrl",
+      "subIncyBannerText",
       "subIncyEnableRouting",
+      "subIncyFragmentInterval",
+      "subIncyFragmentLength",
+      "subIncyFragmentPackets",
+      "subIncyFragmentationEnable",
+      "subIncyHideCheck",
+      "subIncyHideUrl",
+      "subIncyNoLimitEnabled",
+      "subIncyNoisesDelay",
+      "subIncyNoisesEnable",
+      "subIncyNoisesPacket",
+      "subIncyNoisesType",
+      "subIncyPerAppEnable",
+      "subIncyPerAppList",
+      "subIncyPerAppMode",
+      "subIncyPremiumUrl",
+      "subIncyProfileDescription",
+      "subIncyResolveDnsDomain",
+      "subIncyResolveDnsIp",
+      "subIncyResolveEnable",
       "subIncyRoutingRules",
+      "subIncySortOrder",
+      "subIncySupportEmail",
+      "subInfoNodeEnable",
       "subJsonAlwaysArray",
       "subJsonAutoDetect",
+      "subJsonDns",
       "subJsonEnable",
       "subJsonFinalMask",
       "subJsonMux",
+      "subJsonObservatory",
       "subJsonPath",
+      "subJsonRoutingRules",
       "subJsonRules",
       "subJsonURI",
       "subJsonUserAgentRegex",
@@ -435,6 +747,7 @@ export const SCHEMAS: Record<string, unknown> = {
       "subListen",
       "subPath",
       "subPort",
+      "subProfileMode",
       "subProfileUrl",
       "subRoutingRules",
       "subRoutingSource",
@@ -442,6 +755,7 @@ export const SCHEMAS: Record<string, unknown> = {
       "subSupportUrl",
       "subThemeDir",
       "subTitle",
+      "subTrafficDepletedTemplate",
       "subURI",
       "subUpdates",
       "tgBotAPIServer",
@@ -464,6 +778,7 @@ export const SCHEMAS: Record<string, unknown> = {
       "webBasePath",
       "webCertFile",
       "webDomain",
+      "webFavicon",
       "webKeyFile",
       "webListen",
       "webPort"
@@ -475,9 +790,46 @@ export const SCHEMAS: Record<string, unknown> = {
       "datepicker": {
         "type": "string"
       },
+      "discordAdminIds": {
+        "type": "string"
+      },
+      "discordBotBackup": {
+        "type": "boolean"
+      },
+      "discordBotEnable": {
+        "type": "boolean"
+      },
+      "discordBotToken": {
+        "type": "string"
+      },
+      "discordChannelId": {
+        "type": "string"
+      },
+      "discordCpu": {
+        "maximum": 100,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "discordEnabledEvents": {
+        "type": "string"
+      },
+      "discordLang": {
+        "type": "string"
+      },
+      "discordMemory": {
+        "maximum": 100,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "discordRunTime": {
+        "type": "string"
+      },
       "expireDiff": {
         "minimum": 0,
         "type": "integer"
+      },
+      "externalSubUserAgent": {
+        "type": "string"
       },
       "externalTrafficInformEnable": {
         "type": "boolean"
@@ -485,7 +837,13 @@ export const SCHEMAS: Record<string, unknown> = {
       "externalTrafficInformURI": {
         "type": "string"
       },
+      "happLinkEnable": {
+        "type": "boolean"
+      },
       "hasApiToken": {
+        "type": "boolean"
+      },
+      "hasDiscordBotToken": {
         "type": "boolean"
       },
       "hasLdapPassword": {
@@ -506,6 +864,9 @@ export const SCHEMAS: Record<string, unknown> = {
       "hasWarpSecret": {
         "type": "boolean"
       },
+      "ipLimitAllowlist": {
+        "type": "string"
+      },
       "ldapAutoCreate": {
         "type": "boolean"
       },
@@ -574,6 +935,12 @@ export const SCHEMAS: Record<string, unknown> = {
       "ldapVlessField": {
         "type": "string"
       },
+      "logRetentionDays": {
+        "description": "END LUCX-HOOK\nLUCX-HOOK: auto-delete log files older than N days (0 = disabled)",
+        "maximum": 3650,
+        "minimum": 0,
+        "type": "integer"
+      },
       "outboundDownThreshold": {
         "maximum": 100,
         "minimum": 1,
@@ -587,6 +954,9 @@ export const SCHEMAS: Record<string, unknown> = {
       "panelOutbound": {
         "type": "string"
       },
+      "realityScanCandidates": {
+        "type": "string"
+      },
       "remarkTemplate": {
         "type": "string"
       },
@@ -594,6 +964,7 @@ export const SCHEMAS: Record<string, unknown> = {
         "type": "boolean"
       },
       "sessionMaxAge": {
+        "description": "END LUCX-HOOK",
         "maximum": 525600,
         "minimum": 1,
         "type": "integer"
@@ -653,6 +1024,9 @@ export const SCHEMAS: Record<string, unknown> = {
       "subAwgURI": {
         "type": "string"
       },
+      "subCalendarExpireInclusive": {
+        "type": "boolean"
+      },
       "subCertFile": {
         "type": "string"
       },
@@ -689,21 +1063,188 @@ export const SCHEMAS: Record<string, unknown> = {
       "subEncrypt": {
         "type": "boolean"
       },
+      "subExpiredTemplate": {
+        "type": "string"
+      },
+      "subHappAlwaysHwid": {
+        "type": "boolean"
+      },
+      "subHappAutoConnect": {
+        "type": "boolean"
+      },
+      "subHappAutoConnectType": {
+        "type": "string"
+      },
+      "subHappAutoDetect": {
+        "description": "Happ client customization settings (app-management / routing / UX).",
+        "type": "boolean"
+      },
+      "subHappColorProfile": {
+        "type": "string"
+      },
+      "subHappExcludeApns": {
+        "type": "boolean"
+      },
+      "subHappExcludeRoutes": {
+        "type": "string"
+      },
+      "subHappFallbackUrl": {
+        "type": "string"
+      },
+      "subHappLocalProxyAuth": {
+        "type": "string"
+      },
+      "subHappNewUrl": {
+        "type": "string"
+      },
+      "subHappNoLimit": {
+        "type": "boolean"
+      },
+      "subHappNotificationExpire": {
+        "type": "boolean"
+      },
+      "subHappPerAppList": {
+        "type": "string"
+      },
+      "subHappPerAppMode": {
+        "type": "string"
+      },
+      "subHappPingType": {
+        "type": "string"
+      },
+      "subHappProviderId": {
+        "type": "string"
+      },
+      "subHappSubExpire": {
+        "type": "boolean"
+      },
+      "subHappSubExpireButtonLink": {
+        "type": "string"
+      },
+      "subHappSubInfoButtonLink": {
+        "type": "string"
+      },
+      "subHappSubInfoButtonText": {
+        "type": "string"
+      },
+      "subHappSubInfoColor": {
+        "type": "string"
+      },
+      "subHappSubInfoText": {
+        "type": "string"
+      },
+      "subHappTunMode": {
+        "type": "string"
+      },
+      "subHappTunType": {
+        "type": "string"
+      },
       "subHideSettings": {
         "type": "boolean"
+      },
+      "subIncyAnnounceUrl": {
+        "type": "string"
+      },
+      "subIncyAppAutoDetect": {
+        "description": "Incy client customization settings (app-management). A \"\" value omits\nthe header so the subscriber's own app setting is left alone.",
+        "type": "boolean"
+      },
+      "subIncyBannerBgColor": {
+        "type": "string"
+      },
+      "subIncyBannerButtonColor": {
+        "type": "string"
+      },
+      "subIncyBannerButtonText": {
+        "type": "string"
+      },
+      "subIncyBannerButtonUrl": {
+        "type": "string"
+      },
+      "subIncyBannerText": {
+        "type": "string"
       },
       "subIncyEnableRouting": {
         "description": "END LUCX-HOOK",
         "type": "boolean"
       },
+      "subIncyFragmentInterval": {
+        "type": "string"
+      },
+      "subIncyFragmentLength": {
+        "type": "string"
+      },
+      "subIncyFragmentPackets": {
+        "type": "string"
+      },
+      "subIncyFragmentationEnable": {
+        "type": "string"
+      },
+      "subIncyHideCheck": {
+        "type": "string"
+      },
+      "subIncyHideUrl": {
+        "type": "string"
+      },
+      "subIncyNoLimitEnabled": {
+        "type": "string"
+      },
+      "subIncyNoisesDelay": {
+        "type": "string"
+      },
+      "subIncyNoisesEnable": {
+        "type": "string"
+      },
+      "subIncyNoisesPacket": {
+        "type": "string"
+      },
+      "subIncyNoisesType": {
+        "type": "string"
+      },
+      "subIncyPerAppEnable": {
+        "type": "string"
+      },
+      "subIncyPerAppList": {
+        "type": "string"
+      },
+      "subIncyPerAppMode": {
+        "type": "string"
+      },
+      "subIncyPremiumUrl": {
+        "type": "string"
+      },
+      "subIncyProfileDescription": {
+        "type": "string"
+      },
+      "subIncyResolveDnsDomain": {
+        "type": "string"
+      },
+      "subIncyResolveDnsIp": {
+        "type": "string"
+      },
+      "subIncyResolveEnable": {
+        "type": "string"
+      },
       "subIncyRoutingRules": {
         "type": "string"
+      },
+      "subIncySortOrder": {
+        "type": "string"
+      },
+      "subIncySupportEmail": {
+        "type": "string"
+      },
+      "subInfoNodeEnable": {
+        "type": "boolean"
       },
       "subJsonAlwaysArray": {
         "type": "boolean"
       },
       "subJsonAutoDetect": {
         "type": "boolean"
+      },
+      "subJsonDns": {
+        "type": "string"
       },
       "subJsonEnable": {
         "type": "boolean"
@@ -715,7 +1256,13 @@ export const SCHEMAS: Record<string, unknown> = {
         "description": "END LUCX-HOOK",
         "type": "string"
       },
+      "subJsonObservatory": {
+        "type": "string"
+      },
       "subJsonPath": {
+        "type": "string"
+      },
+      "subJsonRoutingRules": {
         "type": "string"
       },
       "subJsonRules": {
@@ -741,6 +1288,9 @@ export const SCHEMAS: Record<string, unknown> = {
         "minimum": 1,
         "type": "integer"
       },
+      "subProfileMode": {
+        "type": "string"
+      },
       "subProfileUrl": {
         "type": "string"
       },
@@ -761,6 +1311,9 @@ export const SCHEMAS: Record<string, unknown> = {
         "type": "string"
       },
       "subTitle": {
+        "type": "string"
+      },
+      "subTrafficDepletedTemplate": {
         "type": "string"
       },
       "subURI": {
@@ -838,6 +1391,10 @@ export const SCHEMAS: Record<string, unknown> = {
       "webDomain": {
         "type": "string"
       },
+      "webFavicon": {
+        "description": "LUCX-HOOK: optional panel tab favicon (emoji or image data URI / base64)",
+        "type": "string"
+      },
       "webKeyFile": {
         "type": "string"
       },
@@ -852,16 +1409,30 @@ export const SCHEMAS: Record<string, unknown> = {
     },
     "required": [
       "datepicker",
+      "discordAdminIds",
+      "discordBotBackup",
+      "discordBotEnable",
+      "discordBotToken",
+      "discordChannelId",
+      "discordCpu",
+      "discordEnabledEvents",
+      "discordLang",
+      "discordMemory",
+      "discordRunTime",
       "expireDiff",
+      "externalSubUserAgent",
       "externalTrafficInformEnable",
       "externalTrafficInformURI",
+      "happLinkEnable",
       "hasApiToken",
+      "hasDiscordBotToken",
       "hasLdapPassword",
       "hasNordSecret",
       "hasSmtpPassword",
       "hasTgBotToken",
       "hasTwoFactorToken",
       "hasWarpSecret",
+      "ipLimitAllowlist",
       "ldapAutoCreate",
       "ldapAutoDelete",
       "ldapBaseDN",
@@ -883,9 +1454,11 @@ export const SCHEMAS: Record<string, unknown> = {
       "ldapUserAttr",
       "ldapUserFilter",
       "ldapVlessField",
+      "logRetentionDays",
       "outboundDownThreshold",
       "pageSize",
       "panelOutbound",
+      "realityScanCandidates",
       "remarkTemplate",
       "restartXrayOnClientDisable",
       "sessionMaxAge",
@@ -905,6 +1478,7 @@ export const SCHEMAS: Record<string, unknown> = {
       "subAwgEnable",
       "subAwgPath",
       "subAwgURI",
+      "subCalendarExpireInclusive",
       "subCertFile",
       "subClashAutoDetect",
       "subClashEnable",
@@ -917,15 +1491,72 @@ export const SCHEMAS: Record<string, unknown> = {
       "subEnable",
       "subEnableRouting",
       "subEncrypt",
+      "subExpiredTemplate",
+      "subHappAlwaysHwid",
+      "subHappAutoConnect",
+      "subHappAutoConnectType",
+      "subHappAutoDetect",
+      "subHappColorProfile",
+      "subHappExcludeApns",
+      "subHappExcludeRoutes",
+      "subHappFallbackUrl",
+      "subHappLocalProxyAuth",
+      "subHappNewUrl",
+      "subHappNoLimit",
+      "subHappNotificationExpire",
+      "subHappPerAppList",
+      "subHappPerAppMode",
+      "subHappPingType",
+      "subHappProviderId",
+      "subHappSubExpire",
+      "subHappSubExpireButtonLink",
+      "subHappSubInfoButtonLink",
+      "subHappSubInfoButtonText",
+      "subHappSubInfoColor",
+      "subHappSubInfoText",
+      "subHappTunMode",
+      "subHappTunType",
       "subHideSettings",
+      "subIncyAnnounceUrl",
+      "subIncyAppAutoDetect",
+      "subIncyBannerBgColor",
+      "subIncyBannerButtonColor",
+      "subIncyBannerButtonText",
+      "subIncyBannerButtonUrl",
+      "subIncyBannerText",
       "subIncyEnableRouting",
+      "subIncyFragmentInterval",
+      "subIncyFragmentLength",
+      "subIncyFragmentPackets",
+      "subIncyFragmentationEnable",
+      "subIncyHideCheck",
+      "subIncyHideUrl",
+      "subIncyNoLimitEnabled",
+      "subIncyNoisesDelay",
+      "subIncyNoisesEnable",
+      "subIncyNoisesPacket",
+      "subIncyNoisesType",
+      "subIncyPerAppEnable",
+      "subIncyPerAppList",
+      "subIncyPerAppMode",
+      "subIncyPremiumUrl",
+      "subIncyProfileDescription",
+      "subIncyResolveDnsDomain",
+      "subIncyResolveDnsIp",
+      "subIncyResolveEnable",
       "subIncyRoutingRules",
+      "subIncySortOrder",
+      "subIncySupportEmail",
+      "subInfoNodeEnable",
       "subJsonAlwaysArray",
       "subJsonAutoDetect",
+      "subJsonDns",
       "subJsonEnable",
       "subJsonFinalMask",
       "subJsonMux",
+      "subJsonObservatory",
       "subJsonPath",
+      "subJsonRoutingRules",
       "subJsonRules",
       "subJsonURI",
       "subJsonUserAgentRegex",
@@ -933,6 +1564,7 @@ export const SCHEMAS: Record<string, unknown> = {
       "subListen",
       "subPath",
       "subPort",
+      "subProfileMode",
       "subProfileUrl",
       "subRoutingRules",
       "subRoutingSource",
@@ -940,6 +1572,7 @@ export const SCHEMAS: Record<string, unknown> = {
       "subSupportUrl",
       "subThemeDir",
       "subTitle",
+      "subTrafficDepletedTemplate",
       "subURI",
       "subUpdates",
       "tgBotAPIServer",
@@ -962,9 +1595,40 @@ export const SCHEMAS: Record<string, unknown> = {
       "webBasePath",
       "webCertFile",
       "webDomain",
+      "webFavicon",
       "webKeyFile",
       "webListen",
       "webPort"
+    ],
+    "type": "object"
+  },
+  "AmneziaWGLogs": {
+    "description": "AmneziaWGLogs is what the overview's AmneziaWG log view renders: the live\nper-peer activity of every running embedded interface, plus the panel's\nown recent AmneziaWG lifecycle log lines that explain a peer being absent\nfrom Peers at all.",
+    "properties": {
+      "events": {
+        "example": [
+          "2025/01/01 12:00:00 amneziawg: started interface awg1 for inbound 1"
+        ],
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "peers": {
+        "items": {
+          "$ref": "#/components/schemas/PeerActivity"
+        },
+        "type": "array"
+      },
+      "running": {
+        "example": true,
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "events",
+      "peers",
+      "running"
     ],
     "type": "object"
   },
@@ -977,10 +1641,17 @@ export const SCHEMAS: Record<string, unknown> = {
       "enabled": {
         "type": "boolean"
       },
+      "expiresAt": {
+        "format": "int64",
+        "type": "integer"
+      },
       "id": {
         "type": "integer"
       },
       "name": {
+        "type": "string"
+      },
+      "scope": {
         "type": "string"
       },
       "token": {
@@ -991,8 +1662,10 @@ export const SCHEMAS: Record<string, unknown> = {
     "required": [
       "createdAt",
       "enabled",
+      "expiresAt",
       "id",
       "name",
+      "scope",
       "token"
     ],
     "type": "object"
@@ -1008,12 +1681,21 @@ export const SCHEMAS: Record<string, unknown> = {
         "example": true,
         "type": "boolean"
       },
+      "expiresAt": {
+        "example": 0,
+        "format": "int64",
+        "type": "integer"
+      },
       "id": {
         "example": 2,
         "type": "integer"
       },
       "name": {
         "example": "central-panel-a",
+        "type": "string"
+      },
+      "scope": {
+        "example": "admin",
         "type": "string"
       },
       "token": {
@@ -1024,8 +1706,10 @@ export const SCHEMAS: Record<string, unknown> = {
     "required": [
       "createdAt",
       "enabled",
+      "expiresAt",
       "id",
-      "name"
+      "name",
+      "scope"
     ],
     "type": "object"
   },
@@ -1041,6 +1725,16 @@ export const SCHEMAS: Record<string, unknown> = {
           "type": "string"
         },
         "type": "array"
+      },
+      "allowedIPsByInbound": {
+        "additionalProperties": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "description": "AllowedIPsByInbound optionally overrides AllowedIPs on a per-inbound\nbasis, keyed by inbound id. Lets one identity attached to both\nWireGuard and AmneziaWG carry two genuinely different addresses in a\nsingle Create/Update call instead of the shared AllowedIPs field\nbeing broadcast to every attached tunnel inbound. Absent/unset for a\ngiven inbound id falls back to the shared AllowedIPs exactly as\nbefore -- fully backward compatible for callers that never set this.",
+        "type": "object"
       },
       "auth": {
         "description": "Auth password (Hysteria)",
@@ -1072,6 +1766,10 @@ export const SCHEMAS: Record<string, unknown> = {
         "description": "Flow control (XTLS)",
         "type": "string"
       },
+      "forwardedPorts": {
+        "description": "END LUCX-HOOK\nAmneziaWG per-client port-forwarding spec, e.g. \"80,443,8000-8100\"",
+        "type": "string"
+      },
       "group": {
         "description": "Logical grouping label",
         "type": "string"
@@ -1081,7 +1779,7 @@ export const SCHEMAS: Record<string, unknown> = {
         "type": "string"
       },
       "keepAlive": {
-        "description": "LUCX-HOOK: KeepAliveValue (number or AWG3 range string)",
+        "description": "LUCX-HOOK: KeepAliveValue (number or AWG3 range string). Not *int:\na vanilla INTEGER column still Scans, and \"15-25\" must round-trip.",
         "type": "string"
       },
       "limitIp": {
@@ -1105,6 +1803,18 @@ export const SCHEMAS: Record<string, unknown> = {
         "description": "Reset period in days",
         "type": "integer"
       },
+      "resetDay": {
+        "description": "Calendar renewal day 1-31, 0 disables monthly renewal",
+        "type": "integer"
+      },
+      "resetMax": {
+        "description": "Max auto-renew count, 0 = unlimited",
+        "type": "integer"
+      },
+      "resetWeekday": {
+        "description": "Calendar weekday 1-7 (Mon-Sun), 0 disables weekly renewal",
+        "type": "integer"
+      },
       "reverse": {
         "allOf": [
           {
@@ -1115,7 +1825,6 @@ export const SCHEMAS: Record<string, unknown> = {
         "nullable": true
       },
       "secret": {
-        "description": "END LUCX-HOOK",
         "example": "ee1234567890abcdef1234567890abcd7777772e636c6f7564666c6172652e636f6d",
         "type": "string"
       },
@@ -1137,6 +1846,22 @@ export const SCHEMAS: Record<string, unknown> = {
         "format": "int64",
         "type": "integer"
       },
+      "trafficReset": {
+        "description": "Per-client traffic reset cycle, independent of the inbound's own (#5497).",
+        "enum": [
+          "never",
+          "hourly",
+          "daily",
+          "weekly",
+          "monthly"
+        ],
+        "type": "string"
+      },
+      "trafficResetDay": {
+        "maximum": 31,
+        "minimum": 1,
+        "type": "integer"
+      },
       "updated_at": {
         "description": "Last update timestamp",
         "format": "int64",
@@ -1150,6 +1875,9 @@ export const SCHEMAS: Record<string, unknown> = {
       "expiryTime",
       "limitIp",
       "reset",
+      "resetDay",
+      "resetMax",
+      "resetWeekday",
       "security",
       "subId",
       "tgId",
@@ -1178,6 +1906,56 @@ export const SCHEMAS: Record<string, unknown> = {
       "createdAt",
       "flowOverride",
       "inboundId"
+    ],
+    "type": "object"
+  },
+  "ClientPageResponse": {
+    "description": "ClientPageResponse is the shape returned by ListPaged. `Total` is the\nrow count in the DB; `Filtered` is the count after Search/Filter/Protocol\nwere applied, before pagination. The page contains at most PageSize items.\nSummary is computed across the full DB row set so dashboard counters\non the clients page stay stable as the user paginates/filters.",
+    "properties": {
+      "filtered": {
+        "example": 47,
+        "type": "integer"
+      },
+      "groups": {
+        "example": [
+          "staff",
+          "trial"
+        ],
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "items": {
+        "items": {
+          "$ref": "#/components/schemas/ClientSlim"
+        },
+        "type": "array"
+      },
+      "page": {
+        "example": 1,
+        "type": "integer"
+      },
+      "pageSize": {
+        "example": 25,
+        "type": "integer"
+      },
+      "summary": {
+        "$ref": "#/components/schemas/ClientsSummary"
+      },
+      "total": {
+        "example": 2000,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "filtered",
+      "groups",
+      "items",
+      "page",
+      "pageSize",
+      "summary",
+      "total"
     ],
     "type": "object"
   },
@@ -1212,6 +1990,10 @@ export const SCHEMAS: Record<string, unknown> = {
       "flow": {
         "type": "string"
       },
+      "forwardedPorts": {
+        "description": "END LUCX-HOOK",
+        "type": "string"
+      },
       "group": {
         "type": "string"
       },
@@ -1221,6 +2003,9 @@ export const SCHEMAS: Record<string, unknown> = {
       "keepAlive": {
         "description": "LUCX-HOOK: string column so AWG3 ranges (\"15-25\") round-trip; legacy ints coerce via SQLite/PG text",
         "type": "string"
+      },
+      "limitHwid": {
+        "type": "integer"
       },
       "limitIp": {
         "type": "integer"
@@ -1240,9 +2025,17 @@ export const SCHEMAS: Record<string, unknown> = {
       "reset": {
         "type": "integer"
       },
+      "resetDay": {
+        "type": "integer"
+      },
+      "resetMax": {
+        "type": "integer"
+      },
+      "resetWeekday": {
+        "type": "integer"
+      },
       "reverse": {},
       "secret": {
-        "description": "END LUCX-HOOK",
         "type": "string"
       },
       "security": {
@@ -1257,6 +2050,12 @@ export const SCHEMAS: Record<string, unknown> = {
       },
       "totalGB": {
         "format": "int64",
+        "type": "integer"
+      },
+      "trafficReset": {
+        "type": "string"
+      },
+      "trafficResetDay": {
         "type": "integer"
       },
       "updatedAt": {
@@ -1277,23 +2076,121 @@ export const SCHEMAS: Record<string, unknown> = {
       "enable",
       "expiryTime",
       "flow",
+      "forwardedPorts",
       "group",
       "id",
       "keepAlive",
+      "limitHwid",
       "limitIp",
       "password",
       "preSharedKey",
       "privateKey",
       "publicKey",
       "reset",
+      "resetDay",
+      "resetMax",
+      "resetWeekday",
       "reverse",
       "secret",
       "security",
       "subId",
       "tgId",
       "totalGB",
+      "trafficReset",
+      "trafficResetDay",
       "updatedAt",
       "uuid"
+    ],
+    "type": "object"
+  },
+  "ClientRenewalPreview": {
+    "properties": {
+      "canRenew": {
+        "example": true,
+        "type": "boolean"
+      },
+      "delayedStart": {
+        "example": false,
+        "type": "boolean"
+      },
+      "nextExpiry": {
+        "example": "2030-02-01T00:00:00Z",
+        "type": "string"
+      },
+      "renewAt": {
+        "example": "2030-01-01T00:00:00Z",
+        "type": "string"
+      },
+      "renewals": {
+        "example": 1,
+        "type": "integer"
+      },
+      "suggestedExpiry": {
+        "example": "2030-01-01T00:00:00Z",
+        "type": "string"
+      },
+      "suggestedExpiryTime": {
+        "example": 1893456000000,
+        "format": "int64",
+        "type": "integer"
+      },
+      "timeZone": {
+        "example": "UTC",
+        "type": "string"
+      },
+      "validThrough": {
+        "example": "2029-12-31T23:59:59Z",
+        "type": "string"
+      }
+    },
+    "required": [
+      "canRenew",
+      "delayedStart",
+      "nextExpiry",
+      "renewAt",
+      "renewals",
+      "suggestedExpiry",
+      "suggestedExpiryTime",
+      "timeZone",
+      "validThrough"
+    ],
+    "type": "object"
+  },
+  "ClientRenewalPreviewRequest": {
+    "properties": {
+      "expiryTime": {
+        "example": 1893456000000,
+        "format": "int64",
+        "type": "integer"
+      },
+      "reset": {
+        "example": 0,
+        "type": "integer"
+      },
+      "resetCount": {
+        "example": 0,
+        "type": "integer"
+      },
+      "resetDay": {
+        "example": 1,
+        "type": "integer"
+      },
+      "resetMax": {
+        "example": 0,
+        "type": "integer"
+      },
+      "resetWeekday": {
+        "example": 0,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "expiryTime",
+      "reset",
+      "resetCount",
+      "resetDay",
+      "resetMax",
+      "resetWeekday"
     ],
     "type": "object"
   },
@@ -1305,6 +2202,110 @@ export const SCHEMAS: Record<string, unknown> = {
     },
     "required": [
       "tag"
+    ],
+    "type": "object"
+  },
+  "ClientSlim": {
+    "description": "ClientSlim is the row-shape used by the clients page. It drops fields the\ntable never reads (UUID, password, auth, flow, security, reverse, tgId)\nso the list payload stays compact even when the panel manages thousands\nof clients. Modals that need the full record still call /get/:email.",
+    "properties": {
+      "comment": {
+        "example": "Primary device",
+        "type": "string"
+      },
+      "createdAt": {
+        "example": 1735000000000,
+        "format": "int64",
+        "type": "integer"
+      },
+      "email": {
+        "example": "alice@example.com",
+        "type": "string"
+      },
+      "enable": {
+        "example": true,
+        "type": "boolean"
+      },
+      "expiryTime": {
+        "example": 1735689600000,
+        "format": "int64",
+        "type": "integer"
+      },
+      "group": {
+        "example": "staff",
+        "type": "string"
+      },
+      "inboundIds": {
+        "example": [
+          3,
+          5
+        ],
+        "items": {
+          "type": "integer"
+        },
+        "type": "array"
+      },
+      "limitHwid": {
+        "example": 0,
+        "type": "integer"
+      },
+      "limitIp": {
+        "example": 0,
+        "type": "integer"
+      },
+      "reset": {
+        "example": 0,
+        "type": "integer"
+      },
+      "resetDay": {
+        "example": 0,
+        "type": "integer"
+      },
+      "resetMax": {
+        "example": 0,
+        "type": "integer"
+      },
+      "resetWeekday": {
+        "example": 0,
+        "type": "integer"
+      },
+      "subId": {
+        "example": "abcd1234",
+        "type": "string"
+      },
+      "totalGB": {
+        "example": 53687091200,
+        "format": "int64",
+        "type": "integer"
+      },
+      "traffic": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ClientTraffic"
+          }
+        ],
+        "nullable": true
+      },
+      "updatedAt": {
+        "example": 1735100000000,
+        "format": "int64",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "createdAt",
+      "email",
+      "enable",
+      "expiryTime",
+      "inboundIds",
+      "limitHwid",
+      "limitIp",
+      "reset",
+      "resetDay",
+      "resetMax",
+      "resetWeekday",
+      "subId",
+      "totalGB",
+      "updatedAt"
     ],
     "type": "object"
   },
@@ -1342,7 +2343,32 @@ export const SCHEMAS: Record<string, unknown> = {
         "format": "int64",
         "type": "integer"
       },
+      "lastSubFetch": {
+        "example": 1735680000000,
+        "format": "int64",
+        "type": "integer"
+      },
       "reset": {
+        "example": 0,
+        "type": "integer"
+      },
+      "resetCount": {
+        "description": "ResetCount is how many have fired, so a prepaid plan stops on its own.",
+        "example": 0,
+        "type": "integer"
+      },
+      "resetDay": {
+        "description": "ResetDay renews on that day of each calendar month instead of every\nReset days; 0 disables monthly renewal.",
+        "example": 0,
+        "type": "integer"
+      },
+      "resetMax": {
+        "description": "ResetMax caps how many times auto-renew may fire; 0 means no cap.",
+        "example": 0,
+        "type": "integer"
+      },
+      "resetWeekday": {
+        "description": "ResetWeekday renews weekly at panel-local midnight: 1 Monday through 7 Sunday.",
         "example": 0,
         "type": "integer"
       },
@@ -1373,11 +2399,90 @@ export const SCHEMAS: Record<string, unknown> = {
       "id",
       "inboundId",
       "lastOnline",
+      "lastSubFetch",
       "reset",
+      "resetCount",
+      "resetDay",
+      "resetMax",
+      "resetWeekday",
       "subId",
       "total",
       "up",
       "uuid"
+    ],
+    "type": "object"
+  },
+  "ClientsSummary": {
+    "description": "ClientsSummary collects per-bucket counts plus the matching email lists so\nthe clients page can render the dashboard stat cards and their hover\npopovers without shipping the full client array. The counters are exact;\nthe lists stop at clientSummaryEmailCap entries and only back the popovers.",
+    "properties": {
+      "active": {
+        "example": 1850,
+        "type": "integer"
+      },
+      "deactive": {
+        "example": [
+          "bob@example.com"
+        ],
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "deactiveCount": {
+        "example": 150,
+        "type": "integer"
+      },
+      "depleted": {
+        "example": [],
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "depletedCount": {
+        "example": 0,
+        "type": "integer"
+      },
+      "expiring": {
+        "example": [],
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "expiringCount": {
+        "example": 0,
+        "type": "integer"
+      },
+      "online": {
+        "example": [
+          "alice@example.com"
+        ],
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "onlineCount": {
+        "example": 1,
+        "type": "integer"
+      },
+      "total": {
+        "example": 2000,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "active",
+      "deactive",
+      "deactiveCount",
+      "depleted",
+      "depletedCount",
+      "expiring",
+      "expiringCount",
+      "online",
+      "onlineCount",
+      "total"
     ],
     "type": "object"
   },
@@ -1547,6 +2652,18 @@ export const SCHEMAS: Record<string, unknown> = {
     ],
     "type": "object"
   },
+  "HappLinkResult": {
+    "properties": {
+      "encryptedLink": {
+        "example": "happ://crypt5/example",
+        "type": "string"
+      }
+    },
+    "required": [
+      "encryptedLink"
+    ],
+    "type": "object"
+  },
   "HistoryOfSeeders": {
     "description": "HistoryOfSeeders tracks which database seeders have been executed to prevent re-running.",
     "properties": {
@@ -1577,6 +2694,9 @@ export const SCHEMAS: Record<string, unknown> = {
           "type": "string"
         },
         "type": "array"
+      },
+      "cipherSuites": {
+        "type": "string"
       },
       "createdAt": {
         "format": "int64",
@@ -1711,6 +2831,7 @@ export const SCHEMAS: Record<string, unknown> = {
       "address",
       "allowInsecure",
       "alpn",
+      "cipherSuites",
       "createdAt",
       "echConfigList",
       "excludeFromSubTypes",
@@ -1754,6 +2875,9 @@ export const SCHEMAS: Record<string, unknown> = {
           "type": "string"
         },
         "type": "array"
+      },
+      "cipherSuites": {
+        "type": "string"
       },
       "echConfigList": {
         "type": "string"
@@ -1881,6 +3005,7 @@ export const SCHEMAS: Record<string, unknown> = {
     "required": [
       "allowInsecure",
       "alpn",
+      "cipherSuites",
       "echConfigList",
       "excludeFromSubTypes",
       "finalMask",
@@ -1913,6 +3038,73 @@ export const SCHEMAS: Record<string, unknown> = {
     ],
     "type": "object"
   },
+  "HostStatus": {
+    "description": "HostStatus is the dashboard-level AWG snapshot (module + running ifaces).",
+    "properties": {
+      "ifnames": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "interfaces": {
+        "type": "integer"
+      },
+      "moduleAwg3": {
+        "type": "boolean"
+      },
+      "moduleAwg31": {
+        "type": "boolean"
+      },
+      "moduleLoaded": {
+        "type": "boolean"
+      },
+      "version": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "interfaces",
+      "moduleAwg3",
+      "moduleAwg31",
+      "moduleLoaded",
+      "version"
+    ],
+    "type": "object"
+  },
+  "HwidSlotStatus": {
+    "description": "HwidSlotStatus is the aggregate device-slot view exposed to subscribers:\ncounters only, no hwid value or hash, no email, no device metadata.",
+    "properties": {
+      "active": {
+        "example": true,
+        "type": "boolean"
+      },
+      "full": {
+        "example": false,
+        "type": "boolean"
+      },
+      "limit": {
+        "example": 2,
+        "type": "integer"
+      },
+      "registered": {
+        "example": 1,
+        "type": "integer"
+      },
+      "remaining": {
+        "example": 1,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "active",
+      "full",
+      "limit",
+      "registered",
+      "remaining"
+    ],
+    "type": "object"
+  },
   "Inbound": {
     "description": "Inbound represents an Xray inbound configuration with traffic statistics and settings.",
     "properties": {
@@ -1923,6 +3115,10 @@ export const SCHEMAS: Record<string, unknown> = {
         },
         "type": "array"
       },
+      "disableFlow": {
+        "example": false,
+        "type": "boolean"
+      },
       "down": {
         "description": "Download traffic in bytes",
         "format": "int64",
@@ -1931,6 +3127,11 @@ export const SCHEMAS: Record<string, unknown> = {
       "enable": {
         "description": "Whether the inbound is enabled",
         "example": true,
+        "type": "boolean"
+      },
+      "excludeFromSub": {
+        "description": "Whether to omit this inbound from subscription output while keeping it operational",
+        "example": false,
         "type": "boolean"
       },
       "expiryTime": {
@@ -1988,12 +3189,19 @@ export const SCHEMAS: Record<string, unknown> = {
           "tunnel",
           "tun",
           "mtproto",
+          "amneziawg",
+          "tuic",
           "awg",
           "naive",
           "olcrtc",
           "qwdtt",
+          "csqtt",
           "mieru",
-          "trusttunnel"
+          "trusttunnel",
+          "anytls",
+          "tproxy",
+          "cover",
+          "gateway"
         ],
         "example": "vless",
         "type": "string"
@@ -2018,9 +3226,8 @@ export const SCHEMAS: Record<string, unknown> = {
       "sniffing": {},
       "streamSettings": {},
       "subSortIndex": {
-        "description": "1-based sort order of this inbound's links in subscription output only (lower first; ties by id)",
+        "description": "Sort order of this inbound's links in subscription output only (lower first; negatives allowed; 0/omitted → 1; ties by id)",
         "example": 1,
-        "minimum": 1,
         "type": "integer"
       },
       "tag": {
@@ -2058,8 +3265,10 @@ export const SCHEMAS: Record<string, unknown> = {
     },
     "required": [
       "clientStats",
+      "disableFlow",
       "down",
       "enable",
+      "excludeFromSub",
       "expiryTime",
       "id",
       "lastTrafficResetTime",
@@ -2145,21 +3354,30 @@ export const SCHEMAS: Record<string, unknown> = {
   "InboundOption": {
     "properties": {
       "awgObfuscation": {
+        "description": "LUCX-HOOK: kernel AWG QR/.conf hints (userspace AmneziaWG uses AwgServer).\nAwgPeerAddresses maps client email to first single-host AllowedIPs for THIS inbound.",
         "type": "string"
       },
       "awgPeerAddresses": {
         "additionalProperties": {
           "type": "string"
         },
-        "description": "AwgPeerAddresses maps client email → first single-host AllowedIPs for\nTHIS inbound (multi-attach clients have a different tunnel IP per AWG\ninbound; the clients-table allowedIPs field is only one of them).",
         "type": "object"
       },
+      "awgServer": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ServerSettings"
+          }
+        ],
+        "description": "AwgServer carries the full AmneziaWG server block (keys, subnet,\nobfuscation params) so the clients page can render a downloadable\nper-client .conf without a second round trip.",
+        "nullable": true
+      },
       "awgServerAddress": {
-        "description": "AWG obfuscation block — the Jc/Jmin/Jmax/S1-S4/H1-H4/I1-I5 lines as they\nappear in a client .conf [Interface] section, plus the server tunnel\naddress. Populated for AWG inbounds so the clients-page QR/.conf path\ncan build a full AmneziaWG client config (mirrors the WG hints above).",
+        "description": "AWG obfuscation block plus the server tunnel address for clients-page QR/.conf.",
         "type": "string"
       },
       "awgVersion": {
-        "description": "AwgVersion is the inbound's AWG protocol version (\"1.5\"/\"2\"/\"3\") — the\nclient-config ceiling the clients page uses to gate the per-client export\nversion selector. Empty/absent is treated as \"2\" by the frontend.",
+        "description": "AwgVersion is the inbound's AWG protocol version (\"1.5\"/\"2\"/\"3\"); empty is \"2\".",
         "type": "string"
       },
       "enable": {
@@ -2174,6 +3392,9 @@ export const SCHEMAS: Record<string, unknown> = {
         "type": "string"
       },
       "mtprotoDomain": {
+        "type": "string"
+      },
+      "network": {
         "type": "string"
       },
       "nodeAddress": {
@@ -2197,6 +3418,9 @@ export const SCHEMAS: Record<string, unknown> = {
         "example": "VLESS-443",
         "type": "string"
       },
+      "security": {
+        "type": "string"
+      },
       "shareAddr": {
         "type": "string"
       },
@@ -2213,6 +3437,14 @@ export const SCHEMAS: Record<string, unknown> = {
       "tlsFlowCapable": {
         "example": true,
         "type": "boolean"
+      },
+      "tuicServer": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/TuicServerSettings"
+          }
+        ],
+        "nullable": true
       },
       "wgDns": {
         "type": "string"
@@ -2236,6 +3468,118 @@ export const SCHEMAS: Record<string, unknown> = {
     ],
     "type": "object"
   },
+  "InboundTrafficSummary": {
+    "properties": {
+      "down": {
+        "example": 2097152,
+        "format": "int64",
+        "type": "integer"
+      },
+      "enable": {
+        "example": true,
+        "type": "boolean"
+      },
+      "id": {
+        "example": 1,
+        "type": "integer"
+      },
+      "total": {
+        "example": 10737418240,
+        "format": "int64",
+        "type": "integer"
+      },
+      "up": {
+        "example": 1048576,
+        "format": "int64",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "down",
+      "enable",
+      "id",
+      "total",
+      "up"
+    ],
+    "type": "object"
+  },
+  "LogEntry": {
+    "properties": {
+      "dateTime": {
+        "example": "2025-01-01T12:00:00Z",
+        "format": "date-time",
+        "type": "string"
+      },
+      "email": {
+        "example": "alice@example.com",
+        "type": "string"
+      },
+      "event": {
+        "example": 0,
+        "type": "integer"
+      },
+      "fromAddress": {
+        "example": "192.0.2.10:54321",
+        "type": "string"
+      },
+      "inbound": {
+        "example": "inbound-443",
+        "type": "string"
+      },
+      "outbound": {
+        "example": "direct",
+        "type": "string"
+      },
+      "toAddress": {
+        "example": "example.com:443",
+        "type": "string"
+      }
+    },
+    "required": [
+      "dateTime",
+      "email",
+      "event",
+      "fromAddress",
+      "inbound",
+      "outbound",
+      "toAddress"
+    ],
+    "type": "object"
+  },
+  "MLDSA65Response": {
+    "properties": {
+      "seed": {
+        "example": "mldsa65-seed",
+        "type": "string"
+      },
+      "verify": {
+        "example": "mldsa65-verify",
+        "type": "string"
+      }
+    },
+    "required": [
+      "seed",
+      "verify"
+    ],
+    "type": "object"
+  },
+  "MLKEM768Response": {
+    "properties": {
+      "client": {
+        "example": "mlkem768-client",
+        "type": "string"
+      },
+      "seed": {
+        "example": "mlkem768-seed",
+        "type": "string"
+      }
+    },
+    "required": [
+      "client",
+      "seed"
+    ],
+    "type": "object"
+  },
   "Msg": {
     "properties": {
       "msg": {
@@ -2250,6 +3594,18 @@ export const SCHEMAS: Record<string, unknown> = {
       "msg",
       "obj",
       "success"
+    ],
+    "type": "object"
+  },
+  "NewUUIDResponse": {
+    "properties": {
+      "uuid": {
+        "example": "550e8400-e29b-41d4-a716-446655440000",
+        "type": "string"
+      }
+    },
+    "required": [
+      "uuid"
     ],
     "type": "object"
   },
@@ -2908,6 +4264,68 @@ export const SCHEMAS: Record<string, unknown> = {
     ],
     "type": "object"
   },
+  "PeerActivity": {
+    "description": "PeerActivity is one peer's live embedded-Device-reported state, the\ncounterpart of an Xray access-log entry: a tunnel logs no requests, only\nhandshakes and bytes.",
+    "properties": {
+      "allowedIPs": {
+        "example": "10.8.1.2/32",
+        "type": "string"
+      },
+      "down": {
+        "example": 4194304,
+        "format": "int64",
+        "type": "integer"
+      },
+      "email": {
+        "example": "peer@example.com",
+        "type": "string"
+      },
+      "endpoint": {
+        "example": "203.0.113.9:51820",
+        "type": "string"
+      },
+      "handshake": {
+        "description": "Handshake is unix milliseconds, 0 when the peer has never connected.",
+        "example": 1735732800000,
+        "format": "int64",
+        "type": "integer"
+      },
+      "inboundId": {
+        "example": 1,
+        "type": "integer"
+      },
+      "interface": {
+        "example": "awg1",
+        "type": "string"
+      },
+      "online": {
+        "example": true,
+        "type": "boolean"
+      },
+      "tag": {
+        "example": "inbound-51820",
+        "type": "string"
+      },
+      "up": {
+        "example": 1048576,
+        "format": "int64",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "allowedIPs",
+      "down",
+      "email",
+      "endpoint",
+      "handshake",
+      "inboundId",
+      "interface",
+      "online",
+      "tag",
+      "up"
+    ],
+    "type": "object"
+  },
   "ProbeResultUI": {
     "properties": {
       "cpuPct": {
@@ -2970,6 +4388,16 @@ export const SCHEMAS: Record<string, unknown> = {
         "example": "h2",
         "type": "string"
       },
+      "certChainBytes": {
+        "description": "CertChainBytes is the sum of DER lengths of the presented peer chain.\nxray-core ML-DSA-65 REALITY needs \u003e= 3500 bytes (constant lives in xray-core).",
+        "example": 3427,
+        "type": "integer"
+      },
+      "certChainValid": {
+        "description": "CertChainValid ignores the name: a trusted chain presented for other names\nstill has serverNames the panel can offer instead of the failing SNI.",
+        "example": true,
+        "type": "boolean"
+      },
       "certIssuer": {
         "example": "Google Trust Services",
         "type": "string"
@@ -3014,6 +4442,11 @@ export const SCHEMAS: Record<string, unknown> = {
         "example": 443,
         "type": "integer"
       },
+      "privateTarget": {
+        "description": "PrivateTarget marks a target that resolves to a loopback/private/link-local\naddress: blocked before the probe unless the caller opted in, then flagged.",
+        "example": false,
+        "type": "boolean"
+      },
       "reason": {
         "type": "string"
       },
@@ -3042,6 +4475,8 @@ export const SCHEMAS: Record<string, unknown> = {
     },
     "required": [
       "alpn",
+      "certChainBytes",
+      "certChainValid",
       "certIssuer",
       "certSubject",
       "certValid",
@@ -3053,12 +4488,157 @@ export const SCHEMAS: Record<string, unknown> = {
       "latencyMs",
       "notAfter",
       "port",
+      "privateTarget",
       "reason",
       "serverNames",
       "target",
       "tls13",
       "tlsVersion",
       "x25519"
+    ],
+    "type": "object"
+  },
+  "ServerSettings": {
+    "description": "ServerSettings is the \"server\" block of an AmneziaWG inbound's Settings\nJSON: the interface-level configuration shared by every client/peer. The\nlisten port is deliberately not duplicated here — it lives on the inbound\nrow itself (Inbound.Port), like every other protocol.",
+    "properties": {
+      "contentPaddingAddition": {
+        "type": "string"
+      },
+      "disableCookies": {
+        "type": "boolean"
+      },
+      "externalInterface": {
+        "description": "ExternalInterface, IPv6Enabled, and IPv6ExternalInterface are live\nagain as of Phase 3.5 -- see the matching fields on Instance for what\nthey gate (internal/amneziawgnet's IPv6-address-alias mechanism).\nIPv6Subnet was never actually vestigial either: InstanceFromInbound\nalready consumes it (via serverAddressV6) to build the server's own\ntunnel address, same as always. Only RouteThroughXray, below, remains\ngenuinely vestigial as of the hard cutover to the embedded path\n(internal/amneziawgnet) -- read from existing stored settings for\nbackward compatibility, but not acted on by anything.",
+        "type": "string"
+      },
+      "h1": {
+        "type": "string"
+      },
+      "h2": {
+        "type": "string"
+      },
+      "h3": {
+        "type": "string"
+      },
+      "h4": {
+        "type": "string"
+      },
+      "headerProtectionKey": {
+        "description": "HeaderProtectionKey and ContentPaddingAddition are AmneziaWG 3.0\nfields, flat and top-level for the same tools/openapigen reason as\nthe block above; Obfuscation() below folds them back into\nObfuscation31's own identically named fields.\nHeaderProtectionKey is a base64 32-byte key; empty (the default)\ndisables AWG 3.0 header protection. A non-empty value requires\nevery one of S1-S4 above to be \u003e= 12 -- ValidateObfuscation\nenforces this at save time, not just at IpcSet time.\nContentPaddingAddition is a \"low-high\" range or bare integer, the\nsame grammar and uint32 cap as H1-H4.",
+        "type": "string"
+      },
+      "i1": {
+        "type": "string"
+      },
+      "i2": {
+        "type": "string"
+      },
+      "i3": {
+        "type": "string"
+      },
+      "i4": {
+        "type": "string"
+      },
+      "i5": {
+        "type": "string"
+      },
+      "ipv6Enabled": {
+        "type": "boolean"
+      },
+      "ipv6ExternalInterface": {
+        "type": "string"
+      },
+      "ipv6Subnet": {
+        "type": "string"
+      },
+      "jc": {
+        "description": "Obfuscation31's fields, repeated flat (not embedded) rather than\nnested under their own key: encoding/json would happily inline an\nembedded Obfuscation31 the same way, but the frontend's Go-\u003eZod/TS\ngenerator (tools/openapigen) does not — it emits a genuinely nested\n`obfuscation31` object, which would silently diverge from the real\nwire JSON. See Obfuscation() below for the manager-facing conversion.",
+        "type": "integer"
+      },
+      "jmax": {
+        "type": "integer"
+      },
+      "jmin": {
+        "type": "integer"
+      },
+      "keepaliveTimeout": {
+        "type": "string"
+      },
+      "maxHandshakeAttempts": {
+        "type": "string"
+      },
+      "mtu": {
+        "type": "integer"
+      },
+      "primaryDns": {
+        "description": "PrimaryDNS/SecondaryDNS seed client configs' DNS line. Blank is\nmeaningful, so no omitempty: a dropped key resurrects frontend defaults.",
+        "type": "string"
+      },
+      "privateKey": {
+        "type": "string"
+      },
+      "publicKey": {
+        "type": "string"
+      },
+      "randomTrailers": {
+        "description": "RandomTrailers/DisableCookies mirror Instance's identically named\nAmneziaWG 3.1 fields -- see that type's own doc comment for the real\nprotocol/interop details. Both real bool fields (not omitempty):\nbuildUAPIConfig always emits both lines explicitly so the\nreconfigure-in-place diff correctly notices a true-\u003efalse edit, not\njust false-\u003etrue.",
+        "type": "boolean"
+      },
+      "rejectAfterTime": {
+        "type": "string"
+      },
+      "rekeyAfterTime": {
+        "description": "RekeyAfterTime/RekeyTimeout/RejectAfterTime/KeepaliveTimeout/\nMaxHandshakeAttempts mirror Instance's identically named fields --\nsee that type's own doc comment for the grammar/width/real-default\ndetails. Flat and top-level for the same tools/openapigen reason as\nthe rest of this struct.",
+        "type": "string"
+      },
+      "rekeyTimeout": {
+        "type": "string"
+      },
+      "routeThroughXray": {
+        "type": "boolean"
+      },
+      "s1": {
+        "type": "integer"
+      },
+      "s2": {
+        "type": "integer"
+      },
+      "s3": {
+        "type": "integer"
+      },
+      "s4": {
+        "type": "integer"
+      },
+      "secondaryDns": {
+        "type": "string"
+      },
+      "subnetCidr": {
+        "type": "integer"
+      },
+      "subnetIp": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "disableCookies",
+      "h1",
+      "h2",
+      "h3",
+      "h4",
+      "jc",
+      "jmax",
+      "jmin",
+      "primaryDns",
+      "privateKey",
+      "publicKey",
+      "randomTrailers",
+      "s1",
+      "s2",
+      "s3",
+      "s4",
+      "secondaryDns",
+      "subnetCidr",
+      "subnetIp"
     ],
     "type": "object"
   },
@@ -3079,6 +4659,269 @@ export const SCHEMAS: Record<string, unknown> = {
       "id",
       "key",
       "value"
+    ],
+    "type": "object"
+  },
+  "Sponsor": {
+    "description": "Sponsor is one paid placement published in the repo's sponsors.json.",
+    "properties": {
+      "enable": {
+        "example": true,
+        "nullable": true,
+        "type": "boolean"
+      },
+      "from": {
+        "example": "2026-10-01T00:00:00Z",
+        "format": "date-time",
+        "nullable": true,
+        "type": "string"
+      },
+      "id": {
+        "example": "acme-2026-10",
+        "type": "string"
+      },
+      "link": {
+        "example": "https://acme.example/?utm_source=3x-ui",
+        "type": "string"
+      },
+      "logo": {
+        "example": "/sponsors/logo/acme.png",
+        "type": "string"
+      },
+      "name": {
+        "example": "Acme VPS",
+        "type": "string"
+      },
+      "slots": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "text": {
+        "additionalProperties": {
+          "type": "string"
+        },
+        "type": "object"
+      },
+      "title": {
+        "additionalProperties": {
+          "type": "string"
+        },
+        "type": "object"
+      },
+      "until": {
+        "example": "2026-11-01T00:00:00Z",
+        "format": "date-time",
+        "type": "string"
+      }
+    },
+    "required": [
+      "id",
+      "link",
+      "name",
+      "slots",
+      "text",
+      "title",
+      "until"
+    ],
+    "type": "object"
+  },
+  "SponsorList": {
+    "description": "SponsorList is the active sponsor set plus the contact link for new sponsors.",
+    "properties": {
+      "contact": {
+        "example": "https://t.me/example",
+        "type": "string"
+      },
+      "sponsors": {
+        "items": {
+          "$ref": "#/components/schemas/Sponsor"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "sponsors"
+    ],
+    "type": "object"
+  },
+  "SubBalancer": {
+    "description": "SubBalancer is one extra JSON-subscription config document whose members are\nthe selected inbounds' proxy outbounds. SortOrder shares SubSortIndex semantics.",
+    "properties": {
+      "createdAt": {
+        "example": 1710000000000,
+        "format": "int64",
+        "type": "integer"
+      },
+      "enabled": {
+        "description": "No gorm default:true — a bool default makes an explicit false at insert\ncollapse back to the column default (zero value is skipped).",
+        "example": true,
+        "type": "boolean"
+      },
+      "id": {
+        "example": 1,
+        "type": "integer"
+      },
+      "inboundIds": {
+        "example": [
+          1,
+          3
+        ],
+        "items": {
+          "type": "integer"
+        },
+        "type": "array"
+      },
+      "memberWeights": {
+        "additionalProperties": {
+          "type": "number"
+        },
+        "description": "inboundId -\u003e leastLoad weight; absent entries mean 1.0. Only meaningful\nwith Strategy \"leastLoad\" — xray ignores costs on every other strategy.",
+        "type": "object"
+      },
+      "remark": {
+        "example": "auto-fastest",
+        "maxLength": 256,
+        "type": "string"
+      },
+      "sortOrder": {
+        "example": 1,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "strategy": {
+        "enum": [
+          "leastLoad",
+          "leastPing",
+          "random",
+          "roundRobin"
+        ],
+        "example": "random",
+        "type": "string"
+      },
+      "updatedAt": {
+        "example": 1710000000000,
+        "format": "int64",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "createdAt",
+      "enabled",
+      "id",
+      "inboundIds",
+      "remark",
+      "sortOrder",
+      "strategy",
+      "updatedAt"
+    ],
+    "type": "object"
+  },
+  "Traffic": {
+    "description": "Traffic represents network traffic statistics for Xray connections.\nIt tracks upload and download bytes for inbound or outbound traffic.",
+    "properties": {
+      "Down": {
+        "example": 2097152,
+        "format": "int64",
+        "type": "integer"
+      },
+      "IsInbound": {
+        "example": true,
+        "type": "boolean"
+      },
+      "IsOutbound": {
+        "example": false,
+        "type": "boolean"
+      },
+      "Tag": {
+        "example": "inbound-443",
+        "type": "string"
+      },
+      "Up": {
+        "example": 1048576,
+        "format": "int64",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "Down",
+      "IsInbound",
+      "IsOutbound",
+      "Tag",
+      "Up"
+    ],
+    "type": "object"
+  },
+  "TuicClientSettings": {
+    "properties": {
+      "email": {
+        "type": "string"
+      },
+      "password": {
+        "type": "string"
+      },
+      "uuid": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "email",
+      "password",
+      "uuid"
+    ],
+    "type": "object"
+  },
+  "TuicServerSettings": {
+    "properties": {
+      "alpn": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "authentication_timeout": {
+        "type": "integer"
+      },
+      "certificate": {
+        "type": "string"
+      },
+      "congestion_control": {
+        "type": "string"
+      },
+      "log_level": {
+        "type": "string"
+      },
+      "max_idle_time": {
+        "type": "integer"
+      },
+      "max_udp_relay_packet_size": {
+        "type": "integer"
+      },
+      "private_key": {
+        "type": "string"
+      },
+      "sni": {
+        "type": "string"
+      },
+      "udp_relay_mode": {
+        "type": "string"
+      },
+      "zero_rtt_handshake": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "alpn",
+      "authentication_timeout",
+      "certificate",
+      "congestion_control",
+      "log_level",
+      "max_idle_time",
+      "max_udp_relay_packet_size",
+      "private_key",
+      "udp_relay_mode",
+      "zero_rtt_handshake"
     ],
     "type": "object"
   },

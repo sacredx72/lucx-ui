@@ -4,9 +4,15 @@
 // Commercial use (including VPN resale) requires explicit written permission from the author.
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
+import type { HostEndpoint } from '@/lib/hosts/host-link';
 import { formatInboundLabel } from '@/lib/inbounds/label';
-import { normalizeAwgTimer } from '@/lib/awg/timer';
-import { awgVersionAtLeast, awgVersionCeiling, preferPublicHost, resolveShareHost } from '@/lib/xray/inbound-link';
+import { collapseKeepaliveForVersion, normalizeAwgTimer } from '@/lib/awg/timer';
+import {
+  awgVersionAtLeast,
+  awgVersionCeiling,
+  preferPublicHost,
+  resolveShareHost,
+} from '@/lib/xray/inbound-link';
 import type { AwgVersion } from '@/lib/xray/inbound-link';
 import type { ClientRecord, InboundOption } from '@/hooks/useClients';
 
@@ -18,16 +24,29 @@ function persistentKeepaliveLine(keepAlive: unknown): string | null {
 
 export function isWireguardClient(client: ClientRecord | null | undefined): boolean {
   if (!client) return false;
-  return !!(client.privateKey || client.publicKey || client.allowedIPs || client.preSharedKey || client.keepAlive);
+  return !!(
+    client.privateKey ||
+    client.publicKey ||
+    client.allowedIPs ||
+    client.preSharedKey ||
+    client.keepAlive
+  );
+}
+
+export function findWireguardInbounds(
+  client: ClientRecord | null | undefined,
+  inboundsById: Record<number, InboundOption>,
+): InboundOption[] {
+  return (client?.inboundIds || [])
+    .map((id) => inboundsById?.[id])
+    .filter((ib): ib is InboundOption => ib?.protocol === 'wireguard');
 }
 
 export function findWireguardInbound(
   client: ClientRecord | null | undefined,
   inboundsById: Record<number, InboundOption>,
 ): InboundOption | undefined {
-  return (client?.inboundIds || [])
-    .map((id) => inboundsById[id])
-    .find((ib) => ib?.protocol === 'wireguard');
+  return findWireguardInbounds(client, inboundsById)[0];
 }
 
 export function buildWireguardClientConfig(
@@ -35,12 +54,18 @@ export function buildWireguardClientConfig(
   inbound: InboundOption | undefined,
   host = window.location.hostname,
   publicHost = '',
+  addressOverride = '',
+  hostEndpoint?: HostEndpoint,
 ): string {
-  const endpointHost = resolveShareHost(inbound ?? {}, inbound?.nodeAddress ?? '', preferPublicHost(host, publicHost));
-  const address = client.allowedIPs || '10.0.0.2/32';
-  const endpoint = `${endpointHost}:${inbound?.port || ''}`;
+  const endpointHost =
+    hostEndpoint?.dest ||
+    resolveShareHost(inbound ?? {}, inbound?.nodeAddress ?? '', preferPublicHost(host, publicHost));
+  const address = addressOverride || client.allowedIPs || '10.0.0.2/32';
+  const endpoint = `${endpointHost}:${hostEndpoint?.port || inbound?.port || ''}`;
   const inboundName = inbound ? formatInboundLabel(inbound.tag, inbound.remark) : '';
-  const remark = [inboundName, client.email, client.comment].filter(Boolean).join(' - ');
+  const remark = [inboundName, hostEndpoint?.remark, client.email, client.comment]
+    .filter(Boolean)
+    .join(' - ');
   const lines = [
     '[Interface]',
     `PrivateKey = ${client.privateKey || client.password || ''}`,
@@ -140,13 +165,16 @@ export function buildAwgClientConfig(
   publicHost = '',
   awgVersionExport?: AwgVersion,
 ): string {
-  const endpointHost = resolveShareHost(inbound ?? {}, inbound?.nodeAddress ?? '', preferPublicHost(host, publicHost));
+  const endpointHost = resolveShareHost(
+    inbound ?? {},
+    inbound?.nodeAddress ?? '',
+    preferPublicHost(host, publicHost),
+  );
   // Multi-attach: each AWG inbound has its own peer tunnel IP in settings.
   // Prefer that over the single clients-table allowedIPs (shared across attaches).
   const email = client.email || '';
-  const peerFromInbound = email && inbound?.awgPeerAddresses
-    ? inbound.awgPeerAddresses[email]
-    : undefined;
+  const peerFromInbound =
+    email && inbound?.awgPeerAddresses ? inbound.awgPeerAddresses[email] : undefined;
   const address = peerFromInbound || client.allowedIPs || '10.200.0.2/32';
   const endpoint = `${endpointHost}:${inbound?.port || ''}`;
   const inboundName = inbound ? formatInboundLabel(inbound.tag, inbound.remark) : '';
@@ -158,13 +186,10 @@ export function buildAwgClientConfig(
     `DNS = ${inbound?.wgDns || '1.1.1.1, 1.0.0.1'}`,
   ];
   if (inbound?.wgMtu && inbound.wgMtu > 0) lines.push(`MTU = ${inbound.wgMtu}`);
-  // AWG obfuscation block (Jc/Jmin/Jmax/S1-S4/H1-H4/I1-I5/HPK) — pre-rendered by
-  // the backend (inboundAwgHints) as the inbound's ceiling. Clamp it to the
-  // requested export version when the client app predates the ceiling (older
-  // awg-quick rejects unknown fields). Defaults to the ceiling (inbound.awgVersion).
+  const ceiling = awgVersionCeiling(inbound?.awgVersion);
+  const target =
+    awgVersionExport && awgVersionAtLeast(ceiling, awgVersionExport) ? awgVersionExport : ceiling;
   if (inbound?.awgObfuscation) {
-    const ceiling = awgVersionCeiling(inbound.awgVersion);
-    const target = awgVersionExport && awgVersionAtLeast(ceiling, awgVersionExport) ? awgVersionExport : ceiling;
     const trimmed = filterAwgObfuscation(inbound.awgObfuscation, target).trimEnd();
     if (trimmed) lines.push(trimmed);
   }
@@ -173,8 +198,8 @@ export function buildAwgClientConfig(
   lines.push('[Peer]', `PublicKey = ${inbound?.wgPublicKey || ''}`);
   if (client.preSharedKey) lines.push(`PresharedKey = ${client.preSharedKey}`);
   lines.push('AllowedIPs = 0.0.0.0/0, ::/0', `Endpoint = ${endpoint}`);
-  const ka = persistentKeepaliveLine(client.keepAlive);
-  if (ka) lines.push(ka);
+  const ka = collapseKeepaliveForVersion(client.keepAlive, awgVersionAtLeast(target, '3'));
+  if (ka) lines.push(`PersistentKeepalive = ${ka}`);
   return lines.join('\n');
 }
 // END LUCX-HOOK

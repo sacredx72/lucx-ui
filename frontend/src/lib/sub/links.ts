@@ -6,6 +6,7 @@
 
 export interface SubSettingsLinks {
   enable?: boolean;
+  happLinkEnable?: boolean;
   subURI?: string;
   subJsonEnable?: boolean;
   subJsonURI?: string;
@@ -33,22 +34,10 @@ export function buildSubLinks(
   const empty: BuiltSubLinks = { sub: '', json: '', clash: '', amnezia: '', amneziaVpn: '' };
   if (!settings || !subId) return empty;
 
-  const sub =
-    settings.enable !== false && settings.subURI
-      ? settings.subURI + subId
-      : '';
-  const json =
-    settings.subJsonEnable && settings.subJsonURI
-      ? settings.subJsonURI + subId
-      : '';
-  const clash =
-    settings.subClashEnable && settings.subClashURI
-      ? settings.subClashURI + subId
-      : '';
-  const amnezia =
-    settings.subAwgEnable && settings.subAwgURI
-      ? settings.subAwgURI + subId
-      : '';
+  const sub = settings.enable !== false && settings.subURI ? settings.subURI + subId : '';
+  const json = settings.subJsonEnable && settings.subJsonURI ? settings.subJsonURI + subId : '';
+  const clash = settings.subClashEnable && settings.subClashURI ? settings.subClashURI + subId : '';
+  const amnezia = settings.subAwgEnable && settings.subAwgURI ? settings.subAwgURI + subId : '';
   const amneziaVpn = amnezia
     ? amnezia.includes('?')
       ? `${amnezia}&format=vpn`
@@ -56,4 +45,10 @@ export function buildSubLinks(
     : '';
 
   return { sub, json, clash, amnezia, amneziaVpn };
+}
+
+export function withAwgInboundId(url: string, inboundId: number): string {
+  if (!url || inboundId <= 0) return url;
+  const sep = url.includes('?') ? '&' : '?';
+  return `${url}${sep}inboundId=${inboundId}`;
 }

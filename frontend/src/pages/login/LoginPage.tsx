@@ -13,6 +13,9 @@ import {
   message,
 } from 'antd';
 import {
+  // LUCX-HOOK: palette switch button icon
+  BgColorsOutlined,
+  // END LUCX-HOOK
   KeyOutlined,
   LockOutlined,
   MoonFilled,
@@ -26,6 +29,7 @@ import { FormProvider, useForm } from 'react-hook-form';
 import { HttpUtil, LanguageManager } from '@/utils';
 import { FormField, rhfZodValidate } from '@/components/form/rhf';
 import { setMessageInstance } from '@/utils/messageBus';
+import SponsorSlot from '@/components/sponsor/SponsorSlot';
 import { pauseAnimationsUntilLeave, useTheme } from '@/hooks/useTheme';
 import { LoginFormSchema, TwoFactorCodeSchema, type LoginFormValues } from '@/schemas/login';
 import './LoginPage.css';
@@ -38,7 +42,10 @@ const basePath = window.X_UI_BASE_PATH || '';
 
 export default function LoginPage() {
   const { t } = useTranslation();
-  const { isDark, isUltra, toggleTheme, toggleUltra, antdThemeConfig } = useTheme();
+  // LUCX-HOOK: palette switch added to the upstream dark/ultra cycle
+  const { isDark, isUltra, toggleTheme, toggleUltra, palette, togglePalette, antdThemeConfig } =
+    useTheme();
+  // END LUCX-HOOK
   const [messageApi, messageContextHolder] = message.useMessage();
 
   useEffect(() => {
@@ -49,13 +56,12 @@ export default function LoginPage() {
   const [submitting, setSubmitting] = useState(false);
   const [twoFactorEnable, setTwoFactorEnable] = useState(false);
   const [headlineIndex, setHeadlineIndex] = useState(0);
-  const methods = useForm<LoginForm>({ defaultValues: { username: '', password: '', twoFactorCode: '' } });
+  const methods = useForm<LoginForm>({
+    defaultValues: { username: '', password: '', twoFactorCode: '' },
+  });
   const [lang, setLang] = useState<string>(() => LanguageManager.getLanguage());
 
-  const headlineWords = useMemo(
-    () => [t('pages.login.hello'), t('pages.login.title')],
-    [t],
-  );
+  const headlineWords = useMemo(() => [t('pages.login.hello'), t('pages.login.title')], [t]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -72,7 +78,9 @@ export default function LoginPage() {
       if (msg.success) setTwoFactorEnable(!!msg.obj);
       setFetched(true);
     })();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const onSubmit = useCallback(async (values: LoginForm) => {
@@ -111,15 +119,18 @@ export default function LoginPage() {
   }, [isDark, isUltra]);
 
   const langMenuItems = useMemo(
-    () => (LanguageManager.supportedLanguages as { value: string; name: string; icon: string }[]).map((l) => ({
-      key: l.value,
-      label: (
-        <Space size={8}>
-          <span aria-hidden="true">{l.icon}</span>
-          <span>{l.name}</span>
-        </Space>
+    () =>
+      (LanguageManager.supportedLanguages as { value: string; name: string; icon: string }[]).map(
+        (l) => ({
+          key: l.value,
+          label: (
+            <Space size={8}>
+              <span aria-hidden="true">{l.icon}</span>
+              <span>{l.name}</span>
+            </Space>
+          ),
+        }),
       ),
-    })),
     [],
   );
 
@@ -141,6 +152,22 @@ export default function LoginPage() {
               icon={themeIcon}
               onClick={cycleTheme}
             />
+            {/* LUCX-HOOK: palette switch (blue / sand-graphite) */}
+            <Button
+              id="login-palette-cycle"
+              shape="circle"
+              size="large"
+              className="toolbar-btn"
+              aria-label={t('menu.palette')}
+              aria-pressed={palette === 'warm'}
+              title={t('menu.palette')}
+              icon={<BgColorsOutlined />}
+              onClick={() => {
+                pauseAnimationsUntilLeave('login-palette-cycle');
+                togglePalette();
+              }}
+            />
+            {/* END LUCX-HOOK */}
             <Popover
               rootClassName={isDark ? 'dark' : 'light'}
               placement="bottomRight"
@@ -243,6 +270,7 @@ export default function LoginPage() {
                     </Form.Item>
                   </Form>
                 </FormProvider>
+                <SponsorSlot slot="login" variant="compact" className="login-sponsor" />
               </div>
             )}
           </div>

@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/mhsanaei/3x-ui/v3/internal/amneziawg"
 	"github.com/mhsanaei/3x-ui/v3/internal/awg"
 	"github.com/mhsanaei/3x-ui/v3/internal/awg/vpnuri"
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
@@ -132,6 +133,46 @@ func tagInXrayTemplate(tag string) (bool, error) {
 	return false, nil
 }
 
+// checkOutboundIFields rejects an I1-I5 set that would leave awgo-{Id} up but
+// unreadable: it applies and passes traffic, yet `awg show` fails with EMSGSIZE.
+func checkOutboundIFields(o *model.AwgOutbound) error {
+	var s struct {
+		I1                  string `json:"i1"`
+		I2                  string `json:"i2"`
+		I3                  string `json:"i3"`
+		I4                  string `json:"i4"`
+		I5                  string `json:"i5"`
+		HeaderProtectionKey string `json:"headerProtectionKey"`
+	}
+	if json.Unmarshal([]byte(o.Settings), &s) != nil {
+		return nil
+	}
+	for _, cv := range []struct{ field, v string }{
+		{"i1", s.I1}, {"i2", s.I2}, {"i3", s.I3}, {"i4", s.I4}, {"i5", s.I5},
+	} {
+		if err := amneziawg.ValidateConfigValue(cv.field, cv.v); err != nil {
+			return err
+		}
+	}
+	ifname := "awgo-" + strconv.Itoa(o.Id)
+	if o.Id == 0 {
+		ifname = "awgo-N"
+	}
+	return awg.ValidateIFields(ifname, s.HeaderProtectionKey, s.I1, s.I2, s.I3, s.I4, s.I5)
+}
+
+// Same rule as the inbound side, deliberately the same function. A bad key here
+// fails at awg-quick instead, which drops awgo-N every 10s and says nothing.
+func checkOutboundHeaderProtectionKey(o *model.AwgOutbound) error {
+	var s struct {
+		HeaderProtectionKey string `json:"headerProtectionKey"`
+	}
+	if json.Unmarshal([]byte(o.Settings), &s) != nil {
+		return nil
+	}
+	return validateAwgHeaderProtectionKey(s.HeaderProtectionKey)
+}
+
 // AddOutbound persists a new AWG outbound row. If Settings is empty, fills in
 // a default keypair via defaultAwgOutboundSettings. Tag uniqueness is enforced.
 // When the operator supplied a non-empty Tag it is kept; otherwise the Tag is
@@ -152,6 +193,12 @@ func (s *AwgOutboundService) AddOutbound(o *model.AwgOutbound) (*model.AwgOutbou
 	}
 	if strings.TrimSpace(o.Settings) == "" {
 		o.Settings = defaultAwgOutboundSettings()
+	}
+	if err := checkOutboundIFields(o); err != nil {
+		return nil, err
+	}
+	if err := checkOutboundHeaderProtectionKey(o); err != nil {
+		return nil, err
 	}
 	if err := s.checkSubnetConflict(o); err != nil {
 		return nil, err
@@ -182,6 +229,12 @@ func (s *AwgOutboundService) DelOutbound(id int) error {
 
 func (s *AwgOutboundService) UpdateOutbound(o *model.AwgOutbound) error {
 	if err := checkTagUnique(o.Tag, o.Id, 0); err != nil {
+		return err
+	}
+	if err := checkOutboundIFields(o); err != nil {
+		return err
+	}
+	if err := checkOutboundHeaderProtectionKey(o); err != nil {
 		return err
 	}
 	if err := s.checkSubnetConflict(o); err != nil {

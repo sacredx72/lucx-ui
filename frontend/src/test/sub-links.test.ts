@@ -1,19 +1,22 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildSubLinks } from '@/lib/sub/links';
+import { buildSubLinks, withAwgInboundId } from '@/lib/sub/links';
 
 describe('buildSubLinks', () => {
   it('builds all enabled formats', () => {
-    const L = buildSubLinks({
-      enable: true,
-      subURI: 'https://h/sub/',
-      subJsonEnable: true,
-      subJsonURI: 'https://h/json/',
-      subClashEnable: true,
-      subClashURI: 'https://h/clash/',
-      subAwgEnable: true,
-      subAwgURI: 'https://h/awg/',
-    }, 'abc');
+    const L = buildSubLinks(
+      {
+        enable: true,
+        subURI: 'https://h/sub/',
+        subJsonEnable: true,
+        subJsonURI: 'https://h/json/',
+        subClashEnable: true,
+        subClashURI: 'https://h/clash/',
+        subAwgEnable: true,
+        subAwgURI: 'https://h/awg/',
+      },
+      'abc',
+    );
     expect(L.sub).toBe('https://h/sub/abc');
     expect(L.json).toBe('https://h/json/abc');
     expect(L.clash).toBe('https://h/clash/abc');
@@ -22,14 +25,31 @@ describe('buildSubLinks', () => {
   });
 
   it('omits disabled formats', () => {
-    const L = buildSubLinks({
-      enable: true,
-      subURI: 'https://h/sub/',
-      subAwgEnable: false,
-      subAwgURI: 'https://h/awg/',
-    }, 'x');
+    const L = buildSubLinks(
+      {
+        enable: true,
+        subURI: 'https://h/sub/',
+        subAwgEnable: false,
+        subAwgURI: 'https://h/awg/',
+      },
+      'x',
+    );
     expect(L.sub).toBe('https://h/sub/x');
     expect(L.amnezia).toBe('');
     expect(L.amneziaVpn).toBe('');
+  });
+});
+
+describe('withAwgInboundId', () => {
+  it('appends inboundId to a vpn url', () => {
+    expect(withAwgInboundId('https://h/awg/abc?format=vpn', 4)).toBe(
+      'https://h/awg/abc?format=vpn&inboundId=4',
+    );
+  });
+
+  it('skips non-positive ids', () => {
+    expect(withAwgInboundId('https://h/awg/abc?format=vpn', 0)).toBe(
+      'https://h/awg/abc?format=vpn',
+    );
   });
 });

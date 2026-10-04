@@ -30,18 +30,20 @@ import { propagateOutboundTagRename } from './basics/helpers';
 import { RoutingTab } from './routing';
 import { OutboundsTab } from './outbounds';
 import { BalancersTab } from './balancers';
-import { cleanupOrphanedBalancerLoopbacks, ensureMissingBalancerLoopbacks, detectBalancerCycles } from './balancers/balancer-loopback';
+import {
+  cleanupOrphanedBalancerLoopbacks,
+  ensureMissingBalancerLoopbacks,
+  detectBalancerCycles,
+} from './balancers/balancer-loopback';
 import { DnsTab } from './dns';
-import { WarpModal, NordModal } from './overrides';
+import { WarpModal, NordModal, PiaModal } from './overrides';
 // LUCX-HOOK: AWG outbound — client-mode AmneziaWG egress tab.
 import { AwgOutboundsTab } from './awg-outbounds/AwgOutboundsTab';
 import { SidecarOutboundsTab } from './sidecar-outbounds/SidecarOutboundsTab';
 // END LUCX-HOOK
 import './XrayPage.css';
 
-// LUCX-HOOK: AWG outbound — add the 'awg-outbound' section slug after 'outbound'.
-const SECTION_SLUGS = ['basic', 'routing', 'outbound', 'awg-outbound', 'sidecar-outbound', 'balancer', 'dns', 'advanced'];
-// END LUCX-HOOK
+const SECTION_SLUGS = ['basic', 'routing', 'outbound', 'balancer', 'dns', 'advanced'];
 
 type AdvKey = 'xraySetting' | 'inboundSettings' | 'outboundSettings' | 'routingRuleSettings';
 
@@ -50,7 +52,9 @@ export default function XrayPage() {
   const { isDark, isUltra, antdThemeConfig } = useTheme();
   const { isMobile } = useMediaQuery();
   const [messageApi, messageContextHolder] = message.useMessage();
-  useEffect(() => { setMessageInstance(messageApi); }, [messageApi]);
+  useEffect(() => {
+    setMessageInstance(messageApi);
+  }, [messageApi]);
   const xs = useXraySetting();
   const {
     fetched,
@@ -86,11 +90,19 @@ export default function XrayPage() {
 
   const [warpOpen, setWarpOpen] = useState(false);
   const [nordOpen, setNordOpen] = useState(false);
+  const [piaOpen, setPiaOpen] = useState(false);
   const [advSettings, setAdvSettings] = useState<AdvKey>('xraySetting');
   const location = useLocation();
   const navigate = useNavigate();
-  const pathSection = location.pathname === '/outbound' ? 'outbound' : location.pathname === '/routing' ? 'routing' : '';
-  const sectionSlug = pathSection || location.hash.replace(/^#/, '');
+  const pathSection =
+    location.pathname === '/outbound'
+      ? 'outbound'
+      : location.pathname === '/routing'
+        ? 'routing'
+        : '';
+  const rawSlug = pathSection || location.hash.replace(/^#/, '');
+  const sectionSlug =
+    rawSlug === 'awg-outbound' || rawSlug === 'sidecar-outbound' ? 'outbound' : rawSlug;
   const activeSection = SECTION_SLUGS.includes(sectionSlug) ? sectionSlug : 'basic';
 
   const mutate = useCallback(
@@ -121,7 +133,12 @@ export default function XrayPage() {
       tt.outbounds.push(outbound as never);
     });
   }
-  function onResetOutbound(payload: { index: number; outbound: Record<string, unknown>; oldTag?: string; newTag?: string }) {
+  function onResetOutbound(payload: {
+    index: number;
+    outbound: Record<string, unknown>;
+    oldTag?: string;
+    newTag?: string;
+  }) {
     mutate((tt) => {
       if (!tt.outbounds || payload.index < 0) return;
       tt.outbounds[payload.index] = payload.outbound as never;
@@ -137,29 +154,20 @@ export default function XrayPage() {
       if (idx >= 0) tt.outbounds.splice(idx, 1);
     });
   }
-  function onRemoveOutboundByIndex(index: number) {
-    mutate((tt) => {
-      if (tt.outbounds && index >= 0) tt.outbounds.splice(index, 1);
-    });
-  }
-  function onRemoveRoutingRules(payload: { prefix: string }) {
-    mutate((tt) => {
-      const rules = tt.routing?.rules;
-      if (!Array.isArray(rules)) return;
-      tt.routing!.rules = rules.filter((r) => !r?.outboundTag?.startsWith?.(payload.prefix));
-    });
-  }
-
   const advancedText = useMemo(() => {
     if (advSettings === 'xraySetting') return xraySetting;
     const tpl = templateSettings;
     if (!tpl) return '';
     try {
       switch (advSettings) {
-        case 'inboundSettings': return JSON.stringify(tpl.inbounds || [], null, 2);
-        case 'outboundSettings': return JSON.stringify(tpl.outbounds || [], null, 2);
-        case 'routingRuleSettings': return JSON.stringify(tpl.routing?.rules || [], null, 2);
-        default: return '';
+        case 'inboundSettings':
+          return JSON.stringify(tpl.inbounds || [], null, 2);
+        case 'outboundSettings':
+          return JSON.stringify(tpl.outbounds || [], null, 2);
+        case 'routingRuleSettings':
+          return JSON.stringify(tpl.routing?.rules || [], null, 2);
+        default:
+          return '';
       }
     } catch {
       return '';
@@ -240,38 +248,37 @@ export default function XrayPage() {
         );
       case 'outbound':
         return (
-          <OutboundsTab
-            templateSettings={templateSettings}
-            setTemplateSettings={setTemplateSettings}
-            outboundsTraffic={outboundsTraffic}
-            outboundTestStates={outboundTestStates}
-            subscriptionTestStates={subscriptionTestStates}
-            testingAll={testingAll}
-            inboundTags={inboundTags}
-            subscriptionOutbounds={subscriptionOutbounds}
-            subscriptionOutboundTags={subscriptionOutboundTags}
-            isMobile={isMobile}
-            onResetTraffic={resetOutboundsTraffic}
-            onTest={onTestOutbound}
-            onTestSubscription={onTestSubscription}
-            onTestAll={testAllOutbounds}
-            onShowWarp={() => setWarpOpen(true)}
-            onShowNord={() => setNordOpen(true)}
-            onRefreshXrayData={fetchAll}
-          />
-        );
-      // LUCX-HOOK: sidecar outbounds — AWG kernel + naive/mieru/TrustTunnel SOCKS.
-      case 'awg-outbound':
-      case 'sidecar-outbound':
-        return (
           <>
-            <AwgOutboundsTab />
+            <OutboundsTab
+              templateSettings={templateSettings}
+              setTemplateSettings={setTemplateSettings}
+              outboundsTraffic={outboundsTraffic}
+              outboundTestStates={outboundTestStates}
+              subscriptionTestStates={subscriptionTestStates}
+              testingAll={testingAll}
+              inboundTags={inboundTags}
+              subscriptionOutbounds={subscriptionOutbounds}
+              subscriptionOutboundTags={subscriptionOutboundTags}
+              isMobile={isMobile}
+              onResetTraffic={resetOutboundsTraffic}
+              onTest={onTestOutbound}
+              onTestSubscription={onTestSubscription}
+              onTestAll={testAllOutbounds}
+              onShowWarp={() => setWarpOpen(true)}
+              onShowNord={() => setNordOpen(true)}
+              onShowPia={() => setPiaOpen(true)}
+              onRefreshXrayData={fetchAll}
+            />
+            {/* LUCX-HOOK: kernel AWG + naive/mieru/TrustTunnel sit with Xray outbounds. */}
+            <div style={{ marginTop: 24 }}>
+              <AwgOutboundsTab />
+            </div>
             <div style={{ marginTop: 24 }}>
               <SidecarOutboundsTab />
             </div>
+            {/* END LUCX-HOOK */}
           </>
         );
-      // END LUCX-HOOK
       case 'balancer':
         return (
           <BalancersTab
@@ -287,10 +294,7 @@ export default function XrayPage() {
         );
       case 'dns':
         return (
-          <DnsTab
-            templateSettings={templateSettings}
-            setTemplateSettings={setTemplateSettings}
-          />
+          <DnsTab templateSettings={templateSettings} setTemplateSettings={setTemplateSettings} />
         );
       case 'advanced':
         return (
@@ -340,7 +344,12 @@ export default function XrayPage() {
 
         <Layout className="content-shell">
           <Layout.Content id="content-layout" className="content-area">
-            <Spin spinning={spinning || !fetched} delay={200} description={t('loading')} size="large">
+            <Spin
+              spinning={spinning || !fetched}
+              delay={200}
+              description={t('loading')}
+              size="large"
+            >
               {!fetched ? (
                 <div className="loading-spacer" />
               ) : fetchError ? (
@@ -348,7 +357,11 @@ export default function XrayPage() {
                   status="error"
                   title={t('somethingWentWrong')}
                   subTitle={fetchError}
-                  extra={<Button type="primary" onClick={fetchAll}>{t('check')}</Button>}
+                  extra={
+                    <Button type="primary" onClick={fetchAll}>
+                      {t('check')}
+                    </Button>
+                  }
                 />
               ) : (
                 <Row gutter={[isMobile ? 8 : 16, isMobile ? 0 : 12]}>
@@ -371,9 +384,7 @@ export default function XrayPage() {
                   </Col>
 
                   <Col span={24}>
-                    <Card hoverable>
-                      {sectionBody}
-                    </Card>
+                    <Card hoverable>{sectionBody}</Card>
                   </Col>
                 </Row>
               )}
@@ -395,8 +406,13 @@ export default function XrayPage() {
           onClose={() => setNordOpen(false)}
           onAddOutbound={onAddOutbound}
           onResetOutbound={onResetOutbound}
-          onRemoveOutbound={onRemoveOutboundByIndex}
-          onRemoveRoutingRules={onRemoveRoutingRules}
+        />
+        <PiaModal
+          open={piaOpen}
+          templateSettings={templateSettings}
+          onClose={() => setPiaOpen(false)}
+          onAddOutbound={onAddOutbound}
+          onResetOutbound={onResetOutbound}
         />
       </Layout>
     </ConfigProvider>

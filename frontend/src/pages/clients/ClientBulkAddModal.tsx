@@ -1,6 +1,18 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AutoComplete, Button, Form, Input, InputNumber, Modal, Select, Space, Switch, Tooltip, message } from 'antd';
+import {
+  AutoComplete,
+  Button,
+  Form,
+  Input,
+  InputNumber,
+  Modal,
+  Select,
+  Space,
+  Switch,
+  Tooltip,
+  message,
+} from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 import dayjs from 'dayjs';
 import type { Dayjs } from 'dayjs';
@@ -8,17 +20,36 @@ import { FormProvider, useForm, useWatch } from 'react-hook-form';
 
 import { RandomUtil, SizeFormatter } from '@/utils';
 import { formatInboundLabel } from '@/lib/inbounds/label';
-import { TLS_FLOW_CONTROL } from '@/schemas/primitives';
+import { TLS_FLOW_CONTROL, TRAFFIC_RESETS } from '@/schemas/primitives';
 import { DateTimePicker, SelectAllClearButtons } from '@/components/form';
 import { FormField } from '@/components/form/rhf';
 import { useClients, type InboundOption } from '@/hooks/useClients';
 import { useFail2banStatusQuery, getLimitIpNotice } from '@/api/queries/useFail2banStatusQuery';
+import ClientRenewalFields from './ClientRenewalFields';
 import { ClientBulkAddFormSchema, type ClientBulkAddFormValues } from '@/schemas/client';
 
 const FLOW_OPTIONS = Object.values(TLS_FLOW_CONTROL);
 
 const MULTI_CLIENT_PROTOCOLS = new Set([
-  'shadowsocks', 'vless', 'vmess', 'trojan', 'hysteria', 'wireguard', 'awg', 'naive', 'mieru', 'trusttunnel', 'qwdtt', 'olcrtc',
+  'shadowsocks',
+  'vless',
+  'vmess',
+  'trojan',
+  'hysteria',
+  'wireguard',
+  'amneziawg',
+  'tuic',
+  'awg',
+  'naive',
+  'mieru',
+  'trusttunnel',
+  'qwdtt',
+  'csqtt',
+  'olcrtc',
+  'anytls',
+  'tproxy',
+  'cover',
+  'gateway',
 ]);
 
 const EMPTY: ClientBulkAddFormValues = {
@@ -33,9 +64,15 @@ const EMPTY: ClientBulkAddFormValues = {
   comment: '',
   flow: '',
   limitIp: 0,
+  limitHwid: 0,
   totalGB: 0,
   expiryTime: 0,
   reset: 0,
+  resetDay: 0,
+  resetWeekday: 0,
+  resetMax: 0,
+  trafficReset: 'never' as const,
+  trafficResetDay: 1,
   inboundIds: [],
 };
 
@@ -62,23 +99,25 @@ export default function ClientBulkAddModal({
   const inboundIds = useWatch({ control: methods.control, name: 'inboundIds' });
   const emailMethod = useWatch({ control: methods.control, name: 'emailMethod' });
   const firstNum = useWatch({ control: methods.control, name: 'firstNum' });
-  const flow = useWatch({ control: methods.control, name: 'flow' });
   const expiryTime = useWatch({ control: methods.control, name: 'expiryTime' });
   const subId = useWatch({ control: methods.control, name: 'subId' });
   const limitIp = useWatch({ control: methods.control, name: 'limitIp' });
+  const trafficReset = useWatch({ control: methods.control, name: 'trafficReset' });
+  const flow = useWatch({ control: methods.control, name: 'flow' });
   const [delayedStart, setDelayedStart] = useState(false);
   const [saving, setSaving] = useState(false);
   const fail2ban = useFail2banStatusQuery();
   const limitIpDisabled = !fail2ban.usable;
   const limitIpNotice = getLimitIpNotice(fail2ban, t);
 
-  useEffect(() => {
-    if (!open) return;
-
-    methods.reset(EMPTY);
-    setDelayedStart(false);
-
-  }, [open, methods]);
+  const [wasOpen, setWasOpen] = useState(false);
+  if (open !== wasOpen) {
+    setWasOpen(open);
+    if (open) {
+      methods.reset(EMPTY);
+      setDelayedStart(false);
+    }
+  }
 
   const flowCapableIds = useMemo(() => {
     const ids = new Set<number>();
@@ -104,18 +143,18 @@ export default function ClientBulkAddModal({
 
   useEffect(() => {
     if (!showFlow && flow) {
-
       methods.setValue('flow', '');
     }
   }, [showFlow, flow, methods]);
 
   const inboundOptions = useMemo(
-    () => (inbounds || [])
-      .filter((ib) => MULTI_CLIENT_PROTOCOLS.has(ib.protocol || ''))
-      .map((ib) => ({
-        label: formatInboundLabel(ib.tag, ib.remark),
-        value: ib.id,
-      })),
+    () =>
+      (inbounds || [])
+        .filter((ib) => MULTI_CLIENT_PROTOCOLS.has(ib.protocol || ''))
+        .map((ib) => ({
+          label: formatInboundLabel(ib.tag, ib.remark),
+          value: ib.id,
+        })),
     [inbounds],
   );
 
@@ -171,11 +210,17 @@ export default function ClientBulkAddModal({
             ? RandomUtil.randomShadowsocksPassword(ss2022Method)
             : RandomUtil.randomLowerAndNum(16),
           auth: RandomUtil.randomLowerAndNum(16),
-          flow: showFlow ? (current.flow || '') : '',
+          flow: showFlow ? current.flow || '' : '',
           totalGB: Math.round((current.totalGB || 0) * SizeFormatter.ONE_GB),
           expiryTime: current.expiryTime,
           reset: Number(current.reset) || 0,
+          resetDay: Number(current.resetDay) || 0,
+          resetWeekday: Number(current.resetWeekday) || 0,
+          resetMax: Number(current.resetMax) || 0,
+          trafficReset: current.trafficReset || 'never',
+          trafficResetDay: Number(current.trafficResetDay) || 1,
           limitIp: Number(current.limitIp) || 0,
+          limitHwid: Number(current.limitHwid) || 0,
           group: current.group,
           comment: current.comment,
           enable: true,
@@ -190,9 +235,11 @@ export default function ClientBulkAddModal({
       if (failed === 0 && msg?.success) {
         messageApi.success(t('pages.clients.toasts.bulkCreated', { count: ok }));
       } else {
-        messageApi.warning(firstError
-          ? `${t('pages.clients.toasts.bulkCreatedMixed', { ok, failed })} — ${firstError}`
-          : t('pages.clients.toasts.bulkCreatedMixed', { ok, failed }));
+        messageApi.warning(
+          firstError
+            ? `${t('pages.clients.toasts.bulkCreatedMixed', { ok, failed })} — ${firstError}`
+            : t('pages.clients.toasts.bulkCreatedMixed', { ok, failed }),
+        );
       }
       onSaved?.();
       onOpenChange(false);
@@ -230,7 +277,8 @@ export default function ClientBulkAddModal({
                 options={inboundOptions}
                 placeholder={t('pages.clients.selectInbound')}
                 showSearch={{
-                  filterOption: (input, option) => ((option?.label as string) || '').toLowerCase().includes(input.toLowerCase()),
+                  filterOption: (input, option) =>
+                    ((option?.label as string) || '').toLowerCase().includes(input.toLowerCase()),
                 }}
               />
             </Form.Item>
@@ -249,10 +297,18 @@ export default function ClientBulkAddModal({
 
             {emailMethod > 1 && (
               <>
-                <FormField name="firstNum" label={t('pages.clients.first')} transform={{ output: (v) => Number(v) || 1 }}>
+                <FormField
+                  name="firstNum"
+                  label={t('pages.clients.first')}
+                  transform={{ output: (v) => Number(v) || 1 }}
+                >
                   <InputNumber min={1} />
                 </FormField>
-                <FormField name="lastNum" label={t('pages.clients.last')} transform={{ output: (v) => Number(v) || 1 }}>
+                <FormField
+                  name="lastNum"
+                  label={t('pages.clients.last')}
+                  transform={{ output: (v) => Number(v) || 1 }}
+                >
                   <InputNumber min={firstNum} />
                 </FormField>
               </>
@@ -268,7 +324,11 @@ export default function ClientBulkAddModal({
               </FormField>
             )}
             {emailMethod < 2 && (
-              <FormField name="quantity" label={t('pages.clients.clientCount')} transform={{ output: (v) => Number(v) || 1 }}>
+              <FormField
+                name="quantity"
+                label={t('pages.clients.clientCount')}
+                transform={{ output: (v) => Number(v) || 1 }}
+              >
                 <InputNumber min={1} max={1000} />
               </FormField>
             )}
@@ -301,6 +361,15 @@ export default function ClientBulkAddModal({
               />
             </FormField>
 
+            <FormField
+              name="limitHwid"
+              label={t('pages.clients.limitHwid')}
+              tooltip={t('pages.clients.limitHwidDesc')}
+              transform={{ output: (v) => Number(v) || 0 }}
+            >
+              <InputNumber min={0} />
+            </FormField>
+
             <FormField name="comment" label={t('comment')}>
               <Input />
             </FormField>
@@ -320,21 +389,33 @@ export default function ClientBulkAddModal({
             <Form.Item label={t('pages.clients.limitIp')}>
               <Tooltip title={limitIpNotice || undefined}>
                 <span style={{ display: 'inline-flex' }}>
-                  <InputNumber value={limitIp} min={0} disabled={limitIpDisabled}
+                  <InputNumber
+                    value={limitIp}
+                    min={0}
+                    disabled={limitIpDisabled}
                     style={limitIpDisabled ? { pointerEvents: 'none' } : undefined}
-                    onChange={(v) => methods.setValue('limitIp', Number(v) || 0)} />
+                    onChange={(v) => methods.setValue('limitIp', Number(v) || 0)}
+                  />
                 </span>
               </Tooltip>
             </Form.Item>
 
-            <FormField name="totalGB" label={t('pages.clients.totalGB')} transform={{ output: (v) => Number(v) || 0 }}>
+            <FormField
+              name="totalGB"
+              label={t('pages.clients.totalGB')}
+              tooltip={t('pages.clients.totalGBDesc')}
+              transform={{ output: (v) => Number(v) || 0 }}
+            >
               <InputNumber min={0} step={1} />
             </FormField>
 
             <Form.Item label={t('pages.clients.delayedStart')}>
               <Switch
                 checked={delayedStart}
-                onClick={() => { setDelayedStart(!delayedStart); methods.setValue('expiryTime', 0); }}
+                onClick={() => {
+                  setDelayedStart(!delayedStart);
+                  methods.setValue('expiryTime', 0);
+                }}
               />
             </Form.Item>
 
@@ -355,14 +436,32 @@ export default function ClientBulkAddModal({
               </Form.Item>
             )}
 
-            <FormField
-              name="reset"
-              label={t('pages.clients.renew')}
-              tooltip={t('pages.clients.renewDesc')}
-              transform={{ output: (v) => Number(v) || 0 }}
-            >
-              <InputNumber min={0} />
+            <ClientRenewalFields
+              active={open}
+              delayedStart={delayedStart}
+              expiryTime={expiryTime}
+              bulk
+              setExpiry={(expiry) => methods.setValue('expiryTime', expiry)}
+            />
+
+            <FormField name="trafficReset" label={t('pages.inbounds.periodicTrafficResetTitle')}>
+              <Select
+                options={TRAFFIC_RESETS.map((r) => ({
+                  value: r,
+                  label: t(`pages.inbounds.periodicTrafficReset.${r}`),
+                }))}
+              />
             </FormField>
+
+            {trafficReset === 'monthly' && (
+              <FormField
+                name="trafficResetDay"
+                label={t('pages.inbounds.periodicTrafficResetDay')}
+                transform={{ output: (v) => Number(v) || 1 }}
+              >
+                <InputNumber min={1} max={31} />
+              </FormField>
+            )}
           </Form>
         </FormProvider>
       </Modal>

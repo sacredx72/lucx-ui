@@ -5,13 +5,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
+	"runtime/debug"
+	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
+	"github.com/mhsanaei/3x-ui/v3/internal/logger"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/common"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/random"
 	"github.com/mhsanaei/3x-ui/v3/internal/xray"
@@ -21,7 +28,7 @@ import (
 
 func hasForbiddenClientChar(s string) bool {
 	for _, r := range s {
-		if r == '/' || r == '\\' || r == ' ' || r < 0x20 || r == 0x7f {
+		if r == '/' || r == '\\' || r < 0x20 || r == 0x7f || unicode.IsSpace(r) {
 			return true
 		}
 	}
@@ -42,6 +49,102 @@ func validateClientSubID(subID string) error {
 	return nil
 }
 
+// Rejected rather than coerced: an unknown cycle would leave the operator with
+// a field that reads as configured while no job ever selects the client.
+func validateClientTrafficReset(period string, day int) error {
+	switch period {
+	case "", "never", "hourly", "daily", "weekly", "monthly":
+	default:
+		return common.NewError("client trafficReset must be never, hourly, daily, weekly or monthly, got:", period)
+	}
+	if day < 0 || day > 31 {
+		return common.NewError("client trafficResetDay must be between 0 and 31, got:", day)
+	}
+	return nil
+}
+
+// Rejected rather than clamped: nextCalendarRenewal would silently move an
+// out-of-range day, and a negative one drops out of the renewal query entirely.
+func validateClientResetDay(day int) error {
+	if day < 0 || day > 31 {
+		return common.NewError("client resetDay must be between 0 and 31, got:", day)
+	}
+	return nil
+}
+
+// Rejected rather than coerced: a negative cap reads as "unlimited" to a caller
+// but selects nothing, so the client would silently stop renewing.
+func validateClientResetMax(resetMax int) error {
+	if resetMax < 0 {
+		return common.NewError("client resetMax must not be negative, got:", resetMax)
+	}
+	return nil
+}
+
+func validateClientRenewal(client model.Client) error {
+	if err := validateClientResetDay(client.ResetDay); err != nil {
+		return err
+	}
+	if client.ResetWeekday < 0 || client.ResetWeekday > 7 {
+		return common.NewError("client resetWeekday must be between 0 and 7, got:", client.ResetWeekday)
+	}
+	if client.ResetWeekday > 0 && (client.Reset > 0 || client.ResetDay > 0) {
+		return common.NewError("client weekly renewal cannot be combined with reset or resetDay")
+	}
+	return nil
+}
+
+func validateClientsRenewal(clients []model.Client) error {
+	for _, client := range clients {
+		if err := validateClientRenewal(client); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// normalizeClientTrafficReset stores what the inbound path would store, so the
+// day never reaches the DB as a 0 that three layers downstream each clamp to 1.
+func normalizeClientTrafficReset(c *model.Client) {
+	if c.TrafficReset == "" {
+		c.TrafficReset = "never"
+	}
+	c.TrafficResetDay = normalizeTrafficResetDay(c.TrafficResetDay)
+}
+
+// ClientResetCycle is the slice of a client the reset job needs: enough to know
+// whether it is due, and whether its disable is the quota's doing or the operator's.
+type ClientResetCycle struct {
+	Email           string
+	TrafficResetDay int
+	Enable          bool
+	Total           int64
+	Used            int64
+}
+
+// Depleted reports a client the quota switched off. A reset restores that one;
+// a client disabled below its quota was switched off by hand and stays off.
+func (c ClientResetCycle) Depleted() bool {
+	return c.Total > 0 && c.Used >= c.Total
+}
+
+// GetClientsByTrafficReset returns the clients whose own reset cycle matches the
+// period, independent of the cycle configured on the inbounds they belong to.
+func (s *ClientService) GetClientsByTrafficReset(period string) ([]ClientResetCycle, error) {
+	var cycles []ClientResetCycle
+	err := database.GetDB().Table("clients c").
+		Select("c.email, c.traffic_reset_day, c.enable, COALESCE(ct.total, 0) AS total, COALESCE(ct.up, 0) + COALESCE(ct.down, 0) AS used").
+		Joins("LEFT JOIN client_traffics ct ON ct.email = c.email").
+		Where("c.traffic_reset = ?", period).
+		Scan(&cycles).Error
+	if err != nil {
+		return nil, err
+	}
+	return cycles, nil
+}
+
+// Create applies the client to every requested inbound: one failing inbound no
+// longer aborts the others, so the error can name several and needRestart holds.
 func (s *ClientService) Create(inboundSvc *InboundService, payload *ClientCreatePayload) (bool, error) {
 	if payload == nil {
 		return false, common.NewError("empty payload")
@@ -56,6 +159,16 @@ func (s *ClientService) Create(inboundSvc *InboundService, payload *ClientCreate
 	if err := validateClientSubID(client.SubID); err != nil {
 		return false, err
 	}
+	if err := validateClientRenewal(client); err != nil {
+		return false, err
+	}
+	if err := validateClientResetMax(client.ResetMax); err != nil {
+		return false, err
+	}
+	if err := validateClientTrafficReset(client.TrafficReset, client.TrafficResetDay); err != nil {
+		return false, err
+	}
+	normalizeClientTrafficReset(&client)
 	if len(payload.InboundIds) == 0 {
 		return false, common.NewError("at least one inbound is required")
 	}
@@ -63,9 +176,7 @@ func (s *ClientService) Create(inboundSvc *InboundService, payload *ClientCreate
 	if client.SubID == "" {
 		client.SubID = uuid.NewString()
 	}
-	if !client.Enable {
-		client.Enable = true
-	}
+	// Enable: omit defaults true via ClientCreatePayload.UnmarshalJSON; explicit false kept.
 	now := time.Now().UnixMilli()
 	if client.CreatedAt == 0 {
 		client.CreatedAt = now
@@ -96,6 +207,18 @@ func (s *ClientService) Create(inboundSvc *InboundService, payload *ClientCreate
 		if client.Secret == "" {
 			client.Secret = existing.Secret
 		}
+		// LUCX-HOOK: one identity attaches to many AWG/WG inbounds, so a re-add
+		// that mints a fresh keypair or PSK desyncs every peer already deployed.
+		if client.PrivateKey == "" {
+			client.PrivateKey = existing.PrivateKey
+		}
+		if client.PublicKey == "" {
+			client.PublicKey = existing.PublicKey
+		}
+		if client.PreSharedKey == "" {
+			client.PreSharedKey = existing.PreSharedKey
+		}
+		// END LUCX-HOOK
 	}
 
 	if client.SubID != "" {
@@ -110,56 +233,208 @@ func (s *ClientService) Create(inboundSvc *InboundService, payload *ClientCreate
 		}
 	}
 
-	emailSubIDs, sidErr := inboundSvc.getAllEmailSubIDs()
-	if sidErr != nil {
-		return false, sidErr
-	}
-
-	needRestart := false
+	// Prepared before any inbound is written: fillProtocolDefaults mints the
+	// shared credentials on the first inbound and every later one reuses them.
 	createTargets := make([]*model.Inbound, 0, len(payload.InboundIds))
 	for _, ibId := range payload.InboundIds {
 		inbound, getErr := inboundSvc.GetInbound(ibId)
 		if getErr != nil {
-			return needRestart, getErr
+			return false, fmt.Errorf("inbound %d: %w", ibId, getErr)
+		}
+		if err := s.fillProtocolDefaults(&client, inbound); err != nil {
+			return false, fmt.Errorf("inbound %d: %w", ibId, err)
 		}
 		createTargets = append(createTargets, inbound)
 	}
+	// LUCX-HOOK: one identity, one keypair — minting inside the loop hands
+	// every tunnel inbound a different pair, and the subscription matches one.
+	if err := mintTunnelKeypairOnce(&client, hasTunnelInbound(createTargets)); err != nil {
+		return false, err
+	}
 	tunnelN := countAwgOrWireguard(createTargets)
+	adds := make([]*model.Inbound, 0, len(createTargets))
 	for _, inbound := range createTargets {
 		per := client
-		// LUCX-HOOK: AWG/WG tunnel IPs are per-inbound. Multi-attach must not
-		// reuse one AllowedIPs across different subnets. A single target keeps
-		// the operator-typed IP (Vlad: dummy clients just to skip addresses).
 		clearBroadcastTunnelIP(&per, inbound.Protocol, tunnelN)
-		// END LUCX-HOOK
-		if err := s.fillProtocolDefaults(&per, inbound); err != nil {
-			return needRestart, err
-		}
-		if per.PrivateKey != "" {
-			client.PrivateKey = per.PrivateKey
-		}
-		if per.PublicKey != "" {
-			client.PublicKey = per.PublicKey
-		}
-		if per.PreSharedKey != "" {
-			client.PreSharedKey = per.PreSharedKey
+		clearForeignTunnelFields(&per, inbound.Protocol)
+		if ips, ok := client.AllowedIPsByInbound[inbound.Id]; ok {
+			per.AllowedIPs = ips
+		} else if !addressesFitAmneziaWGInbound(per.AllowedIPs, inbound) {
+			per.AllowedIPs = nil
 		}
 		settingsPayload, mErr := json.Marshal(map[string][]model.Client{"clients": {clientWithInboundFlow(per, inbound)}})
 		if mErr != nil {
-			return needRestart, mErr
+			return false, fmt.Errorf("inbound %d: %w", inbound.Id, mErr)
 		}
-		nr, addErr := s.addInboundClient(inboundSvc, &model.Inbound{
-			Id:       inbound.Id,
-			Settings: string(settingsPayload),
-		}, emailSubIDs)
-		if addErr != nil {
-			return needRestart, addErr
-		}
-		if nr {
-			needRestart = true
+		adds = append(adds, &model.Inbound{Id: inbound.Id, Settings: string(settingsPayload)})
+	}
+	needRestart, fanoutErr := s.fanoutInboundClientAdds(inboundSvc, adds)
+	if fanoutErr != nil {
+		// Never on a failed create: this retrims the devices of an email that
+		// already existed, and a create the panel reported as failed must not.
+		return needRestart, fanoutErr
+	}
+	// A re-created email is a live identity again: a delete tombstone left
+	// standing makes the next node merge prune the new client's inbound links.
+	withdrawClientTombstones(client.Email)
+	if err := s.setClientLimitHwidByEmail(client.Email, payload.LimitHwid); err != nil {
+		return needRestart, err
+	}
+	if rec, recErr := s.GetRecordByEmail(nil, client.Email); recErr == nil {
+		if err := s.persistIntendedFlow(rec.Id, client.Flow); err != nil {
+			return needRestart, err
 		}
 	}
 	return needRestart, nil
+}
+
+func (s *ClientService) persistIntendedFlow(id int, flow string) error {
+	return database.GetDB().Model(&model.ClientRecord{}).
+		Where("id = ?", id).
+		UpdateColumn("flow", flow).Error
+}
+
+// inboundFanoutConcurrency caps how many inbounds one client op applies at
+// once, so a client spanning many of them can't start an unbounded RPC burst.
+const inboundFanoutConcurrency = 4
+
+// inboundApply is one inbound's share of a client op, ready to run.
+type inboundApply struct {
+	id  int
+	run func() (bool, error)
+}
+
+// fanoutInboundApplies runs the applies with the node pushes overlapping, so a
+// client spanning several nodes no longer costs one RPC round-trip per node.
+func fanoutInboundApplies(applies []inboundApply) (bool, error) {
+	var needRestart atomic.Bool
+	errs := make([]error, len(applies))
+	sem := make(chan struct{}, inboundFanoutConcurrency)
+	var wg sync.WaitGroup
+	for i := range applies {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			// Off the request goroutine gin's Recovery no longer covers this,
+			// so an unrecovered panic here would take the whole panel down.
+			defer func() {
+				if r := recover(); r != nil {
+					// The apply may already have committed, so ask for the
+					// restart the lost return value can no longer report.
+					needRestart.Store(true)
+					errs[i] = fmt.Errorf("inbound %d: panic: %v", applies[i].id, r)
+					logger.Errorf("panic applying client change to inbound %d: %v\n%s", applies[i].id, r, debug.Stack())
+				}
+			}()
+			nr, err := applies[i].run()
+			if nr {
+				needRestart.Store(true)
+			}
+			if err != nil {
+				errs[i] = fmt.Errorf("inbound %d: %w", applies[i].id, err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	return needRestart.Load(), errors.Join(errs...)
+}
+
+// fanoutInboundClientAdds applies one payload per inbound.
+func (s *ClientService) fanoutInboundClientAdds(inboundSvc *InboundService, adds []*model.Inbound) (bool, error) {
+	applies := make([]inboundApply, 0, len(adds))
+	for _, add := range adds {
+		applies = append(applies, inboundApply{id: add.Id, run: func() (bool, error) {
+			return s.AddInboundClient(inboundSvc, add)
+		}})
+	}
+	return fanoutInboundApplies(applies)
+}
+
+// fanoutInboundResults runs one job per inbound with the node pushes
+// overlapping, so a bulk op costs one RPC round-trip instead of one per node.
+// limit is the caller's own cap: an op that allocates tunnel addresses passes 1,
+// because allocation reads a cross-inbound used-set before it writes.
+func fanoutInboundResults[T any](inboundIds []int, limit int, run func(i int) T) ([]T, []error) {
+	if limit < 1 {
+		limit = 1
+	}
+	out := make([]T, len(inboundIds))
+	errs := make([]error, len(inboundIds))
+	sem := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	for i := range inboundIds {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			// Off the request goroutine gin's Recovery no longer covers this,
+			// so an unrecovered panic here would take the whole panel down.
+			defer func() {
+				if r := recover(); r != nil {
+					errs[i] = fmt.Errorf("inbound %d: panic: %v", inboundIds[i], r)
+					logger.Errorf("panic applying bulk client change to inbound %d: %v\n%s", inboundIds[i], r, debug.Stack())
+				}
+			}()
+			out[i] = run(i)
+		}()
+	}
+	wg.Wait()
+	return out, errs
+}
+
+// addFanoutLimit serializes an add that touches a tunnel inbound. WireGuard and
+// AmneziaWG pick a free peer address by reading every inbound's used-set first,
+// so two overlapping allocations hand out the same one and the second is refused.
+func addFanoutLimit(anyTunnel bool) int {
+	if anyTunnel {
+		return 1
+	}
+	return inboundFanoutConcurrency
+}
+
+// sortedInboundIds gives the fanout a stable order, so which inbound wins a
+// per-email report no longer depends on Go's map iteration order.
+func sortedInboundIds[V any](byInbound map[int]V) []int {
+	ids := make([]int, 0, len(byInbound))
+	for id := range byInbound {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// markInboundNodesDirty makes a half-applied client edit unobservable to a node
+// snapshot merge, which skips a node whose config is already flagged dirty.
+func markInboundNodesDirty(inboundIds []int) error {
+	if len(inboundIds) == 0 {
+		return nil
+	}
+	var nodeIDs []int
+	for _, batch := range chunkInts(inboundIds, sqlInChunk) {
+		var ids []int
+		if err := database.GetDB().Model(&model.Inbound{}).
+			Where("id IN ? AND node_id IS NOT NULL", batch).
+			Distinct().Pluck("node_id", &ids).Error; err != nil {
+			return err
+		}
+		nodeIDs = append(nodeIDs, ids...)
+	}
+	if len(nodeIDs) == 0 {
+		return nil
+	}
+	return runSerializedTx(func(tx *gorm.DB) error {
+		svc := &NodeService{}
+		for _, id := range nodeIDs {
+			if err := svc.MarkNodeDirtyTx(tx, id); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (s *ClientService) fillProtocolDefaults(c *model.Client, ib *model.Inbound) error {
@@ -184,6 +459,17 @@ func (s *ClientService) fillProtocolDefaults(c *model.Client, ib *model.Inbound)
 	case model.MTProto:
 		if c.Secret == "" {
 			c.Secret = model.GenerateFakeTLSSecret(mtprotoDomainFromSettings(ib.Settings))
+		}
+	case model.TUIC:
+		if c.ID == "" {
+			c.ID = uuid.NewString()
+		}
+		if c.Password == "" {
+			c.Password = strings.ReplaceAll(uuid.NewString(), "-", "")
+		}
+	case model.AWG:
+		if err := fillAwgPSK(c); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -212,7 +498,7 @@ func mtprotoDomainFromSettings(settings string) string {
 }
 
 func clientWithInboundFlow(c model.Client, ib *model.Inbound) model.Client {
-	if !inboundCanEnableTlsFlow(string(ib.Protocol), ib.StreamSettings, ib.Settings) {
+	if ib.DisableFlow || !inboundCanEnableTlsFlow(string(ib.Protocol), ib.StreamSettings, ib.Settings) {
 		c.Flow = ""
 	}
 	return c
@@ -328,7 +614,7 @@ func applyShadowsocksClientMethod(clients []any, settings map[string]any) {
 	}
 }
 
-func (s *ClientService) Update(inboundSvc *InboundService, id int, updated model.Client, inboundFilter ...int) (bool, error) {
+func (s *ClientService) Update(inboundSvc *InboundService, id int, updated model.Client, limitHwid int, inboundFilter ...int) (bool, error) {
 	existing, err := s.GetByID(id)
 	if err != nil {
 		return false, err
@@ -337,6 +623,9 @@ func (s *ClientService) Update(inboundSvc *InboundService, id int, updated model
 	if err != nil {
 		return false, err
 	}
+	// The rename rewrites the one shared client record, so every node holding
+	// this client goes stale — not just the ones an inboundIds filter applies.
+	attachedIds := append([]int(nil), inboundIds...)
 	if len(inboundFilter) > 0 {
 		allow := make(map[int]struct{}, len(inboundFilter))
 		for _, fid := range inboundFilter {
@@ -360,6 +649,16 @@ func (s *ClientService) Update(inboundSvc *InboundService, id int, updated model
 	if err := validateClientSubID(updated.SubID); err != nil {
 		return false, err
 	}
+	if err := validateClientRenewal(updated); err != nil {
+		return false, err
+	}
+	if err := validateClientResetMax(updated.ResetMax); err != nil {
+		return false, err
+	}
+	if err := validateClientTrafficReset(updated.TrafficReset, updated.TrafficResetDay); err != nil {
+		return false, err
+	}
+	normalizeClientTrafficReset(&updated)
 	if updated.SubID == "" {
 		updated.SubID = existing.SubID
 	}
@@ -387,6 +686,17 @@ func (s *ClientService) Update(inboundSvc *InboundService, id int, updated model
 	if updated.Secret == "" {
 		updated.Secret = existing.Secret
 	}
+	// LUCX-HOOK: enable toggle (and any partial save) omits keys/PSK.
+	if updated.PrivateKey == "" {
+		updated.PrivateKey = existing.PrivateKey
+	}
+	if updated.PublicKey == "" {
+		updated.PublicKey = existing.PublicKey
+	}
+	if updated.PreSharedKey == "" {
+		updated.PreSharedKey = existing.PreSharedKey
+	}
+	// END LUCX-HOOK
 
 	if updated.Email != existing.Email {
 		var collisionCount int64
@@ -412,8 +722,14 @@ func (s *ClientService) Update(inboundSvc *InboundService, id int, updated model
 		}
 	}
 
-	needRestart := false
-	updateTargets := make([]*model.Inbound, 0, len(inboundIds))
+	tunnelCount, tcErr := tunnelInboundCount(inboundIds)
+	if tcErr != nil {
+		return false, tcErr
+	}
+
+	// Built before any inbound is written, as in Create: fillProtocolDefaults
+	// mints the shared credentials on the first inbound, later ones reuse them.
+	applies := make([]inboundApply, 0, len(inboundIds))
 	for _, ibId := range inboundIds {
 		inbound, getErr := inboundSvc.GetInbound(ibId)
 		if getErr != nil {
@@ -421,51 +737,63 @@ func (s *ClientService) Update(inboundSvc *InboundService, id int, updated model
 				if err := database.GetDB().
 					Where("client_id = ? AND inbound_id = ?", id, ibId).
 					Delete(&model.ClientInbound{}).Error; err != nil {
-					return needRestart, err
+					return false, err
 				}
 				continue
 			}
-			return needRestart, getErr
+			return false, getErr
 		}
-		updateTargets = append(updateTargets, inbound)
-	}
-	tunnelN := countAwgOrWireguard(updateTargets)
-	wroteSettings := false
-	for _, inbound := range updateTargets {
 		if existing.Email == "" {
 			continue
 		}
-		if shareOnlySidecar(inbound.Protocol) {
-			continue
+		if err := s.fillProtocolDefaults(&updated, inbound); err != nil {
+			return false, err
 		}
-		per := updated
-		// LUCX-HOOK: never broadcast one AllowedIPs to every AWG/WG inbound.
-		// One tunnel inbound → keep the typed IP (edit was rolling back).
-		clearBroadcastTunnelIP(&per, inbound.Protocol, tunnelN)
-		// END LUCX-HOOK
-		if err := s.fillProtocolDefaults(&per, inbound); err != nil {
-			return needRestart, err
+		clientForInbound := updated
+		if ips, ok := updated.AllowedIPsByInbound[ibId]; ok {
+			clientForInbound.AllowedIPs = ips
+		} else if tunnelCount > 1 && isTunnelProtocol(inbound.Protocol) {
+			// LUCX-HOOK: never broadcast one AllowedIPs or peer keys across tunnel inbounds.
+			clearBroadcastTunnelIP(&clientForInbound, inbound.Protocol, int(tunnelCount))
+			clientForInbound.PrivateKey = ""
+			clientForInbound.PublicKey = ""
+			clientForInbound.PreSharedKey = ""
+		} else if !addressesFitAmneziaWGInbound(clientForInbound.AllowedIPs, inbound) {
+			// A single shared AllowedIPs field (the common case for a caller
+			// that never sends AllowedIPsByInbound) must never overwrite an
+			// inbound it doesn't belong to -- e.g. a client attached to both
+			// wg and awg saving its wg-labeled address would otherwise get
+			// that same address silently written into the awg peer config
+			// too. Clearing it here makes UpdateInboundClient's own
+			// empty-AllowedIPs carry-forward (see its WireGuard/AmneziaWG
+			// branch) preserve THIS inbound's existing, correct value
+			// instead.
+			clientForInbound.AllowedIPs = nil
 		}
-		settingsPayload, mErr := json.Marshal(map[string][]model.Client{"clients": {clientWithInboundFlow(per, inbound)}})
+		settingsPayload, mErr := json.Marshal(map[string][]model.Client{"clients": {clientWithInboundFlow(clientForInbound, inbound)}})
 		if mErr != nil {
-			return needRestart, mErr
+			return false, mErr
 		}
-		nr, upErr := s.UpdateInboundClient(inboundSvc, &model.Inbound{
-			Id:       inbound.Id,
-			Settings: string(settingsPayload),
-		}, existing.Email)
-		if upErr != nil {
-			return needRestart, upErr
-		}
-		wroteSettings = true
-		if nr {
-			needRestart = true
-		}
+		data := &model.Inbound{Id: ibId, Settings: string(settingsPayload)}
+		applies = append(applies, inboundApply{id: ibId, run: func() (bool, error) {
+			return s.UpdateInboundClient(inboundSvc, data, existing.Email)
+		}})
+	}
+	// Each apply marks only its OWN node dirty, so between the first and last
+	// one a merge could resurrect the pre-edit email as a second client.
+	if err := markInboundNodesDirty(attachedIds); err != nil {
+		return false, err
+	}
+	needRestart, applyErr := fanoutInboundApplies(applies)
+	if applyErr != nil {
+		return needRestart, applyErr
+	}
+	if err := s.persistIntendedFlow(id, updated.Flow); err != nil {
+		return needRestart, err
 	}
 
 	// UpdateInboundClient renames the record atomically with each inbound's
-	// settings JSON; this direct write covers records with no Xray inbound left
-	// (none, or only share-only sidecars like qWDTT/olcRTC).
+	// settings JSON; this direct write only covers records with no inbound left.
 	if updated.Email != existing.Email {
 		if err := database.GetDB().Model(&model.ClientRecord{}).
 			Where("id = ? AND email = ?", id, existing.Email).
@@ -474,7 +802,7 @@ func (s *ClientService) Update(inboundSvc *InboundService, id int, updated model
 		}
 	}
 
-	if !wroteSettings {
+	if len(inboundIds) == 0 {
 		merged := *existing
 		applyClientRecordMerge(&merged, updated.ToRecord())
 		if err := database.GetDB().Model(&model.ClientRecord{}).
@@ -498,6 +826,11 @@ func (s *ClientService) Update(inboundSvc *InboundService, id int, updated model
 				"tg_id":             merged.TgID,
 				"comment":           merged.Comment,
 				"reset":             merged.Reset,
+				"reset_day":         merged.ResetDay,
+				"reset_weekday":     merged.ResetWeekday,
+				"reset_max":         merged.ResetMax,
+				"traffic_reset":     merged.TrafficReset,
+				"traffic_reset_day": merged.TrafficResetDay,
 			}).Error; err != nil {
 			return needRestart, err
 		}
@@ -536,9 +869,25 @@ func (s *ClientService) Update(inboundSvc *InboundService, id int, updated model
 		return needRestart, err
 	}
 
+	// LUCX-HOOK: the editor always sends forwardedPorts. Sync from inbound
+	// JSON can miss it (kernel AWG used to skip the settings write), so the
+	// clients page reopened with an empty field. Empty still means omit.
+	if updated.ForwardedPorts != "" {
+		if err := database.GetDB().Model(&model.ClientRecord{}).
+			Where("id = ?", id).
+			UpdateColumn("wg_forwarded_ports", updated.ForwardedPorts).Error; err != nil {
+			return needRestart, err
+		}
+	}
+	// END LUCX-HOOK
+
 	if err := database.GetDB().Model(&model.ClientRecord{}).
 		Where("id = ?", id).
 		UpdateColumn("enable", updated.Enable).Error; err != nil {
+		return needRestart, err
+	}
+
+	if err := s.setClientLimitHwidByEmail(updated.Email, limitHwid); err != nil {
 		return needRestart, err
 	}
 
@@ -559,10 +908,11 @@ func (s *ClientService) Delete(inboundSvc *InboundService, id int, keepTraffic b
 
 	inboundIds, err := s.GetInboundIdsForRecord(id)
 	if err != nil {
+		withdrawClientTombstones(existing.Email)
 		return false, err
 	}
 
-	needRestart := false
+	applies := make([]inboundApply, 0, len(inboundIds))
 	var delErrs []error
 	for _, ibId := range inboundIds {
 		if _, getErr := inboundSvc.GetInbound(ibId); getErr != nil {
@@ -580,28 +930,29 @@ func (s *ClientService) Delete(inboundSvc *InboundService, id int, keepTraffic b
 		if existing.Email == "" {
 			continue
 		}
-		nr, delErr := s.DelInboundClientByEmail(inboundSvc, ibId, existing.Email, keepTraffic, true)
-		if delErr != nil {
+		applies = append(applies, inboundApply{id: ibId, run: func() (bool, error) {
+			nr, delErr := s.DelInboundClientByEmail(inboundSvc, ibId, existing.Email, keepTraffic, true)
 			// The client is already absent from this inbound (data drift or a
 			// retried delete). Skip it — deletion stays idempotent.
 			if errors.Is(delErr, ErrClientNotInInbound) {
-				continue
+				return nr, nil
 			}
-			delErrs = append(delErrs, fmt.Errorf("inbound %d: %w", ibId, delErr))
-			continue
-		}
-		if nr {
-			needRestart = true
-		}
+			return nr, delErr
+		}})
+	}
+	needRestart, applyErr := fanoutInboundApplies(applies)
+	if applyErr != nil {
+		delErrs = append(delErrs, applyErr)
 	}
 	// A failed inbound still holds the client in its settings JSON: keep the
 	// record so the next delete retries exactly the leftovers, and report it.
+	// The tombstone lifts with it, or the next node merge finishes the deletion.
 	if len(delErrs) > 0 {
+		withdrawClientTombstones(existing.Email)
 		return needRestart, errors.Join(delErrs...)
 	}
 
-	db := database.GetDB()
-	if err := db.Transaction(func(tx *gorm.DB) error {
+	if err := runSerializedTx(func(tx *gorm.DB) error {
 		if existing.Email != "" {
 			if err := adjustGroupBaselinesForRemovedTraffic(tx, []string{existing.Email}); err != nil {
 				return err
@@ -611,6 +962,9 @@ func (s *ClientService) Delete(inboundSvc *InboundService, id int, keepTraffic b
 			return err
 		}
 		if err := tx.Where("client_id = ?", id).Delete(&model.ClientExternalLink{}).Error; err != nil {
+			return err
+		}
+		if err := clearClientHwidsBySubIDTx(tx, existing.SubID); err != nil {
 			return err
 		}
 		if !keepTraffic && existing.Email != "" {
@@ -629,11 +983,87 @@ func (s *ClientService) Delete(inboundSvc *InboundService, id int, keepTraffic b
 		}
 		return tx.Delete(&model.ClientRecord{}, id).Error
 	}); err != nil {
+		withdrawClientTombstones(existing.Email)
 		return needRestart, err
 	}
 	return needRestart, nil
 }
 
+// hasTunnelAttachment reports whether any of inboundIds is a currently
+// existing WireGuard or AmneziaWG inbound. Inbounds that fail to load are
+// skipped rather than treated as an error -- Attach's own loop already
+// surfaces a real error for any inbound it can't load when it gets there.
+func (s *ClientService) hasTunnelAttachment(inboundSvc *InboundService, inboundIds []int) bool {
+	for _, ibId := range inboundIds {
+		inbound, err := inboundSvc.GetInbound(ibId)
+		if err != nil {
+			continue
+		}
+		if inbound.Protocol == model.WireGuard || inbound.Protocol == model.AmneziaWG || inbound.Protocol == model.AWG {
+			return true
+		}
+	}
+	return false
+}
+
+// tunnelInboundCount reports how many of inboundIds are WireGuard/AmneziaWG,
+// i.e. how many independent peers one shared field set would be written to.
+func tunnelInboundCount(inboundIds []int) (int64, error) {
+	if len(inboundIds) == 0 {
+		return 0, nil
+	}
+	var n int64
+	err := database.GetDB().Model(&model.Inbound{}).
+		Where("id IN ? AND protocol IN ?", inboundIds, []model.Protocol{model.WireGuard, model.AmneziaWG, model.AWG}).
+		Count(&n).Error
+	return n, err
+}
+
+// addressesFitAmneziaWGInbound reports whether every entry in addrs falls
+// inside ib's own configured subnet(s). AmneziaWG only: its kernel interface
+// Address is exactly that subnet, so an address inherited from elsewhere (an
+// identity attached to a WireGuard inbound first, say) produces a peer that
+// can never connect -- Attach allocates fresh instead.
+func addressesFitAmneziaWGInbound(addrs []string, ib *model.Inbound) bool {
+	if ib.Protocol != model.AmneziaWG || len(addrs) == 0 {
+		return true
+	}
+	v4Base, v6Base, err := defaultAmneziaWGSubnetBases(ib.Settings)
+	if err != nil {
+		return false
+	}
+	bases := make([]netip.Prefix, 0, 2)
+	for _, base := range []string{v4Base, v6Base} {
+		if base == "" {
+			continue
+		}
+		prefix, pErr := netip.ParsePrefix(base)
+		if pErr != nil {
+			return false
+		}
+		bases = append(bases, prefix)
+	}
+	for _, a := range addrs {
+		host := wireguardHostAddr(a)
+		if !host.IsValid() {
+			return false
+		}
+		fits := false
+		for _, prefix := range bases {
+			if prefix.Contains(host) {
+				fits = true
+				break
+			}
+		}
+		if !fits {
+			return false
+		}
+	}
+	return true
+}
+
+// Attach applies the client to every requested inbound: one failing inbound no
+// longer aborts the others, so the error can name several and needRestart holds.
 func (s *ClientService) Attach(inboundSvc *InboundService, id int, inboundIds []int) (bool, error) {
 	existing, err := s.GetByID(id)
 	if err != nil {
@@ -655,48 +1085,48 @@ func (s *ClientService) Attach(inboundSvc *InboundService, id int, inboundIds []
 	}
 	clientWire.Flow = flow
 	clientWire.UpdatedAt = time.Now().UnixMilli()
+	if err := mintTunnelKeypairOnce(clientWire, s.hasTunnelAttachment(inboundSvc, inboundIds) || s.hasTunnelAttachment(inboundSvc, currentIds)); err != nil {
+		return false, err
+	}
+	tunnelN, _ := tunnelInboundCount(append(append([]int{}, currentIds...), inboundIds...))
 
-	emailSubIDs, sidErr := inboundSvc.getAllEmailSubIDs()
-	if sidErr != nil {
-		return false, sidErr
+	// If this identity has no CURRENT WireGuard/AmneziaWG attachment,
+	// clientWire.AllowedIPs (from the ClientRecord) is a leftover from
+	// whenever it last had one -- nothing reserves it anymore. Clear it so
+	// attaching to a tunnel inbound now allocates a fresh address instead
+	// of resurrecting the old one, which may no longer even be the lowest
+	// free slot. Left untouched when the identity already has an active
+	// tunnel elsewhere, so extending it to a second protocol still keeps
+	// the same address on both.
+	if !s.hasTunnelAttachment(inboundSvc, currentIds) {
+		clientWire.AllowedIPs = nil
 	}
 
-	needRestart := false
+	adds := make([]*model.Inbound, 0, len(inboundIds))
 	for _, ibId := range inboundIds {
 		if _, attached := have[ibId]; attached {
 			continue
 		}
 		inbound, getErr := inboundSvc.GetInbound(ibId)
 		if getErr != nil {
-			return needRestart, getErr
+			return false, fmt.Errorf("inbound %d: %w", ibId, getErr)
 		}
 		copyClient := *clientWire
-		// LUCX-HOOK: AWG/WG — allocate a fresh tunnel IP for this inbound's
-		// subnet (keys/PSK stay shared). Carrying clientWire.AllowedIPs would
-		// either collide with the previous inbound or leave a foreign /32 peer.
-		if inbound.Protocol == model.AWG || inbound.Protocol == model.WireGuard {
+		if !addressesFitAmneziaWGInbound(copyClient.AllowedIPs, inbound) {
 			copyClient.AllowedIPs = nil
 		}
-		// END LUCX-HOOK
+		clearBroadcastTunnelIP(&copyClient, inbound.Protocol, int(tunnelN))
+		clearForeignTunnelFields(&copyClient, inbound.Protocol)
 		if err := s.fillProtocolDefaults(&copyClient, inbound); err != nil {
-			return needRestart, err
+			return false, fmt.Errorf("inbound %d: %w", ibId, err)
 		}
 		settingsPayload, mErr := json.Marshal(map[string][]model.Client{"clients": {clientWithInboundFlow(copyClient, inbound)}})
 		if mErr != nil {
-			return needRestart, mErr
+			return false, fmt.Errorf("inbound %d: %w", ibId, mErr)
 		}
-		nr, addErr := s.addInboundClient(inboundSvc, &model.Inbound{
-			Id:       ibId,
-			Settings: string(settingsPayload),
-		}, emailSubIDs)
-		if addErr != nil {
-			return needRestart, addErr
-		}
-		if nr {
-			needRestart = true
-		}
+		adds = append(adds, &model.Inbound{Id: ibId, Settings: string(settingsPayload)})
 	}
-	return needRestart, nil
+	return s.fanoutInboundClientAdds(inboundSvc, adds)
 }
 
 func (s *ClientService) CreateOne(inboundSvc *InboundService, inboundId int, client model.Client) (bool, error) {
@@ -757,23 +1187,19 @@ func (s *ClientService) DeleteByEmail(inboundSvc *InboundService, email string, 
 	if len(inboundIds) == 0 {
 		return false, common.NewError(fmt.Sprintf("client %q not found in any inbound or client record", email))
 	}
-	needRestart := false
-	var delErrs []error
+	applies := make([]inboundApply, 0, len(inboundIds))
 	for _, ibId := range inboundIds {
-		nr, delErr := s.DelInboundClientByEmail(inboundSvc, ibId, email, keepTraffic, true)
-		if delErr != nil {
+		applies = append(applies, inboundApply{id: ibId, run: func() (bool, error) {
+			nr, delErr := s.DelInboundClientByEmail(inboundSvc, ibId, email, keepTraffic, true)
 			if errors.Is(delErr, ErrClientNotInInbound) {
-				continue
+				return nr, nil
 			}
-			delErrs = append(delErrs, fmt.Errorf("inbound %d: %w", ibId, delErr))
-			continue
-		}
-		if nr {
-			needRestart = true
-		}
+			return nr, delErr
+		}})
 	}
-	if len(delErrs) > 0 {
-		return needRestart, errors.Join(delErrs...)
+	needRestart, delErr := fanoutInboundApplies(applies)
+	if delErr != nil {
+		return needRestart, delErr
 	}
 	if !keepTraffic {
 		db := database.GetDB()
@@ -793,7 +1219,7 @@ func (s *ClientService) DeleteByEmail(inboundSvc *InboundService, email string, 
 	return needRestart, nil
 }
 
-func (s *ClientService) UpdateByEmail(inboundSvc *InboundService, email string, updated model.Client, inboundFilter ...int) (bool, error) {
+func (s *ClientService) UpdateByEmail(inboundSvc *InboundService, email string, updated model.Client, limitHwid int, inboundFilter ...int) (bool, error) {
 	if email == "" {
 		return false, common.NewError("client email is required")
 	}
@@ -801,7 +1227,7 @@ func (s *ClientService) UpdateByEmail(inboundSvc *InboundService, email string, 
 	if err != nil {
 		return false, err
 	}
-	return s.Update(inboundSvc, rec.Id, updated, inboundFilter...)
+	return s.Update(inboundSvc, rec.Id, updated, limitHwid, inboundFilter...)
 }
 
 func (s *ClientService) Detach(inboundSvc *InboundService, id int, inboundIds []int) (bool, error) {
@@ -818,28 +1244,25 @@ func (s *ClientService) Detach(inboundSvc *InboundService, id int, inboundIds []
 		have[x] = struct{}{}
 	}
 
-	needRestart := false
+	applies := make([]inboundApply, 0, len(inboundIds))
 	for _, ibId := range inboundIds {
 		if _, attached := have[ibId]; !attached {
 			continue
 		}
 		if _, getErr := inboundSvc.GetInbound(ibId); getErr != nil {
-			return needRestart, getErr
+			return false, getErr
 		}
 		// Detach by email — the client's stable identity (see Delete).
 		if existing.Email == "" {
 			continue
 		}
-		nr, delErr := s.DelInboundClientByEmail(inboundSvc, ibId, existing.Email, true, false)
-		if delErr != nil {
+		applies = append(applies, inboundApply{id: ibId, run: func() (bool, error) {
+			nr, delErr := s.DelInboundClientByEmail(inboundSvc, ibId, existing.Email, true, false)
 			if errors.Is(delErr, ErrClientNotInInbound) {
-				continue
+				return nr, nil
 			}
-			return needRestart, delErr
-		}
-		if nr {
-			needRestart = true
-		}
+			return nr, delErr
+		}})
 	}
-	return needRestart, nil
+	return fanoutInboundApplies(applies)
 }

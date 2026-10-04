@@ -1,5 +1,7 @@
 import { RandomUtil, Wireguard } from '@/utils';
+import { generateAwgObfuscation } from '@/lib/xray/amneziawg-obfuscation';
 
+import type { AmneziawgInboundSettings } from '@/schemas/protocols/inbound/amneziawg';
 import type { HttpInboundSettings } from '@/schemas/protocols/inbound/http';
 import type { HysteriaClient, HysteriaInboundSettings } from '@/schemas/protocols/inbound/hysteria';
 import type { MixedInboundSettings } from '@/schemas/protocols/inbound/mixed';
@@ -8,10 +10,19 @@ import type { AwgInboundSettings } from '@/schemas/protocols/inbound/awg'; // LU
 import type { NaiveInboundSettings } from '@/schemas/protocols/inbound/naive'; // LUCX-HOOK: Naive
 import type { OlcrtcInboundSettings } from '@/schemas/protocols/inbound/olcrtc';
 import type { QwdttInboundSettings } from '@/schemas/protocols/inbound/qwdtt';
+import type { CsqttInboundSettings } from '@/schemas/protocols/inbound/csqtt';
 import type { MieruInboundSettings } from '@/schemas/protocols/inbound/mieru';
 import type { TrustTunnelInboundSettings } from '@/schemas/protocols/inbound/trusttunnel';
-import type { ShadowsocksClient, ShadowsocksInboundSettings } from '@/schemas/protocols/inbound/shadowsocks';
+import type { AnytlsInboundSettings } from '@/schemas/protocols/inbound/anytls';
+import type { TproxyInboundSettings } from '@/schemas/protocols/inbound/tproxy';
+import type { CoverInboundSettings } from '@/schemas/protocols/inbound/cover';
+import type { GatewayInboundSettings } from '@/schemas/protocols/inbound/gateway';
+import type {
+  ShadowsocksClient,
+  ShadowsocksInboundSettings,
+} from '@/schemas/protocols/inbound/shadowsocks';
 import type { TrojanClient, TrojanInboundSettings } from '@/schemas/protocols/inbound/trojan';
+import type { TuicClient, TuicInboundSettings } from '@/schemas/protocols/inbound/tuic';
 import type { TunInboundSettings } from '@/schemas/protocols/inbound/tun';
 import type { TunnelInboundSettings } from '@/schemas/protocols/inbound/tunnel';
 import type { VlessClient, VlessInboundSettings } from '@/schemas/protocols/inbound/vless';
@@ -113,9 +124,13 @@ export interface ShadowsocksClientSeed extends ClientBaseSeed {
 // (the parent inbound's method is authoritative); only 2022-blake3 multi-
 // user inbounds use the per-client method. Callers pass `ssMethod` to seed
 // a method-specific password length when creating a multi-user client.
-export function createDefaultShadowsocksClient(seed: ShadowsocksClientSeed = {}): ShadowsocksClient {
+export function createDefaultShadowsocksClient(
+  seed: ShadowsocksClientSeed = {},
+): ShadowsocksClient {
   const method = seed.method ?? '';
-  const password = seed.password ?? RandomUtil.randomShadowsocksPassword(seed.ssMethod ?? '2022-blake3-aes-256-gcm');
+  const password =
+    seed.password ??
+    RandomUtil.randomShadowsocksPassword(seed.ssMethod ?? '2022-blake3-aes-256-gcm');
   return {
     method,
     password,
@@ -130,6 +145,22 @@ export interface HysteriaClientSeed extends ClientBaseSeed {
 export function createDefaultHysteriaClient(seed: HysteriaClientSeed = {}): HysteriaClient {
   return {
     auth: seed.auth ?? RandomUtil.randomSeq(10),
+    ...clientBase(seed),
+  };
+}
+
+export interface TuicClientSeed extends ClientBaseSeed {
+  uuid?: string;
+  id?: string;
+  password?: string;
+}
+
+export function createDefaultTuicClient(seed: TuicClientSeed = {}): TuicClient {
+  const uuid = seed.uuid ?? seed.id ?? RandomUtil.randomUUID();
+  return {
+    uuid,
+    id: uuid,
+    password: seed.password ?? RandomUtil.randomSeq(10),
     ...clientBase(seed),
   };
 }
@@ -247,6 +278,7 @@ export function createDefaultNaiveInboundSettings(): NaiveInboundSettings {
     routeThroughXray: true,
     useRawConfig: false,
     rawConfig: '',
+    behindCover: false,
     clients: [],
   };
 }
@@ -260,10 +292,30 @@ export function createDefaultOlcrtcInboundSettings(): OlcrtcInboundSettings {
     dns: '8.8.8.8:53',
     vp8Fps: 60,
     vp8Batch: 64,
+    seiFps: 30,
+    seiBatch: 64,
+    seiFrag: 900,
+    seiAck: 2000,
+    videoW: 1080,
+    videoH: 1080,
+    videoFps: 30,
+    videoCodec: 'qrcode',
     debug: false,
     routeThroughXray: false,
     outboundTag: '',
     routeXrayPort: 0,
+  };
+}
+
+export function createDefaultCsqttInboundSettings(): CsqttInboundSettings {
+  return {
+    listenAddr: '0.0.0.0:46000',
+    password: '',
+    deviceId: '',
+    subHost: '',
+    vkHashes: '',
+    routeThroughXray: false,
+    outboundTag: '',
   };
 }
 
@@ -293,6 +345,53 @@ export function createDefaultMieruInboundSettings(): MieruInboundSettings {
     routeThroughXray: true,
     outboundTag: '',
     clients: [],
+  };
+}
+
+export function createDefaultAnytlsInboundSettings(): AnytlsInboundSettings {
+  return {
+    port: 8443,
+    password: '',
+    sni: '',
+    certFile: '',
+    keyFile: '',
+    routeThroughXray: false,
+    outboundTag: '',
+    clients: [],
+  };
+}
+
+export function createDefaultGatewayInboundSettings(): GatewayInboundSettings {
+  return { publicHost: '' };
+}
+
+export function createDefaultCoverInboundSettings(): CoverInboundSettings {
+  return {
+    hostname: '',
+    siteSource: 'zip',
+    siteDir: '',
+    siteUpstream: '',
+    certFile: '',
+    keyFile: '',
+    routes: [],
+  };
+}
+
+export function createDefaultTproxyInboundSettings(): TproxyInboundSettings {
+  return {
+    port: 443,
+    hostname: '',
+    secret: '',
+    siteSource: 'zip',
+    siteDir: '',
+    siteUpstream: '',
+    carrierMode: 'https',
+    certFile: '',
+    keyFile: '',
+    externalTLS: false,
+    behindCover: false,
+    routeThroughXray: false,
+    outboundTag: '',
   };
 }
 
@@ -383,7 +482,10 @@ export function createDefaultAwgInboundSettings(): AwgInboundSettings {
     // initial seed; the generator is the source of truth for the wire format.
     awgVersion: '2',
     routeThroughXray: true,
+    xrayRoutingMode: 'tun',
+    tproxyPort: 51453,
     outboundTag: '',
+    p2p: false,
     clients: [],
   };
 }
@@ -413,12 +515,20 @@ export interface WireguardInboundSeed {
   mtu?: number;
   secretKey?: string;
   noKernelTun?: boolean;
+  subnetIp?: string;
+  subnetCidr?: number;
 }
 
 // WireGuard is multi-client now: a new inbound holds only the server identity
 // (secretKey/mtu) and starts with no clients. Clients (peers) are added later
 // through the client modal, which generates each one's keypair and a unique
 // tunnel address. peers stays empty for backward-compatible parsing.
+//
+// subnetIp/subnetCidr default to 10.0.0.0/24 here — the same value the Go
+// backend has always fallen back to for an inbound with no clients yet — so
+// a freshly created inbound shows an explicit, editable value from the
+// start (matching AmneziaWG's own subnet field), rather than an empty one
+// that silently relies on server-side inference until an admin fills it in.
 export function createDefaultWireguardInboundSettings(
   seed: WireguardInboundSeed = {},
 ): WireguardInboundSettings {
@@ -428,6 +538,55 @@ export function createDefaultWireguardInboundSettings(
     peers: [],
     clients: [],
     noKernelTun: seed.noKernelTun ?? false,
+    subnetIp: seed.subnetIp ?? '10.0.0.0',
+    subnetCidr: seed.subnetCidr ?? 24,
+  };
+}
+
+// AmneziaWG is multi-client, like WireGuard, and uses the same Curve25519
+// keypair format — Wireguard.generateKeypair() works unchanged. Unlike
+// WireGuard's Xray-native inbound, the server's publicKey is a real
+// persisted field here (the Go backend reads it directly rather than
+// re-deriving it), so it's seeded alongside privateKey. The obfuscation
+// parameters are randomized per inbound (a static default would give every
+// install the same DPI fingerprint), mirroring the Go backend's
+// internal/amneziawg.GenerateObfuscation31.
+export function createDefaultAmneziawgInboundSettings(): AmneziawgInboundSettings {
+  const kp = Wireguard.generateKeypair();
+  return {
+    server: {
+      privateKey: kp.privateKey,
+      publicKey: kp.publicKey,
+      subnetIp: '10.8.1.0',
+      subnetCidr: 24,
+      primaryDns: '8.8.8.8',
+      secondaryDns: '8.8.4.4',
+      externalInterface: '',
+      ipv6Enabled: false,
+      ipv6Subnet: '',
+      ipv6ExternalInterface: '',
+      ...generateAwgObfuscation(),
+    },
+    clients: [],
+  };
+}
+
+export function createDefaultTuicInboundSettings(): TuicInboundSettings {
+  return {
+    server: {
+      certificate: '',
+      private_key: '',
+      congestion_control: 'bbr',
+      alpn: ['h3', 'spdy/3.1'],
+      udp_relay_mode: 'native',
+      zero_rtt_handshake: true,
+      log_level: 'info',
+      max_idle_time: 15,
+      authentication_timeout: 3,
+      max_udp_relay_packet_size: 1500,
+      sni: '',
+    },
+    clients: [],
   };
 }
 
@@ -448,32 +607,71 @@ export type AnyInboundSettings =
   | TunnelInboundSettings
   | WireguardInboundSettings
   | MtprotoInboundSettings
+  | AmneziawgInboundSettings
+  | TuicInboundSettings
   | AwgInboundSettings // LUCX-HOOK: AWG
   | NaiveInboundSettings
   | OlcrtcInboundSettings
   | QwdttInboundSettings
+  | CsqttInboundSettings
   | MieruInboundSettings
-  | TrustTunnelInboundSettings;
+  | TrustTunnelInboundSettings
+  | AnytlsInboundSettings
+  | TproxyInboundSettings
+  | CoverInboundSettings
+  | GatewayInboundSettings;
 
 export function createDefaultInboundSettings(protocol: string): AnyInboundSettings | null {
   switch (protocol) {
-    case 'vless':       return createDefaultVlessInboundSettings();
-    case 'vmess':       return createDefaultVmessInboundSettings();
-    case 'trojan':      return createDefaultTrojanInboundSettings();
-    case 'shadowsocks': return createDefaultShadowsocksInboundSettings();
-    case 'hysteria':    return createDefaultHysteriaInboundSettings();
-    case 'http':        return createDefaultHttpInboundSettings();
-    case 'mixed':       return createDefaultMixedInboundSettings();
-    case 'tunnel':      return createDefaultTunnelInboundSettings();
-    case 'tun':         return createDefaultTunInboundSettings();
-    case 'wireguard':   return createDefaultWireguardInboundSettings();
-    case 'mtproto':     return createDefaultMtprotoInboundSettings();
-    case 'awg':         return createDefaultAwgInboundSettings(); // LUCX-HOOK: AWG
-    case 'naive':       return createDefaultNaiveInboundSettings(); // LUCX-HOOK: Naive
-    case 'olcrtc':      return createDefaultOlcrtcInboundSettings();
-    case 'qwdtt':       return createDefaultQwdttInboundSettings();
-    case 'mieru':       return createDefaultMieruInboundSettings();
-    case 'trusttunnel': return createDefaultTrustTunnelInboundSettings();
-    default:            return null;
+    case 'vless':
+      return createDefaultVlessInboundSettings();
+    case 'vmess':
+      return createDefaultVmessInboundSettings();
+    case 'trojan':
+      return createDefaultTrojanInboundSettings();
+    case 'shadowsocks':
+      return createDefaultShadowsocksInboundSettings();
+    case 'hysteria':
+      return createDefaultHysteriaInboundSettings();
+    case 'http':
+      return createDefaultHttpInboundSettings();
+    case 'mixed':
+      return createDefaultMixedInboundSettings();
+    case 'tunnel':
+      return createDefaultTunnelInboundSettings();
+    case 'tun':
+      return createDefaultTunInboundSettings();
+    case 'wireguard':
+      return createDefaultWireguardInboundSettings();
+    case 'mtproto':
+      return createDefaultMtprotoInboundSettings();
+    case 'amneziawg':
+      return createDefaultAmneziawgInboundSettings();
+    case 'tuic':
+      return createDefaultTuicInboundSettings();
+    case 'awg':
+      return createDefaultAwgInboundSettings(); // LUCX-HOOK: AWG
+    case 'naive':
+      return createDefaultNaiveInboundSettings(); // LUCX-HOOK: Naive
+    case 'olcrtc':
+      return createDefaultOlcrtcInboundSettings();
+    case 'qwdtt':
+      return createDefaultQwdttInboundSettings();
+    case 'csqtt':
+      return createDefaultCsqttInboundSettings();
+    case 'mieru':
+      return createDefaultMieruInboundSettings();
+    case 'trusttunnel':
+      return createDefaultTrustTunnelInboundSettings();
+    case 'anytls':
+      return createDefaultAnytlsInboundSettings();
+    case 'tproxy':
+      return createDefaultTproxyInboundSettings();
+    case 'cover':
+      return createDefaultCoverInboundSettings();
+    case 'gateway':
+      return createDefaultGatewayInboundSettings();
+    default:
+      return null;
   }
 }

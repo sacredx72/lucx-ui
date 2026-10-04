@@ -8,6 +8,9 @@ const UPSTREAM_NODE_PROTOCOLS = new Set<string>([
   Protocols.SHADOWSOCKS,
   Protocols.HYSTERIA,
   Protocols.WIREGUARD,
+  Protocols.MTPROTO,
+  Protocols.AMNEZIAWG,
+  Protocols.TUIC,
 ]);
 
 const LUCX_NODE_PROTOCOLS = new Set<string>([
@@ -17,6 +20,10 @@ const LUCX_NODE_PROTOCOLS = new Set<string>([
   Protocols.QWDTT,
   Protocols.MIERU,
   Protocols.TRUSTTUNNEL,
+  Protocols.ANYTLS,
+  Protocols.TPROXY,
+  Protocols.COVER,
+  Protocols.GATEWAY,
 ]);
 
 export function isProtocolNodeEligible(protocol: string): boolean {

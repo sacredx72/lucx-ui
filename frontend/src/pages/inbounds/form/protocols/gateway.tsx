@@ -1,0 +1,20 @@
+// Copyright (c) 2026 LucX-UI Project.
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// LucX-UI Component. Free for personal and educational use.
+// Commercial use (including VPN resale) requires explicit written permission from the author.
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+import { useTranslation } from 'react-i18next';
+import { Alert } from 'antd';
+
+export default function GatewayFields() {
+  const { t } = useTranslation();
+  return (
+    <Alert
+      type="info"
+      showIcon
+      style={{ marginBottom: 12 }}
+      message={t('pages.inbounds.form.gatewayNote')}
+    />
+  );
+}

@@ -88,3 +88,24 @@ func TestInboundCanHostFallbacks_StaysTcpOnly(t *testing.T) {
 		t.Errorf("inboundCanHostFallbacks(nil) = true, want false")
 	}
 }
+
+// Mirrors NODE_ELIGIBLE_PROTOCOLS in
+// frontend/src/pages/inbounds/form/InboundFormModal.tsx -- keep both lists
+// in sync if a protocol's node-eligibility ever changes.
+func TestIsNodeEligibleProtocol(t *testing.T) {
+	eligible := []model.Protocol{model.VLESS, model.VMESS, model.Trojan, model.Shadowsocks, model.Hysteria, model.WireGuard, model.MTProto, model.AmneziaWG, model.TUIC}
+	// LUCX-HOOK: LucX sidecar protocols are node-eligible (lucx.114).
+	eligible = append(eligible, model.AWG, model.Naive, model.Olcrtc, model.Qwdtt, model.Mieru, model.TrustTunnel, model.Anytls, model.Tproxy, model.Cover, model.Gateway)
+	// END LUCX-HOOK
+	for _, p := range eligible {
+		if !nodeEligibleProtocols[p] {
+			t.Errorf("nodeEligibleProtocols[%q] = false, want true", p)
+		}
+	}
+	ineligible := []model.Protocol{model.Mixed, model.HTTP, model.Tunnel}
+	for _, p := range ineligible {
+		if nodeEligibleProtocols[p] {
+			t.Errorf("nodeEligibleProtocols[%q] = true, want false", p)
+		}
+	}
+}

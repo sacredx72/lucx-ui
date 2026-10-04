@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -17,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mhsanaei/3x-ui/v3/internal/crypto/nodetoken"
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
@@ -105,12 +107,32 @@ func (s *NodeService) FetchCertFingerprint(ctx context.Context, n *model.Node) (
 	return base64.StdEncoding.EncodeToString(sum[:]), nil
 }
 
+// decryptToken exposes plaintext to callers. Failures blank only this token
+// and surface through LastError instead of dropping the node row.
+func decryptToken(n *model.Node) {
+	if n == nil || n.ApiToken == "" {
+		return
+	}
+	pt, err := nodetoken.Decrypt(n.Id, n.ApiToken)
+	if err != nil {
+		n.ApiToken = ""
+		if n.LastError == "" {
+			n.LastError = "token decrypt failed: " + err.Error()
+		}
+		return
+	}
+	n.ApiToken = pt
+}
+
 func (s *NodeService) GetAll() ([]*model.Node, error) {
 	db := database.GetDB()
 	var nodes []*model.Node
 	err := db.Model(model.Node{}).Order("id asc").Find(&nodes).Error
 	if err != nil || len(nodes) == 0 {
 		return nodes, err
+	}
+	for _, n := range nodes {
+		decryptToken(n)
 	}
 
 	type inboundRow struct {
@@ -338,6 +360,7 @@ func (s *NodeService) GetById(id int) (*model.Node, error) {
 	if err := db.Model(model.Node{}).Where("id = ?", id).First(n).Error; err != nil {
 		return nil, err
 	}
+	decryptToken(n)
 	return n, nil
 }
 
@@ -434,7 +457,29 @@ func (s *NodeService) Create(n *model.Node) error {
 		return err
 	}
 	db := database.GetDB()
-	return db.Create(n).Error
+	if !nodetoken.Enabled() {
+		return db.Create(n).Error
+	}
+	plaintext := n.ApiToken
+	return db.Transaction(func(tx *gorm.DB) error {
+		// The id-bound ciphertext can only be produced after insertion. Never put
+		// plaintext in the initial tuple: PostgreSQL WAL would retain it.
+		n.ApiToken = ""
+		defer func() { n.ApiToken = plaintext }()
+		if err := tx.Create(n).Error; err != nil {
+			return err
+		}
+		enc, err := nodetoken.Encrypt(n.Id, plaintext)
+		if err != nil {
+			return err
+		}
+		if enc == plaintext {
+			return nil // off-mode / empty token: nothing to rewrite
+		}
+		// DB column gets ciphertext; the in-memory struct keeps plaintext so the
+		// create response echoes the same usable value GetById would return.
+		return tx.Model(model.Node{}).Where("id = ?", n.Id).Update("api_token", enc).Error
+	})
 }
 
 func (s *NodeService) CreateFromRequest(req *NodeMutationRequest) (*NodeView, error) {
@@ -446,6 +491,24 @@ func (s *NodeService) CreateFromRequest(req *NodeMutationRequest) (*NodeView, er
 		return nil, err
 	}
 	return toNodeView(n), nil
+}
+
+// nodeSelectionGrew reports a save that starts managing inbounds the panel has
+// not imported yet; the sweep must wait for the next clean sync to adopt them.
+func nodeSelectionGrew(existing, in *model.Node) bool {
+	if in.InboundSyncMode != "selected" {
+		return existing.InboundSyncMode == "selected"
+	}
+	old := make(map[string]struct{}, len(existing.InboundTags))
+	for _, tag := range existing.InboundTags {
+		old[tag] = struct{}{}
+	}
+	for _, tag := range in.InboundTags {
+		if _, ok := old[tag]; !ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *NodeService) Update(id int, in *model.Node) error {
@@ -461,6 +524,15 @@ func (s *NodeService) Update(id int, in *model.Node) error {
 	if err := db.Where("id = ?", id).First(existing).Error; err != nil {
 		return err
 	}
+	// Blank means keep the hidden stored token; non-blank values are encrypted.
+	apiToken := existing.ApiToken
+	if in.ApiToken != "" {
+		enc, eerr := nodetoken.Encrypt(id, in.ApiToken)
+		if eerr != nil {
+			return eerr
+		}
+		apiToken = enc
+	}
 	updates := map[string]any{
 		"name":                  in.Name,
 		"remark":                in.Remark,
@@ -468,7 +540,7 @@ func (s *NodeService) Update(id int, in *model.Node) error {
 		"address":               in.Address,
 		"port":                  in.Port,
 		"base_path":             in.BasePath,
-		"api_token":             in.ApiToken,
+		"api_token":             apiToken,
 		"enable":                in.Enable,
 		"allow_private_address": in.AllowPrivateAddress,
 		"tls_verify_mode":       in.TlsVerifyMode,
@@ -476,6 +548,9 @@ func (s *NodeService) Update(id int, in *model.Node) error {
 		"inbound_sync_mode":     in.InboundSyncMode,
 		"inbound_tags":          string(inboundTagsJSON),
 		"outbound_tag":          in.OutboundTag,
+	}
+	if nodeSelectionGrew(existing, in) {
+		updates["inbounds_adopted_at"] = 0
 	}
 	if err := db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(model.Node{}).Where("id = ?", id).Updates(updates).Error; err != nil {
@@ -513,7 +588,10 @@ func (s *NodeService) UpdateFromRequest(id int, req *NodeMutationRequest) error 
 	case req.ClearApiToken:
 		apiToken = ""
 	case req.ApiToken != nil:
-		apiToken = *req.ApiToken
+		apiToken, err = nodetoken.Encrypt(id, *req.ApiToken)
+		if err != nil {
+			return err
+		}
 	}
 	if apiToken == "" && in.Enable && in.TlsVerifyMode != "mtls" {
 		return common.NewError("apiToken is required unless mtls is enabled")
@@ -534,11 +612,16 @@ func (s *NodeService) UpdateFromRequest(id int, req *NodeMutationRequest) error 
 		"inbound_tags":          string(inboundTagsJSON),
 		"outbound_tag":          in.OutboundTag,
 	}
-	if err := db.Model(model.Node{}).Where("id = ?", id).Updates(updates).Error; err != nil {
-		return err
+	if nodeSelectionGrew(existing, in) {
+		updates["inbounds_adopted_at"] = 0
 	}
-	if dErr := s.MarkNodeDirty(id); dErr != nil {
-		logger.Warning("mark node dirty after update failed:", dErr)
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(model.Node{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+			return err
+		}
+		return s.MarkNodeDirtyTx(tx, id)
+	}); err != nil {
+		return err
 	}
 	if mgr := runtime.GetManager(); mgr != nil {
 		mgr.InvalidateNode(id)
@@ -593,6 +676,53 @@ func (s *NodeService) NodeFromRequestForCertificate(req *NodeMutationRequest) (*
 		return nil, err
 	}
 	return n, nil
+}
+
+// MigrateNodeTokensToActiveKey uses compare-and-swap to avoid clobbering live
+// changes. Current-key rows are skipped; changed and skipped counts are returned.
+func (s *NodeService) MigrateNodeTokensToActiveKey() (int, int, error) {
+	codec := nodetoken.Active()
+	if !codec.Enabled() {
+		return 0, 0, errors.New("node-token encryption is off; set NODE_TOKEN_ENCRYPTION=migration|required and a key first")
+	}
+	db := database.GetDB()
+	var nodes []*model.Node
+	if err := db.Model(model.Node{}).Order("id asc").Find(&nodes).Error; err != nil {
+		return 0, 0, err
+	}
+	changed, skipped := 0, 0
+	for _, n := range nodes {
+		old := n.ApiToken
+		if old == "" {
+			skipped++
+			continue
+		}
+		if codec.EncryptedWithActive(old) {
+			if _, err := codec.Decrypt(n.Id, old); err != nil {
+				return changed, skipped, fmt.Errorf("node %d validate active ciphertext: %w", n.Id, err)
+			}
+			skipped++
+			continue
+		}
+		plain, err := codec.Decrypt(n.Id, old) // plaintext passes through; old-key ciphertext is decrypted
+		if err != nil {
+			return changed, skipped, fmt.Errorf("node %d decrypt: %w", n.Id, err)
+		}
+		enc, err := codec.Encrypt(n.Id, plain)
+		if err != nil {
+			return changed, skipped, fmt.Errorf("node %d encrypt: %w", n.Id, err)
+		}
+		res := db.Model(model.Node{}).Where("id = ? AND api_token = ?", n.Id, old).Update("api_token", enc)
+		if res.Error != nil {
+			return changed, skipped, res.Error
+		}
+		if res.RowsAffected == 1 {
+			changed++
+		} else {
+			skipped++ // raced with a live update; a later run handles it
+		}
+	}
+	return changed, skipped, nil
 }
 
 func (s *NodeService) GetRemoteInboundOptions(ctx context.Context, n *model.Node) ([]runtime.RemoteInboundOption, error) {
@@ -657,9 +787,9 @@ func (s *NodeService) EnsureInboundTagAllowedTx(tx *gorm.DB, nodeID int, tag str
 		Updates(map[string]any{"inbound_tags": string(buf)}).Error
 }
 
-func FilterNodeSnapshot(n *model.Node, snap *runtime.TrafficSnapshot) {
-	if n == nil || snap == nil || n.InboundSyncMode != "selected" {
-		return
+func nodeSelectedTagSet(n *model.Node) map[string]struct{} {
+	if n == nil || n.InboundSyncMode != "selected" {
+		return nil
 	}
 	prefix := nodeTagPrefix(&n.Id)
 	allowed := make(map[string]struct{}, len(n.InboundTags)*2)
@@ -672,6 +802,30 @@ func FilterNodeSnapshot(n *model.Node, snap *runtime.TrafficSnapshot) {
 				allowed[prefix+tag] = struct{}{}
 			}
 		}
+	}
+	return allowed
+}
+
+// A deselected tag is still served by the node — FilterNodeSnapshot just stops
+// reporting it — so its absence must never be read as "the node deleted it".
+func unmanagedTagPredicate(n *model.Node) func(string) bool {
+	managed := nodeSelectedTagSet(n)
+	if managed == nil {
+		return func(string) bool { return false }
+	}
+	return func(tag string) bool {
+		_, ok := managed[tag]
+		return !ok
+	}
+}
+
+func FilterNodeSnapshot(n *model.Node, snap *runtime.TrafficSnapshot) {
+	if n == nil || snap == nil || n.InboundSyncMode != "selected" {
+		return
+	}
+	allowed := nodeSelectedTagSet(n)
+	for _, tag := range snap.ManagedAliases {
+		allowed[tag] = struct{}{}
 	}
 	filtered := make([]*model.Inbound, 0, len(snap.Inbounds))
 	for _, inbound := range snap.Inbounds {
@@ -711,8 +865,11 @@ func (s *NodeService) Delete(id int) error {
 	// children (traffic baselines, IP attribution) before the parent node row so
 	// the ordering already matches a future ON DELETE constraint. Delete stays
 	// tolerant of a missing node row so it can still clean up orphaned baselines.
-	if err := db.Transaction(func(tx *gorm.DB) error {
+	if err := runSerializedTx(func(tx *gorm.DB) error {
 		if err := tx.Where("node_id = ?", id).Delete(&model.NodeClientTraffic{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("node_id = ?", id).Delete(&model.NodePendingReset{}).Error; err != nil {
 			return err
 		}
 		guids := []string{synthNodeGuid(id)}
@@ -729,8 +886,9 @@ func (s *NodeService) Delete(id int) error {
 	if mgr := runtime.GetManager(); mgr != nil {
 		mgr.InvalidateNode(id)
 	}
-	nodeMetrics.drop(nodeMetricKey(id, "cpu"))
-	nodeMetrics.drop(nodeMetricKey(id, "mem"))
+	for _, metric := range NodeMetricKeys {
+		nodeMetrics.drop(nodeMetricKey(id, metric))
+	}
 	return nil
 }
 
@@ -786,12 +944,11 @@ func (s *NodeService) UpdatePanels(ids []int, dev bool) ([]NodeUpdateResult, err
 	if mgr == nil {
 		return nil, fmt.Errorf("runtime manager unavailable")
 	}
-	results := make([]NodeUpdateResult, 0, len(ids))
-	for _, id := range ids {
+	results, panics := fanoutInboundResults(ids, nodeFanoutConcurrency, func(i int) NodeUpdateResult {
+		id := ids[i]
 		n, err := s.GetById(id)
 		if err != nil || n == nil {
-			results = append(results, NodeUpdateResult{Id: id, OK: false, Error: "node not found"})
-			continue
+			return NodeUpdateResult{Id: id, OK: false, Error: "node not found"}
 		}
 		res := NodeUpdateResult{Id: id, Name: n.Name}
 		switch {
@@ -814,7 +971,12 @@ func (s *NodeService) UpdatePanels(ids []int, dev bool) ([]NodeUpdateResult, err
 				res.OK = true
 			}
 		}
-		results = append(results, res)
+		return res
+	})
+	for i, panicErr := range panics {
+		if panicErr != nil {
+			results[i] = NodeUpdateResult{Id: ids[i], Error: panicErr.Error()}
+		}
 	}
 	return results, nil
 }
@@ -1083,6 +1245,10 @@ func (s *NodeService) withOutboundBridge(nodeID int, outboundTag string, fn func
 	fn(proxyURL)
 }
 
+// A status envelope holds a handful of scalars; the cap keeps a hostile or
+// broken node from dictating the master's allocation on every heartbeat.
+const maxProbeBodyBytes = 1 << 20 // 1 MiB
+
 func (s *NodeService) probe(ctx context.Context, n *model.Node, proxyURL string) (HeartbeatPatch, error) {
 	patch := HeartbeatPatch{LastHeartbeat: time.Now().Unix()}
 
@@ -1113,7 +1279,12 @@ func (s *NodeService) probe(ctx context.Context, n *model.Node, proxyURL string)
 		return patch, err
 	}
 	if n.ApiToken != "" {
-		req.Header.Set("Authorization", "Bearer "+n.ApiToken)
+		token, derr := nodetoken.Decrypt(n.Id, n.ApiToken)
+		if derr != nil {
+			patch.LastError = derr.Error()
+			return patch, derr
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	req.Header.Set("Accept", "application/json")
 
@@ -1160,12 +1331,18 @@ func (s *NodeService) probe(ctx context.Context, n *model.Node, proxyURL string)
 			} `json:"netIO"`
 		} `json:"obj"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxProbeBodyBytes)).Decode(&envelope); err != nil {
 		patch.LastError = "decode response: " + err.Error()
 		return patch, err
 	}
-	if !envelope.Success || envelope.Obj == nil {
+	if !envelope.Success {
 		patch.LastError = "remote returned success=false: " + envelope.Msg
+		return patch, errors.New(patch.LastError)
+	}
+	// A panel that has not sampled its status yet answers success with a null
+	// obj; saying so beats "success=false: " with nothing after the colon.
+	if envelope.Obj == nil {
+		patch.LastError = "remote panel reported no status yet; it may still be starting up"
 		return patch, errors.New(patch.LastError)
 	}
 	o := envelope.Obj

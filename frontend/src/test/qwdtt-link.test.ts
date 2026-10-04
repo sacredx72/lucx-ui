@@ -1,3 +1,9 @@
+// Copyright (c) 2025 LucX-UI Project.
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// LucX-UI Component. Free for personal and educational use.
+// Commercial use (including VPN resale) requires explicit written permission from the author.
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
 import { describe, it, expect } from 'vitest';
 import { genQwdttLink, genOlcrtcLink, genInboundLinks, genLink } from '@/lib/xray/inbound-link';
 import type { Inbound } from '@/schemas/api/inbound';
@@ -32,11 +38,14 @@ describe('genQwdttLink', () => {
     expect(link).toContain('pass=secret');
     expect(link).toContain('name=Home');
     expect(link).toContain('hashes=h1%2Ch2');
-    expect(link).toContain('\nwdtt://1.2.3.4:56000:56001:9000:secret:h1');
+    expect(link.includes('\n')).toBe(false);
+    expect(link).not.toMatch(/(?:^|[\r\n])wdtt:\/\//);
   });
 
   it('falls back to address:port when subHost empty', () => {
-    const ib = qwdttInbound({ settings: { subHost: '', password: 'x', listenAddr: '0.0.0.0:56000' } });
+    const ib = qwdttInbound({
+      settings: { subHost: '', password: 'x', listenAddr: '0.0.0.0:56000' },
+    });
     const link = genQwdttLink({ inbound: ib, address: '9.9.9.9', remark: 'r' });
     expect(link).toContain('peer=9.9.9.9%3A56000');
   });
@@ -48,8 +57,12 @@ describe('genQwdttLink', () => {
 
   it('genInboundLinks and genLink dispatch', () => {
     const ib = qwdttInbound();
-    expect(genInboundLinks({ inbound: ib, remark: 'e2e', fallbackHostname: 'x' })).toContain('qwdtt://');
-    expect(genLink({ inbound: ib, address: '1.2.3.4', client: {}, remark: 'e2e' })).toContain('qwdtt://');
+    expect(genInboundLinks({ inbound: ib, remark: 'e2e', fallbackHostname: 'x' })).toContain(
+      'qwdtt://',
+    );
+    expect(genLink({ inbound: ib, address: '1.2.3.4', client: {}, remark: 'e2e' })).toContain(
+      'qwdtt://',
+    );
   });
 });
 
@@ -70,5 +83,50 @@ describe('genOlcrtcLink', () => {
     } as unknown as Inbound;
     const link = genOlcrtcLink({ inbound: ib });
     expect(link).toBe(`olcrtc://jitsi?datachannel@https://meet.jit.si/r#${'a'.repeat(64)}`);
+  });
+
+  it('builds seichannel and videochannel payloads', () => {
+    const key = 'a'.repeat(64);
+    const base = {
+      protocol: 'olcrtc',
+      port: 0,
+      listen: '',
+      streamSettings: {},
+      sniffing: {},
+    };
+    const sei = genOlcrtcLink({
+      inbound: {
+        ...base,
+        settings: {
+          provider: 'jitsi',
+          roomId: 'r',
+          cryptoKey: key,
+          transport: 'seichannel',
+          seiFps: 30,
+          seiBatch: 64,
+          seiFrag: 900,
+          seiAck: 2000,
+        },
+      } as unknown as Inbound,
+    });
+    expect(sei).toBe(`olcrtc://jitsi?seichannel<fps=30&batch=64&frag=900&ack-ms=2000>@r#${key}`);
+    const video = genOlcrtcLink({
+      inbound: {
+        ...base,
+        settings: {
+          provider: 'telemost',
+          roomId: 'r',
+          cryptoKey: key,
+          transport: 'videochannel',
+          videoW: 1080,
+          videoH: 1080,
+          videoFps: 30,
+          videoCodec: 'qrcode',
+        },
+      } as unknown as Inbound,
+    });
+    expect(video).toBe(
+      `olcrtc://telemost?videochannel<video-w=1080&video-h=1080&video-fps=30&video-codec=qrcode>@r#${key}`,
+    );
   });
 });

@@ -12,33 +12,34 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: mutation
+  cancel-in-progress: false
+
 jobs:
   gremlins:
     runs-on: ubuntu-latest
-    # LUCX-HOOK: 120 минут не хватает матрице (service/database упирались в
-    # таймаут и job отменялся GitHub'ом как cancelled) — поднимаем до 360,
-    # максимума для hosted runner'ов.
-    timeout-minutes: 360
+    # Mutation is informational: a red nightly must never gate anyone. The awg
+    # leg has repeatedly killed its runner mid-run (resource spike while a
+    # mutated test executes -> "runner received a shutdown signal"), which
+    # step-level continue-on-error cannot absorb (the step shell dies with the
+    # runner). Job-level continue-on-error keeps the run green; the surviving
+    # leg still uploads its report and the annotation stays visible.
+    continue-on-error: true
+    # LUCX-HOOK: mutate LucX packages only. service/sub/database are mostly
+    # upstream 3x-ui — gremlins there ran 2–4h and hung the nightly job.
+    timeout-minutes: 60
     # END LUCX-HOOK
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: sub
-            path: ./internal/sub/
+          - name: awg
+            path: ./internal/awg/
             exclude: ""
-          - name: runtime
-            path: ./internal/web/runtime/
+          - name: lucx
+            path: ./internal/lucx/
             exclude: ""
-          - name: link
-            path: ./internal/util/link/
-            exclude: ""
-          - name: database
-            path: ./internal/database/
-            exclude: 'dump_sqlite\.go'
-          - name: service
-            path: ./internal/web/service/
-            exclude: 'server\.go|xray\.go|inbound\.go|client_bulk\.go|inbound_traffic\.go|.*_postgres_test\.go'
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -50,13 +51,17 @@ jobs:
       - name: Install gremlins
         run: go install github.com/go-gremlins/gremlins/cmd/gremlins@v0.6.0
       - name: Run gremlins on ${{ matrix.name }}
+        continue-on-error: true
+        timeout-minutes: 50
         run: |
           OUT="mutation-${{ matrix.name }}.json"
+          set +e
           if [ -n "${{ matrix.exclude }}" ]; then
-            gremlins unleash -E '${{ matrix.exclude }}' -o "$OUT" ${{ matrix.path }}
+            gremlins unleash --timeout-coefficient 2 --workers 2 -E '${{ matrix.exclude }}' -o "$OUT" ${{ matrix.path }}
           else
-            gremlins unleash -o "$OUT" ${{ matrix.path }}
+            gremlins unleash --timeout-coefficient 2 --workers 2 -o "$OUT" ${{ matrix.path }}
           fi
+          exit 0
       - name: Upload mutation report
         if: always()
         uses: actions/upload-artifact@v7

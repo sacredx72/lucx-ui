@@ -25,13 +25,15 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 )
 
 const (
-	containerName = "amnezia-awg"
-	protoName     = "awg"
+	containerName  = "amnezia-awg"
+	protoName      = "awg"
+	maxDecodeBytes = 1 << 20
 )
 
 // EncodeConf builds a vpn:// URI from an awg-quick client .conf body.
@@ -64,6 +66,11 @@ func amneziaEnvelope(conf string) map[string]any {
 	}
 	if meta.port > 0 {
 		awg["port"] = strconv.Itoa(meta.port)
+	}
+	// AmneziaVPN picks the client generation off protocol_version; without it
+	// older app builds fall back to v1 obfuscation and the AWG3 handshake dies.
+	if pv := protocolVersion(meta.inner); pv != "" {
+		awg["protocol_version"] = pv
 	}
 	env := map[string]any{
 		"defaultContainer": containerName,
@@ -200,6 +207,47 @@ func parseConf(conf string) confMeta {
 	return meta
 }
 
+// awg3ProtocolVersionKeys mark an AWG 3.0 config: any of them present forces
+// protocol_version "3" in the envelope.
+var awg3ProtocolVersionKeys = []string{
+	"HeaderProtectionKey",
+	"ContentPaddingAddition",
+	"RekeyAfterTime",
+	"RekeyTimeout",
+	"RejectAfterTime",
+	"KeepaliveTimeout",
+	"MaxHandshakeAttempts",
+}
+
+func protocolVersion(inner map[string]any) string {
+	for _, key := range awg3ProtocolVersionKeys {
+		if s, ok := inner[key].(string); ok && strings.TrimSpace(s) != "" {
+			return "3"
+		}
+	}
+	if atoiPositive(inner, "S3") || atoiPositive(inner, "S4") {
+		return "2"
+	}
+	for _, key := range []string{"H1", "H2", "H3", "H4"} {
+		if s, ok := inner[key].(string); ok && strings.Contains(s, "-") {
+			return "2"
+		}
+	}
+	if s, ok := inner["I1"].(string); ok && strings.TrimSpace(s) != "" {
+		return "2"
+	}
+	return ""
+}
+
+func atoiPositive(inner map[string]any, key string) bool {
+	s, ok := inner[key].(string)
+	if !ok {
+		return false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	return err == nil && n > 0
+}
+
 func splitHostPort(s string) (string, int) {
 	if strings.HasPrefix(s, "[") {
 		end := strings.LastIndex(s, "]")
@@ -264,8 +312,12 @@ func Decode(uri string) ([]byte, error) {
 	}
 	defer r.Close()
 	var out bytes.Buffer
-	if _, err := out.ReadFrom(r); err != nil {
+	n, err := out.ReadFrom(io.LimitReader(r, maxDecodeBytes+1))
+	if err != nil {
 		return nil, err
+	}
+	if n > maxDecodeBytes {
+		return nil, fmt.Errorf("vpnuri: decompressed payload too large")
 	}
 	return out.Bytes(), nil
 }

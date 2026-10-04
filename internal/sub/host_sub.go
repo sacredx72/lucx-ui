@@ -17,8 +17,12 @@ import (
 // inbound/externalProxy path, preserving byte-identical output for zero-host
 // inbounds.
 func (s *SubService) hostEndpoints(inbound *model.Inbound, format string) []map[string]any {
+	db := database.GetDB()
+	if db == nil {
+		return nil
+	}
 	var hosts []*model.Host
-	if err := database.GetDB().
+	if err := db.
 		Where("inbound_id = ? AND is_disabled = ?", inbound.Id, false).
 		Order("sort_order asc, id asc").
 		Find(&hosts).Error; err != nil {
@@ -71,6 +75,9 @@ func hostToExternalProxyMap(h *model.Host, defaultDest string, defaultPort int) 
 	if h.Fingerprint != "" {
 		ep["fingerprint"] = h.Fingerprint
 	}
+	if h.CipherSuites != "" {
+		ep["cipherSuites"] = h.CipherSuites
+	}
 	if len(h.Alpn) > 0 {
 		ep["alpn"] = stringsToAnySlice(h.Alpn)
 	}
@@ -106,6 +113,9 @@ func hostToExternalProxyMap(h *model.Host, defaultDest string, defaultPort int) 
 	}
 	if h.VlessRoute != "" {
 		ep["vlessRoute"] = h.VlessRoute
+	}
+	if h.ServerDescription != "" {
+		ep["serverDescription"] = h.ServerDescription
 	}
 	return ep
 }
@@ -156,14 +166,13 @@ func applyHostStreamOverrides(ep map[string]any, stream map[string]any) {
 			}
 		}
 	}
-	// Reality SNI override (host only): JSON realityData reads serverNames and
-	// clash reads serverName, so set both forms.
+	// Reality SNI override (host only): the stream is already in client form, and xray
+	// refuses a reality client carrying the server-side serverNames list (#6690).
 	if isHostEndpoint(ep) {
 		if sec, _ := stream["security"].(string); sec == "reality" {
 			if rs, ok := stream["realitySettings"].(map[string]any); ok && rs != nil {
 				if sni, ok := externalProxySNI(ep); ok {
 					rs["serverName"] = sni
-					rs["serverNames"] = []any{sni}
 				}
 			}
 		}
